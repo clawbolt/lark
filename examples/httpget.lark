@@ -1,0 +1,90 @@
+// std/http：同一个程序里起一个最小的 HTTP 服务器，再用 http.get / http.request 请求它（需要 lark1 及以后的版本）
+// 服务器接两个连接：每个连接读到一个完整的请求，按路径回复，然后关闭。只有客户端打印，输出的顺序是确定的
+import "std/net"
+import "std/http"
+import "std/time"
+
+fn answer(req: http.Request) -> str {
+    now = time.unix_ms()
+    if req.path == "/hello" {
+        return http.format_response(200, [("Content-Type", "text/plain; charset=utf-8")], "你好，#{http.header(req, "user-agent") ?? "无名"}", false, "close", now)
+    }
+    if req.method == "PUT" { return http.format_response(201, [], "收到 #{len(req.body)} 字节：#{req.body}", false, "close", now) }
+    body, hs = http.error_page(404)
+    http.format_response(404, hs, body, false, "close", now)
+}
+
+fn serve_one(l: net.Listener) -> ()! {
+    c = l.accept()?
+    c.set_timeout_ms(5000)?
+    buf = ""
+    for true {
+        r, at, code = http.parse_request(buf, 0)
+        match r {
+            Some(req) => {
+                c.write(answer(req))?
+                break
+            }
+            None => {
+                if at == -2 {
+                    body, hs = http.error_page(code)
+                    c.write(http.format_response(code, hs, body, false, "close", time.unix_ms()))?
+                    break
+                }
+            }
+        }
+        got = c.read(4096)?
+        if got == "" { break }
+        buf += got
+    }
+    c.close()?
+}
+
+fn serve(take l: net.Listener) {
+    for _i in 0..3 {
+        match serve_one(l) {
+            Ok => {}
+            Err(e) => eprint("服务器出错：#{e}")
+        }
+    }
+}
+
+fn talk(port: int) -> ()! {
+    base = "http://127.0.0.1:#{port}"
+    a = http.request("GET", base + "/hello", [("User-Agent", "云雀")], "")?
+    print("#{a.status} #{a.reason}：#{a.body}（#{http.header(a, "content-type") ?? "?"}）")
+    b = http.request("PUT", base + "/k/x", [], "abc")?
+    print("#{b.status} #{b.reason}：#{b.body}")
+    c = http.get(base + "/nope")?
+    print("#{c.status} #{c.reason}：#{c.body}")
+    Ok()
+}
+
+fn client(take port: int) {
+    match talk(port) {
+        Ok => {}
+        Err(e) => print("客户端出错：#{e}")
+    }
+}
+
+fn main() {
+    l = match take net.listen("127.0.0.1", 0) {
+        Ok(x) => x
+        Err(e) => {
+            print("监听失败：#{e}")
+            return
+        }
+    }
+    port = match l.local_port() {
+        Ok(p) => p
+        Err(_) => 0
+    }
+    scope {
+        spawn(serve, l)
+        spawn(client, port)
+    }
+    match http.get("https://example.com/") {
+        Ok(_) => print("不应该成功")
+        Err(e) => print(e)
+    }
+}

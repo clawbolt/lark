@@ -1,0 +1,934 @@
+// Lark 编译器 stage1 · C 代码生成：类型布局与辅助函数
+// 生成规则与 stage0 的 cgtypes.ml 一致。
+
+type GScope {
+    places: [str]
+    tys: [int]
+    is_loop: bool
+    exit: str           // 跳出这一层（return、?、break、continue）时要执行的 C 语句：lock 块的解锁、scope 块的等待；没有时为 ""
+    wait: bool          // exit 是等任务结束（放到最后做，见 drop_jump）
+}
+
+type Gen {
+    lines: [str]        // 当前函数体
+    ind: int
+    scopes: [GScope]
+    ptrs: [bool]        // 变量编号 → 是否通过指针访问
+    tmp: int
+    lits: [str]         // 字符串字面量的全局变量声明
+    nlit: int
+    lists: [int]        // 用到的列表与可选类型，元素类型在前
+    ret: int            // 当前函数的返回类型
+    fntys: [int]        // 用到的函数类型
+    clos: [str]         // 闭包生成的 C 函数（连同环境结构体）
+    sc: [str]           // 外层 scope 在 C 里的变量名，内层在后（spawn 登记到最内层）
+    fi: int             // 正在生成的函数在 fns 里的下标
+    pnames: [str]       // 它的参数在 C 里的名字（尾调用时重新赋值）
+    tail_used: bool     // 是否生成过跳回开头的尾调用
+    shows: [int]        // 插值用到的 lk_show_* 的类型
+    paths: [str]        // 每个文件的路径（assert 的出错位置、调用栈用）
+    tnames: [str]       // test 块的名字（调用栈里 test__k 显示成测试的名字）
+    loops: [str]        // 正在生成的循环在 C 里的标签名（没带标签的是 ""），外层在前；break outer 跳到 lk_brk_名字
+    pend_label: str     // SLabel 刚给的标签，下一个循环取走
+    full_rt: bool       // 生成的代码用到了运行时的可选部分（任务、通道、锁、系统的内置函数），见 gen_program 里的 LK_CORE
+}
+
+fn new_gen(nlocals: int) -> Gen {
+    Gen(lines: [], ind: 0, scopes: [], ptrs: fill(nlocals, false), tmp: 0,
+        lits: [], nlit: 0, lists: [], ret: 3, fntys: [], clos: [], sc: [], fi: -1, pnames: [], tail_used: false, shows: [], paths: [], tnames: [], loops: [], pend_label: "", full_rt: false)
+}
+
+fn mangle(c: Ctx, t: int) -> str {
+    k = tkind(c, t)
+    if t == 0 {
+        "i"
+    } else if is_fixed(t) {
+        // 基本类型都是一个小写字母：u8 是 u，u16 是 w，u32 是 d，i32 是 j
+        if t == 11 { "u" } else if t == 14 { "w" } else if t == 15 { "d" } else { "j" }
+    } else if t == 9 {
+        "f"
+    } else if t == 1 {
+        "b"
+    } else if t == 2 {
+        "s"
+    } else if unit_like(t) {
+        "v"
+    } else if k == "fn" || k == "ofn" {
+        ms: [str] = []
+        fps = fn_params(c, t)
+        for p in fps { ms.push(mangle(c, p)) }
+        head = if k == "fn" { "F" } else { "G" }
+        "#{head}#{len(fps)}" + join(ms, "") + mangle(c, telem(c, t))
+    } else if k == "struct" {
+        "S#{len(cid(tname(c, t)))}#{cid(tname(c, t))}"
+    } else if k == "enum" {
+        "E#{len(cid(tname(c, t)))}#{cid(tname(c, t))}"
+    } else {
+        if k == "dyn" { "D#{len(tname(c, t))}#{tname(c, t)}" } else if k == "chan" { "K" + mangle(c, telem(c, t)) } else if k == "shared" { "H" + mangle(c, telem(c, t)) } else if k == "mutex" { "M" + mangle(c, telem(c, t)) } else if k == "opt" { "O" + mangle(c, telem(c, t)) } else if k == "res" { "R" + mangle(c, telem(c, t)) + res_tag(c, t) } else { "L" + mangle(c, telem(c, t)) }
+    }
+}
+
+fn register(c: Ctx, inout g: Gen, t: int) {
+    k = tkind(c, t)
+    if k == "dyn" && !has(g.lists, t) {
+        // 先登记自己：方法签名里可能又用到这个 dyn 类型
+        g.lists.push(t)
+        for i in 0..len(c.dsig_t) {
+            if c.dsig_t[i] == t {
+                for k2 in 1..len(c.dsig_s[i].tys) { register(c, &g, c.dsig_s[i].tys[k2]) }
+                register(c, &g, c.dsig_s[i].ret)
+            }
+        }
+        return
+    }
+    if k == "ofn" && !has(g.lists, t) {
+        ops = fn_params(c, t)
+        for p in ops { register(c, &g, p) }
+        register(c, &g, telem(c, t))
+        g.lists.push(t)
+        return
+    }
+    if k == "fn" && !has(g.fntys, t) {
+        fps = fn_params(c, t)
+        for p in fps { register(c, &g, p) }
+        register(c, &g, telem(c, t))
+        g.fntys.push(t)
+        return
+    }
+    if (k == "list" || k == "opt" || k == "res" || k == "shared" || k == "chan" || k == "mutex") && !has(g.lists, t) {
+        register(c, &g, telem(c, t))
+        if k == "res" { register(c, &g, res_err(c, t)) }
+        if k == "chan" { register(c, &g, opt_of(c, telem(c, t))) }
+        g.lists.push(t)
+    }
+}
+
+fn ctype(c: Ctx, inout g: Gen, t: int) -> str {
+    register(c, &g, t)
+    k = tkind(c, t)
+    if t == 0 {
+        "int64_t"
+    } else if is_fixed(t) {
+        fixed_cty(t)
+    } else if t == 9 {
+        "double"
+    } else if t == 1 {
+        "bool"
+    } else if t == 2 {
+        "lk_str"
+    } else if unit_like(t) {
+        "void"
+    } else if k == "struct" {
+        "S_" + cid(tname(c, t))
+    } else if k == "enum" {
+        "E_" + cid(tname(c, t))
+    } else {
+        "LK_" + mangle(c, t)
+    }
+}
+
+// 不登记列表类型的版本（只在类型都已登记后使用）
+fn cty(c: Ctx, t: int) -> str {
+    k = tkind(c, t)
+    if t == 0 {
+        "int64_t"
+    } else if is_fixed(t) {
+        fixed_cty(t)
+    } else if t == 9 {
+        "double"
+    } else if t == 1 {
+        "bool"
+    } else if t == 2 {
+        "lk_str"
+    } else if unit_like(t) {
+        "void"
+    } else if k == "struct" {
+        "S_" + cid(tname(c, t))
+    } else if k == "enum" {
+        "E_" + cid(tname(c, t))
+    } else {
+        "LK_" + mangle(c, t)
+    }
+}
+
+fn drop_stmt(c: Ctx, t: int, place: str) -> str {
+    if managed(t) && tkind(c, t) != "fn" { "lk_drop_#{mangle(c, t)}(&(#{place}));" } else { "" }
+}
+
+fn copy_expr(c: Ctx, t: int, place: str) -> str {
+    if managed(t) && tkind(c, t) != "fn" { "lk_copy_#{mangle(c, t)}(&(#{place}))" } else { place }
+}
+
+fn fname(f: str) -> str { "f_" + cid(f) }
+
+// 模块里的名字带点（geo.Vec2），在 C 标识符里换成 _M_
+fn cid(s: str) -> str {
+    if !has_dot(s) { return s }
+    parts: [str] = []
+    start = 0
+    for i in 0..len(s) {
+        if byte_at(s, i) == '.' {
+            parts.push(slice(s, start, i))
+            start = i + 1
+        }
+    }
+    parts.push(slice(s, start, len(s)))
+    join(parts, "_M_")
+}
+
+fn fld(f: str) -> str { "f_" + f }
+
+fn octal3(n: int) -> str {
+    int_str(n / 64) + int_str((n / 8) % 8) + int_str(n % 8)
+}
+
+fn c_string(s: str) -> str {
+    parts: [str] = ["\""]
+    for i in 0..len(s) {
+        b = byte_at(s, i)
+        if b == '"' {
+            parts.push("\\\"")
+        } else if b == '\\' {
+            parts.push("\\\\")
+        } else if b >= 32 && b < 127 && b != '?' {
+            parts.push(from_byte(b))
+        } else {
+            parts.push("\\" + octal3(b))
+        }
+    }
+    parts.push("\"")
+    join(parts, "")
+}
+
+// ---------- 按值存放还是放在堆上 ----------
+// 结构体、元组、枚举、T?、T! 默认按值存放。沿“按值包含”关系（结构体的字段、元组的元素、枚举的变体字段、T? 里的值、T! 的两边）
+// 能回到自己的枚举、T? 和 T! 放在堆上，其余按值存放；列表、str、shared、dyn、Fn、Chan 本来就是指针，不算包含。
+// 结果按类型编号记在 c.tboxed 里，类型检查结束时算出。见 design/enum-by-value.md
+fn boxed_types(c: Ctx) -> [bool] {
+    n = len(c.tt.kinds)
+    out = fill(n, false)
+    for t in 0..n {
+        k = c.tt.kinds[t]
+        if k == "opt" && unit_like(c.tt.elems[t]) {
+            // ()? 没有值可放，仍用指针（NULL 是 None）
+            out[t] = true
+        } else if k == "enum" || k == "opt" || k == "res" {
+            seen = fill(n, false)
+            kids = contained(c, t)
+            hit = false
+            for ft in kids {
+                if !hit && reaches(c, ft, t, &seen) { hit = true }
+            }
+            out[t] = hit
+        }
+    }
+    out
+}
+
+// t 按值直接包含的类型（这时把所有枚举和 T? 都当作按值存放）
+fn contained(c: Ctx, t: int) -> [int] {
+    k = tkind(c, t)
+    out: [int] = []
+    if k == "struct" {
+        si = find_struct(c, tname(c, t))
+        if si >= 0 {
+            for ft in c.structs[si].ftys { out.push(ft) }
+        }
+    } else if k == "enum" {
+        ei = find_enum(c, tname(c, t))
+        if ei >= 0 {
+            for v in c.enums[ei].variants {
+                for ft in v.ftys { out.push(ft) }
+            }
+        }
+    } else if k == "opt" {
+        out.push(telem(c, t))
+    } else if k == "res" {
+        out.push(telem(c, t))
+        out.push(res_err(c, t))
+    }
+    out
+}
+
+fn reaches(c: Ctx, t: int, target: int, inout seen: [bool]) -> bool {
+    if t == target { return true }
+    if seen[t] { return false }
+    seen[t] = true
+    kids = contained(c, t)
+    for ft in kids {
+        if reaches(c, ft, target, &seen) { return true }
+    }
+    false
+}
+
+fn is_boxed(c: Ctx, t: int) -> bool { c.tboxed[t] }
+
+// 按值存放的结构体、枚举和 T? 按包含关系做拓扑排序（被包含的先定义）；返回类型编号
+fn sort_types(c: Ctx, extra: [int]) -> [int] {
+    state = fill(len(c.tt.kinds), 0)
+    out: [int] = []
+    for s in c.structs { visit_type(c, intern_lookup(c, "struct", s.name), &state, &out) }
+    for en in c.enums { visit_type(c, intern_lookup(c, "enum", en.name), &state, &out) }
+    for t in extra { visit_type(c, t, &state, &out) }
+    out
+}
+
+fn visit_type(c: Ctx, t: int, inout state: [int], inout out: [int]) {
+    k = tkind(c, t)
+    by_value = k == "struct" || ((k == "enum" || k == "opt" || k == "res") && !is_boxed(c, t))
+    if !by_value || state[t] == 2 { return }
+    // 经过枚举或 T? 的环已经放在堆上了，剩下的环只可能全是结构体
+    if state[t] == 1 { fail(1, 1, "结构体 #{tname(c, t)} 按值包含了自己，请改用 enum 或列表") }
+    state[t] = 1
+    kids = contained(c, t)
+    for ft in kids { visit_type(c, ft, &state, &out) }
+    state[t] = 2
+    out.push(t)
+}
+
+// 访问枚举值 x 的 tag 和字段：在堆上的是 x->，按值存放的是 (x).
+fn eacc(c: Ctx, t: int, x: str) -> str { if is_boxed(c, t) { x + "->" } else { "(" + x + ")." } }
+
+// T! 的 C 表示：按值存放的是 { set, ok, val, err }，set 为 false（按位清零）表示还没赋值或已移走；
+// 经过自己的环的 T! 放在堆上，是指向 { ok, val, err } 的指针，NULL 表示还没赋值或已移走
+fn racc(c: Ctx, t: int, x: str) -> str { if is_boxed(c, t) { "(" + x + ")->" } else { "(" + x + ")." } }
+
+// T! 的变量 x 是否还没赋值（或已移走）
+fn res_unset(c: Ctx, t: int, x: str) -> str { if is_boxed(c, t) { "!" + x } else { "!(" + x + ").set" } }
+
+fn struct_def(c: Ctx, i: int) -> str {
+    n = c.structs[i].name
+    line = "struct S_#{cid(n)} {"
+    if len(c.structs[i].ftys) == 0 { line = line + " char _empty;" }
+    // 有自定义析构的结构体多一个 lk_live：构造时为 1，被移走（按位清零）后为 0，只对活着的值调用析构
+    if dtor_of(c, intern_lookup(c, "struct", n)) >= 0 { line = line + " bool lk_live;" }
+    for j in 0..len(c.structs[i].ftys) {
+        line = line + " #{cty(c, c.structs[i].ftys[j])} #{fld(c.structs[i].fnames[j])};"
+    }
+    line + " };\n"
+}
+
+// 枚举：{ tag, 各变体字段的 union }。tag 从 1 开始，0 表示已移走（按位清零），析构遇到 0 什么都不做
+fn enum_def(c: Ctx, j: int) -> str {
+    line = "struct E_#{cid(c.enums[j].name)}_s { int32_t tag; union { char _empty;"
+    for vi in 0..len(c.enums[j].variants) {
+        if len(c.enums[j].variants[vi].ftys) > 0 {
+            line = line + " struct {"
+            for k in 0..len(c.enums[j].variants[vi].ftys) {
+                line = line + " #{cty(c, c.enums[j].variants[vi].ftys[k])} #{fld(c.enums[j].variants[vi].fnames[k])};"
+            }
+            line = line + " } v#{vi};"
+        }
+    }
+    line + " } u; };\n"
+}
+
+// 枚举的析构、复制和各变体的构造函数。按值存放的直接操作 *p；在堆上的 *p 是指针，NULL 表示已移走
+fn enum_helpers(c: Ctx, ei: int) -> str {
+    en = c.enums[ei].copy()
+    t = intern_lookup(c, "enum", en.name)
+    ct = cty(c, t)
+    m = mangle(c, t)
+    boxed = is_boxed(c, t)
+    // 有自定义析构时，先对整个值调用它，再释放各个变体的字段
+    edi = dtor_of(c, t)
+    live = if boxed { "*p" } else { "p->tag" }
+    user = if edi >= 0 { " if (!#{live}) return; #{fname(c.fns[edi].name)}(p);" } else { "" }
+    d = ""
+    cp = ""
+    if boxed {
+        d = "static void lk_drop_#{m}(#{ct}* p) {#{user} #{ct} e = *p; if (!e) return; *p = NULL; switch (e->tag) {"
+        cp = "static #{ct} lk_copy_#{m}(#{ct}* p) { #{ct} e = *p; if (!e) return NULL; #{ct} r = lk_alloc(sizeof *r); r->tag = e->tag; switch (e->tag) {"
+    } else {
+        d = "static void lk_drop_#{m}(#{ct}* p) {#{user} #{ct}* e = p; switch (e->tag) {"
+        cp = "static #{ct} lk_copy_#{m}(#{ct}* p) { #{ct}* e = p; #{ct} r0 = {0}; #{ct}* r = &r0; r->tag = e->tag; switch (e->tag) {"
+    }
+    for vi in 0..len(en.variants) {
+        d = d + " case #{vi + 1}:"
+        cp = cp + " case #{vi + 1}:"
+        for j in 0..len(en.variants[vi].ftys) {
+            ft = en.variants[vi].ftys[j]
+            fl = "u.v#{vi}." + fld(en.variants[vi].fnames[j])
+            d = d + " " + drop_stmt(c, ft, "e->" + fl)
+            cp = cp + " r->#{fl} = #{copy_expr(c, ft, "e->" + fl)};"
+        }
+        d = d + " break;"
+        cp = cp + " break;"
+    }
+    o: [str] = []
+    if boxed {
+        o.push(d + " default: break; } lk_free(e); }\n")
+        o.push(cp + " default: break; } return r; }\n")
+    } else {
+        o.push(d + " default: break; } e->tag = 0; }\n")
+        o.push(cp + " default: break; } return r0; }\n")
+    }
+    for vi in 0..len(en.variants) {
+        alloc = if boxed { "#{ct} r = lk_alloc(sizeof *r); #{ct} q = r;" } else { "#{ct} q = {0}; #{ct}* r = &q;" }
+        mk = "static #{ct} lk_mk_#{m}_#{vi}(#{params_decl(c, en.variants[vi].ftys)}) { #{alloc} r->tag = #{vi + 1};"
+        for j in 0..len(en.variants[vi].ftys) {
+            mk = mk + " r->u.v#{vi}.#{fld(en.variants[vi].fnames[j])} = a#{j};"
+        }
+        o.push(mk + " return q; }\n")
+    }
+    join(o, "")
+}
+
+// lk_ok_* 的参数表：()! 没有参数
+fn res_ok_param(c: Ctx, e: int) -> str {
+    if unit_like(e) { "void" } else { cty(c, e) + " v" }
+}
+
+fn params_decl(c: Ctx, tys: [int]) -> str {
+    ps: [str] = []
+    for j in 0..len(tys) { ps.push(cty(c, tys[j]) + " a#{j}") }
+    if len(ps) == 0 { "void" } else { join(ps, ", ") }
+}
+
+fn emit_types(c: Ctx, inout g: Gen) -> str {
+    for s in c.structs {
+        for t in s.ftys { register(c, &g, t) }
+    }
+    for en in c.enums {
+        for v in en.variants {
+            for t in v.ftys { register(c, &g, t) }
+        }
+    }
+    lists = g.lists.copy()
+    torder = sort_types(c, lists)
+    order: [int] = []
+    for t in torder {
+        if tkind(c, t) == "struct" { order.push(find_struct(c, tname(c, t))) }
+    }
+    o: [str] = []
+    // 前向声明
+    for i in order {
+        n = c.structs[i].name
+        o.push("typedef struct S_#{cid(n)} S_#{cid(n)};\n")
+    }
+    for en in c.enums {
+        star = if is_boxed(c, intern_lookup(c, "enum", en.name)) { "*" } else { "" }
+        o.push("typedef struct E_#{cid(en.name)}_s#{star} E_#{cid(en.name)};\n")
+    }
+    // 按值存放的 T? 是 { some, v }；在堆上的 T? 是指向 T 的指针，NULL 表示 None。T! 是指向 { ok, val, err } 的指针
+    for t in lists {
+        ct = cty(c, t)
+        if tkind(c, t) == "opt" && is_boxed(c, t) {
+            o.push("typedef #{cty(c, telem(c, t))}* #{ct};\n")
+        } else if tkind(c, t) == "chan" {
+            o.push("typedef struct lk_chan* #{ct};\n")
+        } else if (tkind(c, t) == "res" && is_boxed(c, t)) || tkind(c, t) == "shared" || tkind(c, t) == "mutex" {
+            o.push("typedef struct #{ct}_s* #{ct};\n")
+        } else {
+            o.push("typedef struct #{ct} #{ct};\n")
+        }
+    }
+    o.push("\n")
+    for t in lists {
+        if tkind(c, t) == "list" {
+            o.push("struct #{cty(c, t)} { #{cty(c, telem(c, t))}* data; int64_t len; int64_t cap; };\n")
+        }
+        if tkind(c, t) == "dyn" {
+            o.push("struct #{cty(c, t)} { void* obj; const struct lk_vt_#{mangle(c, t)}* vt; };\n")
+        }
+        if tkind(c, t) == "ofn" {
+            // 与 fn 类型布局相同，env 指向以 lk_env 开头的堆上环境
+            o.push("struct #{cty(c, t)} { #{cty(c, telem(c, t))} (*f)(#{fn_ptr_params(c, t)}); void* env; };\n")
+        }
+    }
+    // 结构体、按值存放的枚举和 T? 按包含关系排好序再定义；在堆上的枚举只有指针，放在最后
+    for t in torder {
+        k = tkind(c, t)
+        if k == "struct" {
+            o.push(struct_def(c, find_struct(c, tname(c, t))))
+        } else if k == "enum" {
+            o.push(enum_def(c, find_enum(c, tname(c, t))))
+        } else if k == "res" {
+            e = telem(c, t)
+            val = if unit_like(e) { "char _unit;" } else { "#{cty(c, e)} val;" }
+            o.push("struct #{cty(c, t)} { bool set; bool ok; #{val} #{cty(c, res_err(c, t))} err; };\n")
+        } else {
+            o.push("struct #{cty(c, t)} { bool some; #{cty(c, telem(c, t))} v; };\n")
+        }
+    }
+    for j in 0..len(c.enums) {
+        if is_boxed(c, intern_lookup(c, "enum", c.enums[j].name)) { o.push(enum_def(c, j)) }
+    }
+    // 在堆上的 T! 的结构体：元素可能是结构体，所以放在所有结构体之后
+    for t in lists {
+        if tkind(c, t) == "res" && is_boxed(c, t) {
+            e = telem(c, t)
+            val = if unit_like(e) { "char _unit;" } else { "#{cty(c, e)} val;" }
+            o.push("struct #{cty(c, t)}_s { bool ok; #{val} #{cty(c, res_err(c, t))} err; };\n")
+        }
+    }
+    o.push("\n")
+    // shared T：{ 引用计数, 值 }，同样放在所有结构体之后
+    for t in lists {
+        if tkind(c, t) == "shared" { o.push("struct #{cty(c, t)}_s { int64_t rc; #{cty(c, telem(c, t))} v; };\n") }
+        if tkind(c, t) == "mutex" { o.push("struct #{cty(c, t)}_s { int64_t rc; lk_mutex lk; #{cty(c, telem(c, t))} v; };\n") }
+    }
+    // 函数类型：{ 函数指针, 环境指针 }。参数传递方式与普通函数的只读参数相同
+    fnts = g.fntys.copy()
+    for t in fnts {
+        cs: [str] = ["void*"]
+        fps = fn_params(c, t)
+        for p in fps {
+            star = if managed(p) && p != 2 { "*" } else { "" }
+            cs.push(cty(c, p) + star)
+        }
+        o.push("typedef struct { #{cty(c, telem(c, t))} (*f)(#{join(cs, ", ")}); void* env; } #{cty(c, t)};\n")
+    }
+    // dyn 的虚表结构体（方法参数里可能有函数类型，所以放在函数类型之后）
+    for t in lists {
+        if tkind(c, t) == "dyn" { o.push(dyn_vtable_struct(c, t)) }
+    }
+    o.push("\n")
+    // 原型
+    // 自定义析构函数的原型：lk_drop_* 里要调用它们
+    for k in 0..len(c.dtor_ty) {
+        dfn = fname(c.fns[c.dtor_fn[k]].name)
+        o.push("static void #{dfn}(#{cty(c, c.dtor_ty[k])}* x);\n")
+    }
+    all: [int] = []
+    for i in order { all.push(intern_lookup(c, "struct", c.structs[i].name)) }
+    for en in c.enums { all.push(intern_lookup(c, "enum", en.name)) }
+    for t in lists { all.push(t) }
+    // 自定义 eq 的原型：lk_eq_* 里要调用它们
+    for t in all {
+        ef = if is_user_ty(c, t) { find_op(c, "eq", t) } else { -1 }
+        if ef >= 0 {
+            ct = cty(c, t)
+            o.push("static bool #{fname(c.fns[ef].name)}(#{ct}* a, #{ct}* b);\n")
+        }
+    }
+    for t in all {
+        ct = cty(c, t)
+        m = mangle(c, t)
+        o.push("static void lk_drop_#{m}(#{ct}* p);\nstatic #{ct} lk_copy_#{m}(#{ct}* p);\n")
+        o.push("static bool lk_eq_#{m}(#{ct}* a, #{ct}* b);\n")
+        if tkind(c, t) == "chan" {
+            g.full_rt = true
+            o.push("static void lk_send_#{m}(#{ct} ch, #{cty(c, telem(c, t))} v);\nstatic #{cty(c, opt_of(c, telem(c, t)))} lk_recv_#{m}(#{ct} ch);\n")
+        }
+        if tkind(c, t) == "mutex" {
+            g.full_rt = true
+            o.push("static #{ct} lk_mutex_new_#{m}(#{cty(c, telem(c, t))} v);\n")
+        }
+        if tkind(c, t) == "shared" {
+            o.push("static #{ct} lk_share_#{m}(#{cty(c, telem(c, t))} v);\n")
+        }
+        if tkind(c, t) == "opt" {
+            o.push("static #{ct} lk_some_#{m}(#{cty(c, telem(c, t))} v);\n")
+        }
+        if tkind(c, t) == "res" {
+            o.push("static #{ct} lk_ok_#{m}(#{res_ok_param(c, telem(c, t))});\nstatic #{ct} lk_err_#{m}(#{cty(c, res_err(c, t))} e);\n")
+        }
+    }
+    for en in c.enums {
+        m = mangle(c, intern_lookup(c, "enum", en.name))
+        for vi in 0..len(en.variants) {
+            o.push("static E_#{cid(en.name)} lk_mk_#{m}_#{vi}(#{params_decl(c, en.variants[vi].ftys)});\n")
+        }
+    }
+    o.push("\n")
+    // 结构体辅助函数
+    for i in order {
+        t = intern_lookup(c, "struct", c.structs[i].name)
+        ct = cty(c, t)
+        m = mangle(c, t)
+        d = "static void lk_drop_#{m}(#{ct}* p) {"
+        di = dtor_of(c, t)
+        if di >= 0 { d = d + " if (p->lk_live) { p->lk_live = 0; #{fname(c.fns[di].name)}(p); }" }
+        cp = "static #{ct} lk_copy_#{m}(#{ct}* p) { #{ct} r = {0};"
+        for j in 0..len(c.structs[i].ftys) {
+            ft = c.structs[i].ftys[j]
+            f = fld(c.structs[i].fnames[j])
+            d = d + " " + drop_stmt(c, ft, "p->" + f)
+            cp = cp + " r.#{f} = #{copy_expr(c, ft, "p->" + f)};"
+        }
+        o.push(d + " (void)p; }\n")
+        if di >= 0 { cp = cp + " r.lk_live = p->lk_live;" }
+        o.push(cp + " (void)p; return r; }\n")
+    }
+    // 枚举辅助函数
+    for ei in 0..len(c.enums) { o.push(enum_helpers(c, ei)) }
+    // 列表与可选类型的辅助函数
+    for t in lists {
+        e = telem(c, t)
+        ct = cty(c, t)
+        m = mangle(c, t)
+        ce = if e >= 0 { cty(c, e) } else { "" }     // dyn 没有元素类型
+        e0 = e
+        if tkind(c, t) == "dyn" {
+            // 装箱的值由虚表负责释放和复制
+            o.push("static void lk_drop_#{m}(#{ct}* p) { if (p->obj) p->vt->drop(p->obj); p->obj = NULL; p->vt = NULL; }\n")
+            o.push("static #{ct} lk_copy_#{m}(#{ct}* p) { #{ct} r = *p; if (p->obj) r.obj = p->vt->copy(p->obj); return r; }\n")
+            continue
+        }
+        if tkind(c, t) == "ofn" {
+            // Fn 值：环境的计数归零时调用环境自带的释放函数（释放捕获的副本）
+            o.push("static void lk_drop_#{m}(#{ct}* p) { lk_env* e = (lk_env*)p->env; p->env = NULL; p->f = NULL; if (e && lk_rc_dec(&e->rc) == 0) { e->drop(e); lk_free(e); } }\n")
+            o.push("static #{ct} lk_copy_#{m}(#{ct}* p) { if (p->env) lk_rc_inc(&((lk_env*)p->env)->rc); return *p; }\n")
+            continue
+        }
+        if tkind(c, t) == "chan" {
+            // 队列本身在运行时里（按元素字节数存放）；最后一个持有者放手时释放队列里剩下的值
+            ot = cty(c, opt_of(c, e))
+            o.push("static void lk_drop_#{m}(#{ct}* p) { #{ct} ch = *p; if (!ch) return; *p = NULL; if (lk_chan_release(ch)) { #{ce} x; while (lk_chan_take(ch, &x)) { #{drop_stmt(c, e0, "x")} } lk_chan_free(ch); } }\n")
+            o.push("static #{ct} lk_copy_#{m}(#{ct}* p) { if (*p) lk_chan_retain(*p); return *p; }\n")
+            o.push("static void lk_send_#{m}(#{ct} ch, #{ce} v) { lk_chan_send(ch, &v); }\n")
+            ott = opt_of(c, telem(c, t))
+            if is_boxed(c, ott) {
+                o.push("static #{ot} lk_recv_#{m}(#{ct} ch) { #{ot} r = lk_alloc(sizeof *r); if (!lk_chan_recv(ch, r)) { lk_free(r); return NULL; } return r; }\n")
+            } else {
+                o.push("static #{ot} lk_recv_#{m}(#{ct} ch) { #{ot} r = {0}; if (lk_chan_recv(ch, &r.v)) r.some = true; return r; }\n")
+            }
+            continue
+        }
+        if tkind(c, t) == "mutex" {
+            // Mutex[T]：{ 引用计数, 锁, 值 }。复制只是计数加一（同一个互斥量），最后一个持有者释放时才释放值
+            o.push("static void lk_drop_#{m}(#{ct}* p) { #{ct} e = *p; if (!e) return; *p = NULL; if (lk_rc_dec(&e->rc) == 0) { #{drop_stmt(c, e0, "e->v")} lk_mutex_destroy(&e->lk); lk_free(e); } }\n")
+            o.push("static #{ct} lk_copy_#{m}(#{ct}* p) { if (*p) lk_rc_inc(&(*p)->rc); return *p; }\n")
+            o.push("static #{ct} lk_mutex_new_#{m}(#{ce} v) { #{ct} r = lk_alloc(sizeof *r); r->rc = 1; lk_mutex_init(&r->lk); r->v = v; return r; }\n")
+            continue
+        }
+        if tkind(c, t) == "shared" {
+            // 最后一个持有者释放时才释放内容（自定义析构也只在这时调用一次）；计数见运行时的 lk_rc_inc，可以跨线程共享
+            o.push("static void lk_drop_#{m}(#{ct}* p) { #{ct} e = *p; if (!e) return; *p = NULL; if (lk_rc_dec(&e->rc) == 0) { #{drop_stmt(c, e0, "e->v")} lk_free(e); } }\n")
+            o.push("static #{ct} lk_copy_#{m}(#{ct}* p) { if (*p) lk_rc_inc(&(*p)->rc); return *p; }\n")
+            o.push("static #{ct} lk_share_#{m}(#{ce} v) { #{ct} r = lk_alloc(sizeof *r); r->rc = 1; r->v = v; return r; }\n")
+            continue
+        }
+        if tkind(c, t) == "opt" && !is_boxed(c, t) {
+            o.push("static void lk_drop_#{m}(#{ct}* p) { if (!p->some) return; #{drop_stmt(c, e, "p->v")} p->some = false; }\n")
+            o.push("static #{ct} lk_copy_#{m}(#{ct}* p) { #{ct} r = {0}; if (!p->some) return r; r.some = true; r.v = #{copy_expr(c, e, "p->v")}; return r; }\n")
+            o.push("static #{ct} lk_some_#{m}(#{ce} v) { #{ct} r; r.some = true; r.v = v; return r; }\n")
+            continue
+        }
+        if tkind(c, t) == "opt" {
+            o.push("static void lk_drop_#{m}(#{ct}* p) { #{ct} e = *p; if (!e) return; *p = NULL; #{drop_stmt(c, e, "*e")} lk_free(e); }\n")
+            o.push("static #{ct} lk_copy_#{m}(#{ct}* p) { if (!*p) return NULL; #{ct} r = lk_alloc(sizeof *r); *r = #{copy_expr(c, e, "**p")}; return r; }\n")
+            o.push("static #{ct} lk_some_#{m}(#{ce} v) { #{ct} r = lk_alloc(sizeof *r); *r = v; return r; }\n")
+            continue
+        }
+        if tkind(c, t) == "res" && !is_boxed(c, t) {
+            unit = unit_like(e)
+            dv = if unit { "" } else { drop_stmt(c, e, "p->val") }
+            cv = if unit { "" } else { "r.val = #{copy_expr(c, e, "p->val")};" }
+            setv = if unit { "" } else { " r.val = v;" }
+            o.push("static void lk_drop_#{m}(#{ct}* p) { if (!p->set) return; if (p->ok) { #{dv} } else { #{drop_stmt(c, res_err(c, t), "p->err")} } memset(p, 0, sizeof *p); }\n")
+            o.push("static #{ct} lk_copy_#{m}(#{ct}* p) { #{ct} r = {0}; if (!p->set) return r; r.set = true; r.ok = p->ok; if (r.ok) { #{cv} } else { r.err = #{copy_expr(c, res_err(c, t), "p->err")}; } return r; }\n")
+            o.push("static #{ct} lk_ok_#{m}(#{res_ok_param(c, e)}) { #{ct} r = {0}; r.set = true; r.ok = true;#{setv} return r; }\n")
+            o.push("static #{ct} lk_err_#{m}(#{cty(c, res_err(c, t))} e) { #{ct} r = {0}; r.set = true; r.ok = false; r.err = e; return r; }\n")
+            continue
+        }
+        if tkind(c, t) == "res" {
+            unit = unit_like(e)
+            dv = if unit { "" } else { drop_stmt(c, e, "e->val") }
+            cv = if unit { "" } else { "r->val = #{copy_expr(c, e, "(*p)->val")};" }
+            setv = if unit { "" } else { " r->val = v;" }
+            o.push("static void lk_drop_#{m}(#{ct}* p) { #{ct} e = *p; if (!e) return; *p = NULL; if (e->ok) { #{dv} } else { #{drop_stmt(c, res_err(c, t), "e->err")} } lk_free(e); }\n")
+            o.push("static #{ct} lk_copy_#{m}(#{ct}* p) { if (!*p) return NULL; #{ct} r = lk_alloc(sizeof *r); r->ok = (*p)->ok; if (r->ok) { #{cv} } else { r->err = #{copy_expr(c, res_err(c, t), "(*p)->err")}; } return r; }\n")
+            o.push("static #{ct} lk_ok_#{m}(#{res_ok_param(c, e)}) { #{ct} r = lk_alloc(sizeof *r); r->ok = true;#{setv} return r; }\n")
+            o.push("static #{ct} lk_err_#{m}(#{cty(c, res_err(c, t))} e) { #{ct} r = lk_alloc(sizeof *r); r->ok = false; r->err = e; return r; }\n")
+            continue
+        }
+        d = "static void lk_drop_#{m}(#{ct}* p) {"
+        if managed(e) { d = d + " for (int64_t i = 0; i < p->len; i++) " + drop_stmt(c, e, "p->data[i]") }
+        o.push(d + " lk_free(p->data); p->data = NULL; p->len = p->cap = 0; }\n")
+        o.push("static #{ct} lk_copy_#{m}(#{ct}* p) { #{ct} r; r.len = p->len; r.cap = p->len; r.data = p->len ? lk_alloc(sizeof(#{ce}) * p->len) : NULL;")
+        o.push(" for (int64_t i = 0; i < p->len; i++) r.data[i] = #{copy_expr(c, e, "p->data[i]")}; return r; }\n")
+        o.push("static void lk_push_#{m}(#{ct}* p, #{ce} v) { if (p->len == p->cap) { p->cap = p->cap ? p->cap * 2 : 4; p->data = lk_realloc(p->data, sizeof(#{ce}) * p->cap); } p->data[p->len++] = v; }\n")
+        // reserve：至少还能再放 n 个而不扩容（n <= 0 时什么都不做）
+        o.push("static void lk_reserve_#{m}(#{ct}* p, int64_t n) { if (n <= 0 || p->len + n <= p->cap) return; if (n > INT64_MAX / 2 - p->len) lk_panic_c(\"reserve: 容量太大\"); p->cap = p->len + n; p->data = lk_realloc(p->data, sizeof(#{ce}) * p->cap); }\n")
+        o.push("static #{ce} lk_pop_#{m}(#{ct}* p) { if (p->len == 0) lk_panic_c(\"pop: 列表为空\"); return p->data[--p->len]; }\n")
+        // insert_at / remove_at：用 memmove 整段挪（元素只是按位移动，不复制、不释放）
+        o.push("static void lk_insert_at_#{m}(#{ct}* p, int64_t i, #{ce} v) { if (i < 0 || i > p->len) lk_index_oob(i, p->len); if (p->len == p->cap) { p->cap = p->cap ? p->cap * 2 : 4; p->data = lk_realloc(p->data, sizeof(#{ce}) * p->cap); } memmove(p->data + i + 1, p->data + i, sizeof(#{ce}) * (size_t)(p->len - i)); p->data[i] = v; p->len++; }\n")
+        o.push("static #{ce} lk_remove_at_#{m}(#{ct}* p, int64_t i) { if (i < 0 || i >= p->len) lk_index_oob(i, p->len); #{ce} v = p->data[i]; memmove(p->data + i, p->data + i + 1, sizeof(#{ce}) * (size_t)(p->len - i - 1)); p->len--; return v; }\n")
+        o.push("static #{ce}* lk_at_#{m}(#{ct}* p, int64_t i) { if (i < 0 || i >= p->len) lk_index_oob(i, p->len); return &p->data[i]; }\n")
+    }
+    for t in all { o.push(eq_fn(c, t)) }
+    join(o, "")
+}
+
+// 两个同类型的值（C 里的位置表达式）是否相等
+fn eq_expr(c: Ctx, t: int, a: str, b: str) -> str {
+    if t == 0 || t == 1 || t == 9 || is_fixed(t) {
+        "(#{a} == #{b})"
+    } else if t == 2 {
+        "lk_str_eq(#{a}, #{b})"
+    } else if unit_like(t) {
+        "true"
+    } else {
+        "lk_eq_#{mangle(c, t)}(&(#{a}), &(#{b}))"
+    }
+}
+
+fn eq_fields(c: Ctx, tys: [int], names: [str], a: str, b: str) -> str {
+    parts: [str] = ["true"]
+    for j in 0..len(tys) {
+        f = fld(names[j])
+        parts.push(eq_expr(c, tys[j], a + f, b + f))
+    }
+    join(parts, " && ")
+}
+
+// lk_eq_*：结构体逐字段；枚举先比 tag 再比该变体的字段；列表先比长度；T? / T! 先比有没有值
+fn eq_fn(c: Ctx, t: int) -> str {
+    ct = cty(c, t)
+    m = mangle(c, t)
+    k = tkind(c, t)
+    head = "static bool lk_eq_#{m}(#{ct}* a, #{ct}* b) {"
+    ef = if is_user_ty(c, t) { find_op(c, "eq", t) } else { -1 }
+    if ef >= 0 {
+        // 自定义的 fn eq(a: T, b: T) -> bool
+        "#{head} return #{fname(c.fns[ef].name)}(a, b); }\n"
+    } else if k == "struct" {
+        si = find_struct(c, tname(c, t))
+        body = eq_fields(c, c.structs[si].ftys, c.structs[si].fnames, "a->", "b->")
+        "#{head} return #{body}; }\n"
+    } else if k == "enum" {
+        ei = find_enum(c, tname(c, t))
+        cs: [str] = []
+        for vi in 0..len(c.enums[ei].variants) {
+            pre = "u.v#{vi}."
+            body = eq_fields(c, c.enums[ei].variants[vi].ftys, c.enums[ei].variants[vi].fnames, "x->" + pre, "y->" + pre)
+            cs.push(" case #{vi + 1}: return #{body};")
+        }
+        // 在堆上的枚举先比指针（NULL 是已移走）；按值存放的直接比 tag
+        pre0 = if is_boxed(c, t) { "#{ct} x = *a, y = *b; if (x == y) return true; if (!x || !y || x->tag != y->tag) return false;" } else { "#{ct}* x = a; #{ct}* y = b; if (x->tag != y->tag) return false;" }
+        "#{head} #{pre0} switch (x->tag) {#{join(cs, "")} default: return true; } }\n"
+    } else if k == "list" {
+        el = eq_expr(c, telem(c, t), "a->data[i]", "b->data[i]")
+        "#{head} if (a->len != b->len) return false; for (int64_t i = 0; i < a->len; i++) if (!#{el}) return false; return true; }\n"
+    } else if k == "dyn" {
+        // 同一个对象，或者装的类型相同、值也相等
+        "#{head} if (a->obj == b->obj) return true; if (a->vt->tid != b->vt->tid) return false; if (!a->vt->eq) lk_panic_c(\"dyn 里装的值不能比较\"); return a->vt->eq(a->obj, b->obj); }\n"
+    } else if k == "ofn" {
+        "#{head} return a->f == b->f && a->env == b->env; }\n"
+    } else if k == "chan" {
+        "#{head} return *a == *b; }\n"
+    } else if k == "mutex" {
+        "#{head} return *a == *b; }\n"
+    } else if k == "shared" {
+        el = eq_expr(c, telem(c, t), "(*a)->v", "(*b)->v")
+        "#{head} if (*a == *b) return true; if (!*a || !*b) return false; return #{el}; }\n"
+    } else if k == "opt" {
+        boxed = is_boxed(c, t)
+        va = if boxed { "**a" } else { "a->v" }
+        vb = if boxed { "**b" } else { "b->v" }
+        el = eq_expr(c, telem(c, t), va, vb)
+        pre = if boxed { "if (!*a || !*b) return *a == *b;" } else { "if (a->some != b->some) return false; if (!a->some) return true;" }
+        "#{head} #{pre} return #{el}; }\n"
+    } else if is_boxed(c, t) {
+        e = telem(c, t)
+        ve = if unit_like(e) { "true" } else { eq_expr(c, e, "x->val", "y->val") }
+        "#{head} #{ct} x = *a, y = *b; if (!x || !y) return x == y; if (x->ok != y->ok) return false; if (x->ok) return #{ve}; return #{eq_expr(c, res_err(c, t), "x->err", "y->err")}; }\n"
+    } else {
+        e = telem(c, t)
+        ve = if unit_like(e) { "true" } else { eq_expr(c, e, "x->val", "y->val") }
+        "#{head} #{ct}* x = a; #{ct}* y = b; if (!x->set || !y->set) return x->set == y->set; if (x->ok != y->ok) return false; if (x->ok) return #{ve}; return #{eq_expr(c, res_err(c, t), "x->err", "y->err")}; }\n"
+    }
+}
+
+// T!E 的 mangle 后缀：T! 为空，否则是 X + E 的 mangle（X 不是任何类型 mangle 的开头，所以不会混淆）
+fn res_tag(c: Ctx, t: int) -> str {
+    er = res_err(c, t)
+    if er == 2 { "" } else { "X" + mangle(c, er) }
+}
+
+// 函数类型 / Fn 类型对应的 C 函数指针的参数表：环境指针在前，参数传递方式与普通函数的只读参数相同
+fn fn_ptr_params(c: Ctx, t: int) -> str {
+    cs: [str] = ["void*"]
+    fps = fn_params(c, t)
+    for p in fps {
+        star = if managed(p) && p != 2 { "*" } else { "" }
+        cs.push(cty(c, p) + star)
+    }
+    join(cs, ", ")
+}
+
+// 参数按传递方式对应的 C 类型（同普通函数）
+fn param_cty(c: Ctx, mode: str, t: int) -> str {
+    if mode == "inout" || (mode == "read" && managed(t) && t != 2) { cty(c, t) + "*" } else { cty(c, t) }
+}
+
+// ---------- 插值 ----------
+// lk_show_<m>(lk_str* o, T* p)：把 *p 拼到 o 后面。有 fn show 就调用它，否则列表、T?、元组按元素拼。
+// 它们会调用用户的 show，所以放在函数原型之后（见 gen_program）。
+
+fn register_show(c: Ctx, inout g: Gen, t: int) {
+    if t == 0 || t == 1 || t == 2 || t == 9 || is_fixed(t) || has(g.shows, t) { return }
+    register(c, &g, t)
+    g.shows.push(t)
+    if show_fn(c, t) >= 0 { return }
+    if tkind(c, t) == "list" || tkind(c, t) == "opt" {
+        register_show(c, &g, telem(c, t))
+    } else if is_tuple(c, t) {
+        es = tuple_elems(c, t)
+        for el in es { register_show(c, &g, el) }
+    }
+}
+
+// 容器里的一个元素（C 里的位置表达式 x）；字符串加引号
+fn show_elem(c: Ctx, t: int, x: str) -> str {
+    if t == 0 || is_fixed(t) { "lk_str_append_int(o, #{x});" } else if t == 9 { "lk_str_append_float(o, #{x});" } else if t == 1 { "lk_str_append_bool(o, #{x});" } else if t == 2 { "lk_str_append_quoted(o, #{x});" } else { "lk_show_#{mangle(c, t)}(o, &(#{x}));" }
+}
+
+fn show_def(c: Ctx, t: int) -> str {
+    head = "static void lk_show_#{mangle(c, t)}(lk_str* o, #{cty(c, t)}* p) {"
+    fi = show_fn(c, t)
+    k = tkind(c, t)
+    if fi >= 0 {
+        "#{head} lk_str s = #{fname(c.fns[fi].name)}(p); lk_str_append(o, s); #{drop_stmt(c, 2, "s")} }\n"
+    } else if k == "list" {
+        el = show_elem(c, telem(c, t), "p->data[i]")
+        "#{head} lk_str_append_c(o, \"[\"); for (int64_t i = 0; i < p->len; i++) { if (i > 0) lk_str_append_c(o, \", \"); #{el} } lk_str_append_c(o, \"]\"); }\n"
+    } else if k == "opt" {
+        boxed = is_boxed(c, t)
+        vp = if boxed { "**p" } else { "p->v" }
+        el = show_elem(c, telem(c, t), vp)
+        none = if boxed { "!*p" } else { "!p->some" }
+        "#{head} if (#{none}) { lk_str_append_c(o, \"None\"); return; } lk_str_append_c(o, \"Some(\"); #{el} lk_str_append_c(o, \")\"); }\n"
+    } else {
+        es = tuple_elems(c, t)
+        ps: [str] = []
+        for j in 0..len(es) {
+            sep = if j > 0 { "lk_str_append_c(o, \", \"); " } else { "" }
+            ps.push(sep + show_elem(c, es[j], "p->" + fld(int_str(j))))
+        }
+        "#{head} lk_str_append_c(o, \"(\"); #{join(ps, " ")} lk_str_append_c(o, \")\"); }\n"
+    }
+}
+
+fn emit_shows(c: Ctx, g: Gen) -> str {
+    o: [str] = []
+    for t in g.shows {
+        o.push("static void lk_show_#{mangle(c, t)}(lk_str* o, #{cty(c, t)}* p);\n")
+    }
+    for t in g.shows { o.push(show_def(c, t)) }
+    join(o, "")
+}
+
+// dyn 类型的虚表：释放、复制，再按接口方法的顺序放每个方法（第一个参数是装箱的值）
+fn dyn_vtable_struct(c: Ctx, t: int) -> str {
+    m = mangle(c, t)
+    // tid：装的具体类型的编号；eq：比较两个同类型的值（具体类型不能比较时为 NULL）
+    fs: [str] = ["void (*drop)(void*);", "void* (*copy)(void*);", "int64_t tid;", "bool (*eq)(void*, void*);"]
+    k = 0
+    for i in 0..len(c.dsig_t) {
+        if c.dsig_t[i] == t {
+            sg = c.dsig_s[i].copy()
+            ps: [str] = ["void*"]
+            for j in 1..len(sg.tys) { ps.push(param_cty(c, sg.modes[j], sg.tys[j])) }
+            fs.push("#{cty(c, sg.ret)} (*m#{k})(#{join(ps, ", ")});")
+            k += 1
+        }
+    }
+    "struct lk_vt_#{m} { #{join(fs, " ")} };\n"
+}
+
+// 每个 (dyn 类型, 具体类型) 组合：方法的转接函数、虚表、装箱函数。放在函数原型之后
+fn emit_dyn_impls(c: Ctx, inout g: Gen) -> str {
+    o: [str] = []
+    for i in 0..len(c.dyn_ty) {
+        dt = c.dyn_ty[i]
+        st = c.dyn_src[i]
+        dm = mangle(c, dt)
+        sm = mangle(c, st)
+        dct = ctype(c, &g, dt)
+        sct = ctype(c, &g, st)
+        tag = "#{dm}_#{sm}"
+        fns = split_commas(c.dyn_fns[i])
+        o.push("static void lk_vd_#{tag}(void* p) { #{sct}* x = p; #{drop_stmt(c, st, "*x")} lk_free(x); }\n")
+        o.push("static void* lk_vc_#{tag}(void* p) { #{sct}* r = lk_alloc(sizeof *r); *r = #{copy_expr(c, st, "*(" + sct + "*)p")}; return r; }\n")
+        self_arg = if managed(st) && st != 2 { "(#{sct}*)self" } else { "*(#{sct}*)self" }
+        eqf = "NULL"
+        if is_eq(c, st) {
+            eqf = "lk_ve_#{tag}"
+            o.push("static bool lk_ve_#{tag}(void* a, void* b) { return #{eq_expr(c, st, "*(" + sct + "*)a", "*(" + sct + "*)b")}; }\n")
+        }
+        ents: [str] = ["lk_vd_#{tag}", "lk_vc_#{tag}", "INT64_C(#{st})", eqf]
+        k = 0
+        for j in 0..len(c.dsig_t) {
+            if c.dsig_t[j] == dt {
+                sg = c.dsig_s[j].copy()
+                ps: [str] = ["void* self"]
+                cargs: [str] = [self_arg]
+                for q in 1..len(sg.tys) {
+                    ps.push(param_cty(c, sg.modes[q], sg.tys[q]) + " a#{q}")
+                    cargs.push("a#{q}")
+                }
+                rct = cty(c, sg.ret)
+                call = fname(fns[k]) + "(" + join(cargs, ", ") + ")"
+                body = if unit_like(sg.ret) { call + ";" } else { "return " + call + ";" }
+                o.push("static #{rct} lk_vm_#{tag}_#{k}(#{join(ps, ", ")}) { #{body} }\n")
+                ents.push("lk_vm_#{tag}_#{k}")
+                k += 1
+            }
+        }
+        o.push("static const struct lk_vt_#{dm} lk_vt_#{tag} = { #{join(ents, ", ")} };\n")
+        o.push("static #{dct} lk_mkdyn_#{tag}(#{sct} v) { #{dct} r; #{sct}* b = lk_alloc(sizeof *b); *b = v; r.obj = b; r.vt = &lk_vt_#{tag}; return r; }\n\n")
+    }
+    join(o, "")
+}
+
+fn split_commas(s: str) -> [str] {
+    out: [str] = []
+    if s == "" { return out }
+    start = 0
+    for i in 0..len(s) {
+        if byte_at(s, i) == ',' {
+            out.push(slice(s, start, i))
+            start = i + 1
+        }
+    }
+    out.push(slice(s, start, len(s)))
+    out
+}
+
+// ---------- 单元测试（lark1 --test，见 make unit-compiler） ----------
+
+test "代码生成：C 字符串字面量" {
+    assert_eq(c_string("ab"), "\"ab\"")
+    assert_eq(c_string("a\"b\\c"), "\"a\\\"b\\\\c\"")
+    assert_eq(c_string("\n"), "\"\\012\"")
+    // ? 也转义，避免 C 的三字符组
+    assert_eq(c_string("??="), "\"\\077\\077=\"")
+    assert_eq(octal3(255), "377")
+    assert_eq(octal3(7), "007")
+}
+
+test "代码生成：C 标识符" {
+    assert_eq(cid("geo.Vec2"), "geo_M_Vec2")
+    assert_eq(cid("a.b.c"), "a_M_b_M_c")
+    assert_eq(cid("plain"), "plain")
+    assert_eq(fname("map.get"), "f_map_M_get")
+    assert_eq(fld("x"), "f_x")
+    assert_eq(split_commas("a,b,,c"), ["a", "b", "", "c"])
+    assert_eq(len(split_commas("")), 0)
+}
+
+test "代码生成：类型的 C 名字" {
+    no_toks: [Tok] = []
+    c = new_ctx(0, no_toks)
+    assert_eq(cty(c, 0), "int64_t")
+    assert_eq(cty(c, 9), "double")
+    assert_eq(cty(c, 11), "uint8_t")
+    assert_eq(mangle(c, 13), "Lu")
+    assert_eq(cty(c, 14), "uint16_t")
+    assert_eq(cty(c, 16), "int32_t")
+    assert_eq(mangle(c, 15), "d")
+    assert_eq(mangle(c, 19), "Oj")
+    assert_eq(cty(c, 2), "lk_str")
+    assert_eq(cty(c, 3), "void")
+    assert_eq(cty(c, 6), "LK_Ls")
+    nested = resolve_ty(&c, "[int?]", 1, 1)
+    assert_eq(mangle(c, nested), "LOi")
+    assert_eq(cty(c, nested), "LK_LOi")
+    assert_eq(drop_stmt(c, 0, "x"), "")
+    assert_eq(drop_stmt(c, 6, "x"), "lk_drop_Ls(&(x));")
+    assert_eq(copy_expr(c, 0, "x"), "x")
+    assert_eq(copy_expr(c, 6, "x"), "lk_copy_Ls(&(x))")
+}

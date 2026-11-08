@@ -1,0 +1,276 @@
+// Lark 标准库 · 迭代器（用 Lark 自己写）
+// 用法：import "std/iter"
+//
+//   iter.count_from(1).map(|n| n * n).take_n(5).collect()   // [1, 4, 9, 16, 25]
+//   xs.filter(|x| x > 0).enumerate().collect()              // 列表直接接着写
+//   for (w, n) in iter.zip(words, iter.count_from(1)) { … } // for in 直接取
+//
+// 只有一套函数，分两种：
+// - 适配器（map、filter、take_n、skip_n、take_while、enumerate、zip、chain）是惰性的：只把来源包起来，返回的结构体
+//   （Mapped、Filtered、Taken……）本身也是迭代器，每次 next 才往前走一步，所以能一层层套、能接在无限迭代器后面。
+//   来源可以是列表，也可以是定义了 fn next(inout it: T) -> E? 的迭代器：每个适配器按第一个参数重载，列表的那个先用
+//   each 包一下。zip、chain 的第二个来源要是迭代器，列表先 each(ys)。闭包会存进结构体，是 Fn 闭包（捕获的变量复制进去）。
+// - 取值的函数（collect、fold、find、any、all、count）把来源走一遍得出结果；find、any、all 会提前停下。
+//   来源可以是列表、迭代器，或者能借用遍历的类型（约束 Iter[T]）。
+// 来源都归函数所有：要接着用的列表先 copy 一份。这些函数也能用方法语法调用：xs.map(f)、it.take_n(5).collect()。
+
+// lo 到 hi - 1 的整数
+pub type Range {
+    cur: int
+    end: int
+}
+
+pub fn range(lo: int, hi: int) -> Range { Range(cur: lo, end: hi) }
+
+pub fn next(inout r: Range) -> int? {
+    if r.cur >= r.end { return None }
+    r.cur += 1
+    Some(r.cur - 1)
+}
+
+// 从 n 开始无限地数下去
+pub type Counter {
+    cur: int
+}
+
+pub fn count_from(n: int) -> Counter { Counter(cur: n) }
+
+pub fn next(inout k: Counter) -> int? {
+    k.cur += 1
+    Some(k.cur - 1)
+}
+
+// ---------- 取值 ----------
+
+// 全部放进列表（列表元素是借用的，放进结果时复制一份）
+pub fn collect[I: Iter[T], T](take it: I) -> [T] {
+    out: [T] = []
+    for x in it { out.push(x.copy()) }
+    out
+}
+
+pub fn fold[I: Iter[T], T, A](take it: I, take init: A, f: fn(A, T) -> A) -> A {
+    acc = init
+    for x in it { acc = f(acc, x) }
+    acc
+}
+
+// 第一个满足 pred 的元素；没有时为 None
+pub fn find[I: Iter[T], T](take it: I, pred: fn(T) -> bool) -> T? {
+    for x in it {
+        if pred(x) { return Some(x.copy()) }
+    }
+    None
+}
+
+pub fn any[I: Iter[T], T](take it: I, pred: fn(T) -> bool) -> bool {
+    for x in it {
+        if pred(x) { return true }
+    }
+    false
+}
+
+pub fn all[I: Iter[T], T](take it: I, pred: fn(T) -> bool) -> bool {
+    for x in it {
+        if !pred(x) { return false }
+    }
+    true
+}
+
+pub fn count[I: Iter[T], T](take it: I) -> int {
+    n = 0
+    for _x in it { n += 1 }
+    n
+}
+
+// ---------- 适配器 ----------
+
+// 依次给出列表的元素（列表归迭代器所有，元素复制一份给出）
+pub type Each[T] {
+    xs: [T]
+    i: int
+}
+
+pub fn each[T](take xs: [T]) -> Each[T] { Each(xs: xs, i: 0) }
+
+pub fn next[T](inout e: Each[T]) -> T? {
+    if e.i >= len(e.xs) { return None }
+    e.i += 1
+    Some(e.xs[e.i - 1].copy())
+}
+
+pub type Mapped[I, T, U] {
+    src: I
+    f: Fn(T) -> U
+}
+
+// 每个元素经过 f
+pub fn map[I: Next[T], T, U](take it: I, take f: Fn(T) -> U) -> Mapped[I, T, U] { Mapped(src: it, f: f) }
+
+pub fn map[T, U](take xs: [T], take f: Fn(T) -> U) -> Mapped[Each[T], T, U] { Mapped(src: each(xs), f: f) }
+
+pub fn next[I: Next[T], T, U](inout m: Mapped[I, T, U]) -> U? {
+    f = m.f.copy()
+    r = next(&m.src)
+    match take r {
+        Some(x) => Some(f(x))
+        None => None
+    }
+}
+
+pub type Filtered[I, T] {
+    src: I
+    keep: Fn(T) -> bool
+}
+
+// 只留下 keep 为 true 的元素
+pub fn filter[I: Next[T], T](take it: I, take keep: Fn(T) -> bool) -> Filtered[I, T] { Filtered(src: it, keep: keep) }
+
+pub fn filter[T](take xs: [T], take keep: Fn(T) -> bool) -> Filtered[Each[T], T] { Filtered(src: each(xs), keep: keep) }
+
+pub fn next[I: Next[T], T](inout m: Filtered[I, T]) -> T? {
+    keep = m.keep.copy()
+    for {
+        r = next(&m.src)
+        match take r {
+            Some(x) => {
+                if keep(x) { return Some(x) }
+            }
+            None => { return None }
+        }
+    }
+    None
+}
+
+pub type Taken[I] {
+    src: I
+    left: int
+}
+
+// 最多 n 个（不足 n 个时全部）；够数之后不再动来源，所以能接在无限迭代器后面
+pub fn take_n[I: Next[T], T](take it: I, n: int) -> Taken[I] { Taken(src: it, left: n) }
+
+pub fn take_n[T](take xs: [T], n: int) -> Taken[Each[T]] { Taken(src: each(xs), left: n) }
+
+pub fn next[I: Next[T], T](inout t: Taken[I]) -> T? {
+    if t.left <= 0 { return None }
+    t.left -= 1
+    next(&t.src)
+}
+
+pub type Skipped[I] {
+    src: I
+    left: int
+}
+
+// 跳过前 n 个（第一次 next 时才跳）
+pub fn skip_n[I: Next[T], T](take it: I, n: int) -> Skipped[I] { Skipped(src: it, left: n) }
+
+pub fn skip_n[T](take xs: [T], n: int) -> Skipped[Each[T]] { Skipped(src: each(xs), left: n) }
+
+pub fn next[I: Next[T], T](inout s: Skipped[I]) -> T? {
+    for s.left > 0 {
+        s.left -= 1
+        _drop = next(&s.src)
+    }
+    next(&s.src)
+}
+
+pub type TakenWhile[I, T] {
+    src: I
+    keep: Fn(T) -> bool
+    done: bool
+}
+
+// 一直取到第一个 keep 为 false 的元素为止（那个元素丢掉）
+pub fn take_while[I: Next[T], T](take it: I, take keep: Fn(T) -> bool) -> TakenWhile[I, T] {
+    TakenWhile(src: it, keep: keep, done: false)
+}
+
+pub fn take_while[T](take xs: [T], take keep: Fn(T) -> bool) -> TakenWhile[Each[T], T] {
+    TakenWhile(src: each(xs), keep: keep, done: false)
+}
+
+pub fn next[I: Next[T], T](inout w: TakenWhile[I, T]) -> T? {
+    if w.done { return None }
+    keep = w.keep.copy()
+    r = next(&w.src)
+    match take r {
+        Some(x) => {
+            if keep(x) { return Some(x) }
+            w.done = true
+            None
+        }
+        None => {
+            w.done = true
+            None
+        }
+    }
+}
+
+pub type Enumerated[I] {
+    src: I
+    i: int
+}
+
+// 带上从 0 开始的序号：(0, a), (1, b), …
+pub fn enumerate[I: Next[T], T](take it: I) -> Enumerated[I] { Enumerated(src: it, i: 0) }
+
+pub fn enumerate[T](take xs: [T]) -> Enumerated[Each[T]] { Enumerated(src: each(xs), i: 0) }
+
+pub fn next[I: Next[T], T](inout e: Enumerated[I]) -> (int, T)? {
+    r = next(&e.src)
+    match take r {
+        Some(x) => {
+            e.i += 1
+            Some((e.i - 1, x))
+        }
+        None => None
+    }
+}
+
+pub type Zipped[A, B] {
+    a: A
+    b: B
+}
+
+// 两个来源一一配对，较短的那个走完就结束。按第一个参数重载，所以 a 可以是列表，b 是列表时要先 each(b)
+pub fn zip[A: Next[T], B: Next[U], T, U](take a: A, take b: B) -> Zipped[A, B] { Zipped(a: a, b: b) }
+
+pub fn zip[T, B: Next[U], U](take a: [T], take b: B) -> Zipped[Each[T], B] { Zipped(a: each(a), b: b) }
+
+pub fn next[A: Next[T], B: Next[U], T, U](inout z: Zipped[A, B]) -> (T, U)? {
+    ra = next(&z.a)
+    match take ra {
+        Some(x) => {
+            rb = next(&z.b)
+            match take rb {
+                Some(y) => Some((x, y))
+                None => None
+            }
+        }
+        None => None
+    }
+}
+
+pub type Chained[A, B] {
+    a: A
+    b: B
+    first_done: bool
+}
+
+// 先走完 a，再走 b（两者的元素类型相同）；和 zip 一样，a 可以是列表，b 是列表时要先 each(b)
+pub fn chain[A: Next[T], B: Next[T], T](take a: A, take b: B) -> Chained[A, B] { Chained(a: a, b: b, first_done: false) }
+
+pub fn chain[T, B: Next[T]](take a: [T], take b: B) -> Chained[Each[T], B] { Chained(a: each(a), b: b, first_done: false) }
+
+pub fn next[A: Next[T], B: Next[T], T](inout ch: Chained[A, B]) -> T? {
+    if !ch.first_done {
+        r = next(&ch.a)
+        match take r {
+            Some(x) => { return Some(x) }
+            None => { ch.first_done = true }
+        }
+    }
+    next(&ch.b)
+}

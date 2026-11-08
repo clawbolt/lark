@@ -1,0 +1,11 @@
+// 期望错误：析构函数会自动调用，不能直接调用
+type File {
+    fd: int
+}
+
+fn drop(inout f: File) {}
+
+fn main() {
+    a = File(fd: 1)
+    drop(&a)
+}

@@ -1,0 +1,14 @@
+// 期望错误：job 的值已经被移走（移进了新线程），不能再使用
+type Job {
+    name: str
+}
+
+fn work(take j: Job) { print(j.name) }
+
+fn main() {
+    job = Job(name: "a")
+    scope {
+        spawn(work, job)
+        print(job.name)
+    }
+}

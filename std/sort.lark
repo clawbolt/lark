@@ -1,0 +1,138 @@
+// Lark 标准库 · 排序（用 Lark 自己写）
+// 用法：import "std/sort"
+//
+//   sort.sort(&xs)                              // 原地排序，T: Ord（int / float / str / 定义了 fn cmp 的类型）
+//   ys = sort.sorted(xs)                        // 拿走 xs，返回排好的新列表
+//   sort.sort_by(&people, |a, b| a.age - b.age) // 自定义比较：负数表示 a 在前
+//   sort.reversed(xs)、sort.is_sorted(xs)、sort.min_of(xs)、sort.max_of(xs)
+//   sort.binary_search(xs, x) -> int?、sort.lower_bound(xs, x)、sort.upper_bound(xs, x)  // xs 要先排好
+//   sort.dedup(&xs)                             // 原地去掉相邻的重复；sort 以后用就是去重
+//
+// 归并排序，O(n log n)，稳定（比较相等的元素保持原来的先后）。
+// 列表只能从末尾取出元素，所以拆分和合并都从末尾做，最后再倒一次。
+
+pub fn sorted[T: Ord](take xs: [T]) -> [T] {
+    msort_by(xs, |a, b| if a < b { -1 } else if b < a { 1 } else { 0 })
+}
+
+pub fn sort[T: Ord](inout xs: [T]) {
+    tmp = replace(&xs, [])
+    xs = sorted(tmp)
+}
+
+pub fn sorted_by[T](take xs: [T], by: fn(T, T) -> int) -> [T] {
+    msort_by(xs, by)
+}
+
+pub fn sort_by[T](inout xs: [T], by: fn(T, T) -> int) {
+    tmp = replace(&xs, [])
+    xs = msort_by(tmp, by)
+}
+
+fn msort_by[T](take xs: [T], by: fn(T, T) -> int) -> [T] {
+    n = len(xs)
+    if n <= 1 { return xs }
+    // 后一半挪进 back（顺序倒了），再倒回 right
+    back: [T] = []
+    back.reserve(n - n / 2)
+    for len(xs) > n / 2 { back.push(xs.pop()) }
+    right: [T] = []
+    right.reserve(len(back))
+    for len(back) > 0 { right.push(back.pop()) }
+    a = msort_by(xs, by)
+    b = msort_by(right, by)
+    merge_by(a, b, by)
+}
+
+// 从两个有序列表的末尾往前合并，每次取较大的那个；相等时先取 b 的，
+// 这样 a 里的元素仍然排在 b 的同等元素前面（稳定）
+fn merge_by[T](take a: [T], take b: [T], by: fn(T, T) -> int) -> [T] {
+    rev: [T] = []
+    rev.reserve(len(a) + len(b))
+    for len(a) > 0 && len(b) > 0 {
+        if by(a[len(a) - 1], b[len(b) - 1]) > 0 {
+            rev.push(a.pop())
+        } else {
+            rev.push(b.pop())
+        }
+    }
+    for len(a) > 0 { rev.push(a.pop()) }
+    for len(b) > 0 { rev.push(b.pop()) }
+    out: [T] = []
+    out.reserve(len(rev))
+    for len(rev) > 0 { out.push(rev.pop()) }
+    out
+}
+
+pub fn reversed[T](take xs: [T]) -> [T] {
+    out: [T] = []
+    for len(xs) > 0 { out.push(xs.pop()) }
+    out
+}
+
+pub fn is_sorted[T: Ord](xs: [T]) -> bool {
+    for i in 1..len(xs) {
+        if xs[i] < xs[i - 1] { return false }
+    }
+    true
+}
+
+// 下面三个要求 xs 已经从小到大排好。二分查找，O(log n)
+// 第一个不小于 x 的下标；都比 x 小时是 len(xs)。把 x 插在这里，列表仍然有序
+pub fn lower_bound[T: Ord](xs: [T], x: T) -> int {
+    lo = 0
+    hi = len(xs)
+    for lo < hi {
+        mid = lo + (hi - lo) / 2
+        if xs[mid] < x { lo = mid + 1 } else { hi = mid }
+    }
+    lo
+}
+
+// 第一个比 x 大的下标；upper_bound - lower_bound 就是等于 x 的个数
+pub fn upper_bound[T: Ord](xs: [T], x: T) -> int {
+    lo = 0
+    hi = len(xs)
+    for lo < hi {
+        mid = lo + (hi - lo) / 2
+        if x < xs[mid] { hi = mid } else { lo = mid + 1 }
+    }
+    lo
+}
+
+// 等于 x 的元素的下标（有好几个时是第一个）；没有时为 None
+pub fn binary_search[T: Ord](xs: [T], x: T) -> int? {
+    i = lower_bound(xs, x)
+    if i < len(xs) && !(x < xs[i]) { Some(i) } else { None }
+}
+
+// 原地去掉相邻的重复元素，只留第一个：先 sort 再 dedup 就是去重
+pub fn dedup[T: Eq](inout xs: [T]) {
+    tmp = replace(&xs, [])
+    rev: [T] = []
+    rev.reserve(len(tmp))
+    for len(tmp) > 0 { rev.push(tmp.pop()) }
+    for len(rev) > 0 {
+        v = rev.pop()
+        if len(xs) == 0 || !(xs[len(xs) - 1] == v) { xs.push(v) }
+    }
+}
+
+// 最小的元素的副本；空列表时为 None
+pub fn min_of[T: Ord](xs: [T]) -> T? {
+    if len(xs) == 0 { return None }
+    best = 0
+    for i in 1..len(xs) {
+        if xs[i] < xs[best] { best = i }
+    }
+    Some(xs[best].copy())
+}
+
+pub fn max_of[T: Ord](xs: [T]) -> T? {
+    if len(xs) == 0 { return None }
+    best = 0
+    for i in 1..len(xs) {
+        if xs[best] < xs[i] { best = i }
+    }
+    Some(xs[best].copy())
+}

@@ -1,0 +1,349 @@
+// std/http 的测试：请求的解析在 apps/lhttp 的测试里（流水线、错误码、百分号编码），这里测客户端那一半：
+// 拆 URL、解析回复、chunked，以及服务器的路由和回复。真的发请求在 examples/httpget.lark；serve 由 lhttp、lcache 的端到端测试跑
+import "std/http"
+import "std/net"
+import "std/str"
+
+fn url(u: str) -> (str, int, str) {
+    match take http.parse_url(u) {
+        Ok(t) => t
+        Err(e) => panic(e)
+    }
+}
+
+fn resp(raw: str) -> http.Response {
+    match take http.parse_response(raw, false) {
+        Ok(r) => r
+        Err(e) => panic(e)
+    }
+}
+
+test "拆 URL" {
+    h, p, path = url("http://127.0.0.1:8080/a/b?x=1")
+    assert_eq(h, "127.0.0.1")
+    assert_eq(p, 8080)
+    assert_eq(path, "/a/b?x=1")
+    h2, p2, path2 = url("http://example.com")
+    assert_eq(h2, "example.com")
+    assert_eq(p2, 80)
+    assert_eq(path2, "/")
+    bad = 0
+    for u in ["https://a.com/", "ftp://a", "http://", "http://a:0/", "http://a:99999/", "http://a:x/"] {
+        match http.parse_url(u) {
+            Ok(_) => {}
+            Err(_) => { bad += 1 }
+        }
+    }
+    assert_eq(bad, 6)
+}
+
+test "解析回复" {
+    r = resp("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello, extra")
+    assert_eq(r.status, 200)
+    assert_eq(r.reason, "OK")
+    assert(http.header(r, "content-type") == Some("text/plain"))
+    assert_eq(r.body, "hello")
+    // 没有 Content-Length：读到的全部
+    r2 = resp("HTTP/1.0 404 Not Found\r\n\r\nnope")
+    assert_eq(r2.status, 404)
+    assert_eq(r2.body, "nope")
+    // 204 没有正文
+    r3 = resp("HTTP/1.1 204 No Content\r\nContent-Length: 3\r\n\r\n")
+    assert_eq(r3.body, "")
+    bad = 0
+    for raw in ["HTTP/1.1 200 OK\r\n", "SMTP 220\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort", "HTTP/1.1 200 OK\r\nbroken\r\n\r\n"] {
+        match http.parse_response(raw, false) {
+            Ok(_) => {}
+            Err(_) => { bad += 1 }
+        }
+    }
+    assert_eq(bad, 4)
+}
+
+test "chunked" {
+    r = resp("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\nb;ext=1\r\n, chunked!!\r\n0\r\n\r\n")
+    assert_eq(r.body, "hello, chunked!!")
+    match http.decode_chunked("zz\r\n") {
+        Ok(_) => panic("应该出错")
+        Err(_) => {}
+    }
+    match http.decode_chunked("5\r\nab") {
+        Ok(_) => panic("应该出错")
+        Err(_) => {}
+    }
+}
+
+test "百分号编码、状态码和内容类型" {
+    assert_eq(http.unescape_path("/a%20b/%E4%BA%91") ?? "-", "/a b/云")
+    assert_eq(http.unescape_path("plain") ?? "-", "plain")
+    assert_eq(http.unescape_path("%4") ?? "-", "-")
+    assert_eq(http.unescape_path("%zz") ?? "-", "-")
+    assert_eq(http.unescape_path("a%00b") ?? "-", "-")
+    assert_eq(http.status_text(404), "Not Found")
+    assert_eq(http.status_text(299), "Unknown")
+    assert_eq(http.mime_type("a/B.HTML"), "text/html; charset=utf-8")
+    assert_eq(http.mime_type("x.wasm"), "application/wasm")
+    assert_eq(http.mime_type("noext"), "application/octet-stream")
+}
+
+fn code_of(s: str) -> int {
+    _r, _at, code = http.parse_request(s, 0)
+    code
+}
+
+test "请求走私、Connection 和响应拆分" {
+    // 两个 Content-Length：一样的可以，不一样的 400；只认十进制数字
+    assert_eq(rq("POST / HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nab").body, "ab")
+    assert_eq(code_of("POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab"), 400)
+    for v in ["+5", "-1", "0x5", "5 5", "", "99999999999999999999"] {
+        assert_eq(code_of("POST / HTTP/1.1\r\nContent-Length: #{v}\r\n\r\nhello"), 400)
+    }
+    // Connection 按 token 比
+    assert(http.is_keep_alive(rq("GET / HTTP/1.1\r\nConnection: enclose\r\n\r\n")))
+    assert(!http.is_keep_alive(rq("GET / HTTP/1.1\r\nConnection: upgrade, Close\r\n\r\n")))
+    assert(!http.is_keep_alive(rq("GET / HTTP/1.0\r\nConnection: keep-alive, close\r\n\r\n")))
+    assert(!http.is_keep_alive(rq("GET / HTTP/1.1\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n")))
+    // 值里的换行变空格，名字不对的头部不写；1xx 不写 Content-Length
+    out = http.format_response(302, [("Location", "/x\r\nSet-Cookie: a=1"), ("Bad Name", "v")], "", false, "", 0)
+    assert_eq(out, "HTTP/1.1 302 Found\r\nDate: Thu, 01 Jan 1970 00:00:00 GMT\r\nLocation: /x  Set-Cookie: a=1\r\nContent-Length: 0\r\n\r\n")
+    assert_eq(http.format_response(101, [], "", false, "", 0), "HTTP/1.1 101 Switching Protocols\r\nDate: Thu, 01 Jan 1970 00:00:00 GMT\r\n\r\n")
+    assert_eq(http.status_text(504), "Gateway Timeout")
+}
+
+fn rq(s: str) -> http.Request {
+    r, _at, code = http.parse_request(s, 0)
+    match take r {
+        Some(x) => x
+        None => panic("没有解析出请求，状态码 #{code}")
+    }
+}
+
+fn site() -> http.Router {
+    r = http.new_router()
+    r.handle("GET /items/{id}", |q| http.reply(200, [], "item " + http.param(q, "id")))
+    r.handle("GET /items/new", |q| http.reply(200, [], "new form"))
+    r.handle("PUT /k/{key...}", |q| http.reply(200, [], "key=" + http.param(q, "key") + " body=" + q.body))
+    r.handle("/health", |q| http.reply(200, [], "ok " + q.method))
+    r.handle("GET /{path...}", |q| http.reply(200, [("Content-Type", "text/plain")], "file " + http.param(q, "path")))
+    r
+}
+
+fn body(r: http.Router, raw: str) -> str { http.route(r, rq(raw)).body }
+
+fn allow_of(resp: http.Response) -> str {
+    for (k, v) in resp.headers {
+        if k == "Allow" { return v.copy() }
+    }
+    "-"
+}
+
+test "路由：匹配和参数" {
+    r = site()
+    assert_eq("#{r}", "Router(5 条路由)")
+    assert_eq(body(r, "GET /items/7 HTTP/1.1\r\n\r\n"), "item 7")
+    // 写死的段比 {id} 具体
+    assert_eq(body(r, "GET /items/new HTTP/1.1\r\n\r\n"), "new form")
+    // GET 也接 HEAD
+    assert_eq(body(r, "HEAD /items/7 HTTP/1.1\r\n\r\n"), "item 7")
+    // {key...} 是剩下的整段（路径先解码，%2F 也变成 /），可以是空的
+    assert_eq(body(r, "PUT /k/a%2Fb/c HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi"), "key=a/b/c body=hi")
+    assert_eq(body(r, "PUT /k/ HTTP/1.1\r\n\r\n"), "key= body=")
+    // 没写方法的什么方法都行，并且比 {path...} 具体
+    assert_eq(body(r, "POST /health HTTP/1.1\r\n\r\n"), "ok POST")
+    assert_eq(body(r, "GET /health HTTP/1.1\r\n\r\n"), "ok GET")
+    assert_eq(body(r, "GET /a/b HTTP/1.1\r\n\r\n"), "file a/b")
+    assert_eq(body(r, "GET / HTTP/1.1\r\n\r\n"), "file ")
+    // {id} 不接空的段
+    assert_eq(body(r, "GET /items/ HTTP/1.1\r\n\r\n"), "file items/")
+    // 回复的头部原样带出来；没有的参数是 ""
+    resp = http.route(r, rq("GET /x HTTP/1.1\r\n\r\n"))
+    assert(resp.headers == [("Content-Type", "text/plain")])
+    assert_eq(http.param(rq("GET / HTTP/1.1\r\n\r\n"), "id"), "")
+}
+
+test "路由：404 和 405" {
+    r = site()
+    // 路径对得上、方法不对：405，Allow 里是能用的方法（GET 带上 HEAD，不重复）
+    d = http.route(r, rq("DELETE /items/7 HTTP/1.1\r\n\r\n"))
+    assert_eq(d.status, 405)
+    assert_eq(allow_of(d), "GET, HEAD")
+    p = http.route(r, rq("POST /k/x HTTP/1.1\r\n\r\n"))
+    assert_eq(allow_of(p), "PUT, GET, HEAD")
+    small = http.new_router()
+    small.handle("GET /a", |q| http.reply(200, [], "a"))
+    n = http.route(small, rq("GET /b HTTP/1.1\r\n\r\n"))
+    assert_eq(n.status, 404)
+    assert_eq(n.body, "404 Not Found\n")
+    assert_eq(allow_of(n), "-")
+    // 结尾的 / 要一样
+    assert_eq(http.route(small, rq("GET /a/ HTTP/1.1\r\n\r\n")).status, 404)
+}
+
+test "回复" {
+    a = http.reply(201, [("X-A", "1")], "made")
+    assert_eq(a.status, 201)
+    assert_eq(a.reason, "Created")
+    assert_eq(a.body, "made")
+    e = http.reply_error(404)
+    assert_eq(e.reason, "Not Found")
+    assert_eq(e.body, "404 Not Found\n")
+    assert(e.headers == [("Content-Type", "text/plain; charset=utf-8")])
+    assert_eq("#{e}", "404 Not Found")
+}
+
+// ---------- 能复用连接的客户端：对着一个按计划回复的假服务器 ----------
+
+fn must(r: ()!) {
+    match r {
+        Ok => {}
+        Err(e) => panic(e)
+    }
+}
+
+// 按顺序回给每个请求的原文。以 ! 开头的：发完就关掉连接，但不写 Connection: close（像服务器的空闲超时）；
+// "?"：不回，过一会儿关掉连接。seen 记下每个请求："第几条连接 方法 目标 Host"
+type Fake {
+    l: net.Listener
+    plan: [str]
+    seen: Chan[str]
+}
+
+fn fake_run(inout f: Fake) -> ()! {
+    i = 0
+    nconn = 0
+    for i < len(f.plan) {
+        c = f.l.accept()?
+        nconn += 1
+        buf = ""
+        open = true
+        for open && i < len(f.plan) {
+            chunk = c.read(65536)?
+            if chunk == "" {
+                open = false
+                continue
+            }
+            buf += chunk
+            pos = 0
+            for open && i < len(f.plan) {
+                r, at, _code = http.parse_request(buf, pos)
+                if at < 0 { break }
+                pos = at
+                req = match take r {
+                    Some(x) => x
+                    None => break
+                }
+                host = http.header(req, "host") ?? "-"
+                f.seen.send("#{nconn} #{req.method} #{req.target} #{host}")
+                p = f.plan[i].copy()
+                i += 1
+                if p == "?" {
+                    sleep_ms(200)
+                    open = false
+                } else if str.starts_with(p, "!") {
+                    c.write(slice(p, 1, len(p)))?
+                    open = false
+                } else {
+                    c.write(p)?
+                }
+            }
+            buf = slice(buf, pos, len(buf))
+        }
+        _r = c.close()
+    }
+}
+
+fn fake(take f: Fake) { must(fake_run(&f)) }
+
+type Asker {
+    base: str
+    paths: [str]
+    timeout_ms: int
+    out: Chan[str]
+}
+
+// 用同一个 Client 依次请求 paths，每个结果是 "状态码 正文" 或 "错误：…"
+fn ask(take a: Asker) {
+    cl = http.new_client()
+    cl.set_timeout_ms(a.timeout_ms)
+    for p in a.paths {
+        line = match take cl.get(a.base + p) {
+            Ok(r) => "#{r.status} #{r.body}"
+            Err(e) => "错误：" + e
+        }
+        a.out.send(line)
+    }
+}
+
+fn ok(body: str) -> str { "HTTP/1.1 200 OK\r\nContent-Length: #{len(body)}\r\n\r\n" + body }
+
+fn drain(ch: Chan[str]) -> [str] {
+    ch.close()
+    out: [str] = []
+    for true {
+        match ch.recv() {
+            Some(x) => out.push(x)
+            None => break
+        }
+    }
+    out
+}
+
+// 起假服务器，用一个 Client 请求 paths；返回 (结果, 服务器看到的请求)
+fn run_plan(plan: [str], paths: [str], timeout_ms: int) -> ([str], [str]) {
+    l = match take net.listen("127.0.0.1", 0) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    port = l.local_port() ?? 0
+    seen: Chan[str] = chan()
+    out: Chan[str] = chan()
+    scope {
+        spawn(fake, Fake(l: l, plan: plan.copy(), seen: seen.copy()))
+        spawn(ask, Asker(base: "http://127.0.0.1:#{port}", paths: paths.copy(), timeout_ms: timeout_ms, out: out.copy()))
+    }
+    (drain(out), drain(seen))
+}
+
+test "客户端：复用连接、chunked、对方要求关闭" {
+    plan = [ok("one"), "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\ntwo\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nthree", ok("four")]
+    got, seen = run_plan(plan, ["/1", "/2", "/3", "/4"], 5000)
+    assert(got == ["200 one", "200 two", "200 three", "200 four"])
+    // 前三个在第 1 条连接上；第 3 个回复要求关闭，第 4 个换了新连接。Host 带着端口
+    assert_eq(len(seen), 4)
+    assert(str.starts_with(seen[0], "1 GET /1 127.0.0.1:"))
+    assert(str.starts_with(seen[1], "1 GET /2 "))
+    assert(str.starts_with(seen[2], "1 GET /3 "))
+    assert(str.starts_with(seen[3], "2 GET /4 "))
+}
+
+test "客户端：空闲的连接被对方关掉以后重发" {
+    got, seen = run_plan(["!" + ok("x"), ok("y")], ["/x", "/y"], 5000)
+    assert(got == ["200 x", "200 y"])
+    assert(str.starts_with(seen[0], "1 GET /x "))
+    assert(str.starts_with(seen[1], "2 GET /y "))
+}
+
+test "客户端：跟随重定向" {
+    plan = ["HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n", ok("here"),
+        "HTTP/1.1 301 Moved Permanently\r\nLocation: c?q=1\r\nContent-Length: 0\r\n\r\n", ok("rel")]
+    got, seen = run_plan(plan, ["/a", "/d/e"], 5000)
+    assert(got == ["200 here", "200 rel"])
+    // 相对的 Location 换掉最后一段；都在同一条连接上
+    assert(str.starts_with(seen[1], "1 GET /b "))
+    assert(str.starts_with(seen[3], "1 GET /d/c?q=1 "))
+}
+
+test "客户端：超时" {
+    got, _seen = run_plan(["?"], ["/slow"], 50)
+    assert_eq(len(got), 1)
+    assert(str.starts_with(got[0], "错误："))
+    c = http.new_client()
+    assert_eq("#{c}", "Client(0 条空闲连接)")
+    assert_eq(c.max_redirects, 5)
+    c.set_max_redirects(-1)
+    assert_eq(c.max_redirects, 0)
+    c.set_timeout_ms(7)
+    assert_eq(c.timeout_ms, 7)
+    c.close()
+}

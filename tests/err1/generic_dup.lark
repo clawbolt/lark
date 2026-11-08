@@ -1,0 +1,9 @@
+// 期望错误：泛型函数也按第一个参数重载，第一个参数的类型不能相同
+type Box[T] {
+    v: T
+}
+
+fn get[T](b: Box[T]) -> T { b.v.copy() }
+fn get[T](b: Box[T]) -> int { 0 }
+
+fn main() {}

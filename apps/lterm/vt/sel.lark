@@ -1,0 +1,127 @@
+// 鼠标选中、复制（lterm app 用）。
+// 先证明再写：对应 formal/Lark/VtSel.lean，函数和定义一一对应：
+//   Sel ↔ Sel、mk ↔ mk、in_sel ↔ inSel、cell_at ↔ cellAt、seg ↔ seg、no_sp ↔ noSp、trim ↔ trim、
+//   line_of ↔ lineOf、copy_text ↔ copy（joinNl；不叫 copy：和值的 .copy() 撞名）、is_word ↔ isWord、left ↔ left、right ↔ right、word ↔ word。
+// 证明了：从哪头往哪头拖都一样，选中的正好是两个位置之间的格子（mk_symm、mk_in）；复制的文字按换行切开正好是每一行选中的部分，
+// 行尾的空白去掉、宽字符的右半去掉（split_join、copy_lines、trim_*）；双击选到的是包含那一格的最长的词（left_*、right_*）。
+// 位置是 行号 × 列数 + 列；行号是"绝对的"：滚动缓冲最旧的那一行往前数也算（mode.M 的 pushed），所以新的输出把行推上去时选中的还是那几行。
+// 一行的格子是字符（screen.cell_ch：宽字符的右半是 0）。
+// 和模型不一样的一处：复制出来的是 UTF-8 的字符串（模型里是码点的列表），行之间是 "\n"。
+// mark 把选中的格子反显（没有证明，tests.lark 里测）。
+import "std/utf8"
+import "vt/style"
+import "vt/draw"
+
+pub const SP = 0
+pub const BLANK = 32
+
+pub type Sel {
+    pub lo: int
+    pub hi: int
+}
+
+pub fn mk(a: int, b: int) -> Sel {
+    if a <= b { Sel(lo: a, hi: b) } else { Sel(lo: b, hi: a) }
+}
+
+pub fn in_sel(s: Sel, i: int) -> bool { s.lo <= i && i <= s.hi }
+
+pub fn cell_at(r: [int], i: int) -> int { if i >= 0 && i < len(r) { r[i] } else { BLANK } }
+
+// 第 a 到第 b 格（含两头）
+pub fn seg(r: [int], a: int, b: int) -> [int] {
+    out: [int] = []
+    for k in 0..b + 1 - a { out.push(cell_at(r, a + k)) }
+    out
+}
+
+pub fn no_sp(r: [int]) -> [int] {
+    out: [int] = []
+    for c in r {
+        if c != SP { out.push(c) }
+    }
+    out
+}
+
+// 去掉行尾的空白
+pub fn trim(r: [int]) -> [int] {
+    n = len(r)
+    for n > 0 && r[n - 1] == BLANK { n -= 1 }
+    out: [int] = []
+    for i in 0..n { out.push(r[i]) }
+    out
+}
+
+// 第 y 行（格子 row，C 列）选中的部分
+pub fn line_of(row: [int], c: int, s: Sel, y: int) -> [int] {
+    a = if y == s.lo / c { s.lo % c } else { 0 }
+    b = if y == s.hi / c { s.hi % c } else { c - 1 }
+    trim(no_sp(seg(row, a, b)))
+}
+
+// 复制：rows[k] 是第 first + k 行（要包含 s.lo / c 到 s.hi / c 这些行；拿不到的行给空列表）
+pub fn copy_text(rows: [[int]], first: int, c: int, s: Sel) -> str {
+    out = ""
+    for y in s.lo / c..s.hi / c + 1 {
+        if y > s.lo / c { out += "\n" }
+        k = y - first
+        row: [int] = if k >= 0 && k < len(rows) { rows[k].copy() } else { [] }
+        for ch in line_of(row, c, s, y) { out += utf8.from_code_point(ch) }
+    }
+    out
+}
+
+// ---------- 双击选词 ----------
+
+pub fn is_word(c: int) -> bool {
+    for x in [BLANK, 0x09, 0x22, 0x27, 0x28, 0x29, 0x2C, 0x3A, 0x3B, 0x3C, 0x3E, 0x5B, 0x5D, 0x60, 0x7B, 0x7C, 0x7D] {
+        if c == x { return false }
+    }
+    true
+}
+
+// 往左：第 i - 1 格还是词里的字符就继续
+pub fn left(r: [int], x: int) -> int {
+    i = x
+    for i > 0 && is_word(cell_at(r, i - 1)) { i -= 1 }
+    i
+}
+
+// 往右最多走 k 格：第 x + 1 格还是词里的字符就继续
+pub fn right(r: [int], x: int, k: int) -> int {
+    i = x
+    n = k
+    for n > 0 && is_word(cell_at(r, i + 1)) {
+        i += 1
+        n -= 1
+    }
+    i
+}
+
+// 双击第 x 格（一行 c 格）：点在词里时是 [left, right]，点在空白、标点上时就是那一格
+pub fn word(r: [int], c: int, x: int) -> (int, int) {
+    if is_word(cell_at(r, x)) { return (left(r, x), right(r, x, c - 1 - x)) }
+    (x, x)
+}
+
+// ---------- 画出来 ----------
+
+// 选中的格子反显：f 的第 y 行是绝对行号 top + y
+pub fn mark(f: draw.F, s: Sel, top: int) -> draw.F {
+    out = f.copy()
+    for y in 0..out.rows {
+        lno = top + y
+        if lno >= s.lo / out.cols && lno <= s.hi / out.cols {
+            st = out.sty[y].copy()
+            for x in 0..out.cols {
+                if in_sel(s, lno * out.cols + x) {
+                    v = style.unpack(st[x])
+                    v.inverse = !v.inverse
+                    st[x] = style.pack(v)
+                }
+            }
+            out.sty[y] = st
+        }
+    }
+    out
+}

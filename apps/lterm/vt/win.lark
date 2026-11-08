@@ -1,0 +1,168 @@
+// lterm app 的窗口（macOS，C 的那一层在 native/gui.c）：开窗口、收按键、滚轮和鼠标、把一帧的格子交过去画、剪贴板、标题。
+// 没有证明：颜色表（palette）和一格怎么画（cell）在 tests.lark 里测；窗口本身要自己开起来看。
+// 只把变了的行交过去（vt/draw 的 diff，证明在 formal/Lark/VtDraw.lean：交过去以后 C 那边的格子正好是新的一帧）。
+// 颜色：16 色用 VS Code 的深色主题，16–231 是 6×6×6 的立方体，232–255 是灰；粗体的 0–7 色换成亮的 8–15。
+import "vt/screen"
+import "vt/style"
+import "vt/draw"
+
+extern "c" {
+    fn lterm_gui_open(rows: c_int, cols: c_int, size: c_int) -> c_int
+    fn lterm_gui_pump(ms: c_int) -> c_int
+    fn lterm_gui_keys() -> str
+    fn lterm_gui_scroll() -> c_int
+    fn lterm_gui_size() -> c_int
+    fn lterm_gui_grid(rows: c_int, cols: c_int) -> ()
+    fn lterm_gui_cell(y: c_int, x: c_int, cp: c_int, fg: c_int, bg: c_int, fl: c_int) -> ()
+    fn lterm_gui_colors(fg: c_int, bg: c_int) -> ()
+    fn lterm_gui_cursor(x: c_int, y: c_int, show: c_int) -> ()
+    fn lterm_gui_modes(ckm: c_int, paste: c_int) -> ()
+    fn lterm_gui_show() -> ()
+    fn lterm_gui_mouse() -> int
+    fn lterm_gui_wheel_at() -> int
+    fn lterm_gui_copy_req() -> c_int
+    fn lterm_gui_clip(s: str) -> ()
+    fn lterm_gui_title(t: str) -> ()
+}
+
+pub const FG = 0xD4D4D4
+pub const BG = 0x1E1E1E
+
+// 256 色
+pub fn palette() -> [int] {
+    out = [0x000000, 0xCD3131, 0x0DBC79, 0xE5E510, 0x2472C8, 0xBC3FBC, 0x11A8CD, 0xE5E5E5, 0x666666, 0xF14C4C, 0x23D18B, 0xF5F543, 0x3B8EEA, 0xD670D6, 0x29B8DB, 0xFFFFFF]
+    lv = [0, 95, 135, 175, 215, 255]
+    for r in 0..6 {
+        for g in 0..6 {
+            for b in 0..6 { out.push((lv[r] << 16) | (lv[g] << 8) | lv[b]) }
+        }
+    }
+    for i in 0..24 {
+        v = 8 + 10 * i
+        out.push((v << 16) | (v << 8) | v)
+    }
+    out
+}
+
+fn rgb(pal: [int], c: style.Color, d: int, bright: bool) -> int {
+    match c {
+        Dflt => d
+        Idx(n) => if bright && n < 8 { pal[n + 8] } else { pal[n] }
+        Rgb(r, g, b) => (r << 16) | (g << 8) | b
+    }
+}
+
+// 两个颜色的中间（暗淡用）
+fn mid(a: int, b: int) -> int {
+    out = 0
+    for k in [16, 8, 0] { out = out | (((((a >> k) & 0xFF) + ((b >> k) & 0xFF)) / 2) << k) }
+    out
+}
+
+// 一格交给 C 的样子：码点（0 空，-1 宽字符的右半）、前景色、背景色、1 粗体 / 2 下划线 / 4 宽字符 / 8 删除线
+pub type Px {
+    pub cp: int
+    pub fg: int
+    pub bg: int
+    pub fl: int
+}
+
+pub fn cell(pal: [int], v: int, sv: int) -> Px {
+    s = style.unpack(sv)
+    fg = rgb(pal, s.fg, FG, s.bold)
+    bg = rgb(pal, s.bg, BG, false)
+    if s.inverse {
+        t = fg
+        fg = bg
+        bg = t
+    }
+    if s.dim { fg = mid(fg, bg) }
+    if s.hidden { fg = bg }
+    fl = 0
+    if s.bold { fl = fl | 1 }
+    if s.under { fl = fl | 2 }
+    if s.strike { fl = fl | 8 }
+    cp = v
+    if v == screen.SPACER {
+        cp = -1
+    } else if v < 0 {
+        cp = screen.cell_ch(v)
+        fl = fl | 4
+    }
+    Px(cp: cp, fg: fg, bg: bg, fl: fl)
+}
+
+pub fn open(rows: int, cols: int, size: int) -> ()! {
+    e = lterm_gui_open(rows, cols, size)
+    if e != 0 { return Err("开不了窗口（第 #{0 - e} 步失败，要在 macOS 上；LTERM_DEBUG=1 可以看到每一步）") }
+    lterm_gui_colors(FG, BG)
+    lterm_gui_grid(rows, cols)
+    Ok()
+}
+
+// 处理窗口的事件，最多等 ms 毫秒；窗口关了返回 false
+pub fn pump(ms: int) -> bool { lterm_gui_pump(ms) == 1 }
+
+// 按过的键（要交给 shell 的字节）
+pub fn keys() -> str { lterm_gui_keys() }
+
+// 滚轮滚了几行（往上是正的）
+pub fn scroll() -> int { lterm_gui_scroll() }
+
+// 窗口放得下几个格子（行, 列）
+pub fn size() -> (int, int) {
+    v = lterm_gui_size()
+    if v < 0 { return (24, 80) }
+    (v >> 16, v & 0xFFFF)
+}
+
+// 格子改大小（清空，之后要整个交一遍）
+pub fn grid(rows: int, cols: int) { lterm_gui_grid(rows, cols) }
+
+// 把 draw 的命令交过去：第 row 行从第 col 列开始的格子
+pub fn put(pal: [int], cmds: [draw.Cmd]) {
+    for c in cmds {
+        for j in 0..len(c.cells) {
+            p = cell(pal, c.cells[j], c.sty[j])
+            lterm_gui_cell(c.row, c.col + j, p.cp, p.fg, p.bg, p.fl)
+        }
+    }
+}
+
+pub fn cursor(x: int, y: int, show: bool) { lterm_gui_cursor(x, y, if show { 1 } else { 0 }) }
+
+pub fn modes(ckm: bool, paste: bool) { lterm_gui_modes(if ckm { 1 } else { 0 }, if paste { 1 } else { 0 }) }
+
+// 画出来
+pub fn show() { lterm_gui_show() }
+
+// 鼠标事件：kind 1 按下、2 拖、3 松开、4 不按键移动；clicks 点了几下（双击是 2）；btn 0 左、1 中、2 右；
+// mods 1 Shift、2 Option、4 Ctrl；在第 row 行第 col 列
+pub type Mouse {
+    pub kind: int
+    pub clicks: int
+    pub btn: int
+    pub mods: int
+    pub row: int
+    pub col: int
+}
+
+pub fn mouse() -> Mouse? {
+    v = lterm_gui_mouse()
+    if v < 0 { return None }
+    Some(Mouse(kind: v & 15, clicks: (v >> 4) & 15, btn: (v >> 8) & 3, mods: (v >> 10) & 7, row: (v >> 32) & 0xFFFF, col: (v >> 16) & 0xFFFF))
+}
+
+// 按了 ⌘C 没有
+pub fn copy_req() -> bool { lterm_gui_copy_req() == 1 }
+
+// 放进系统的剪贴板
+pub fn clip(s: str) { lterm_gui_clip(s) }
+
+pub fn title(t: str) { lterm_gui_title(t) }
+
+// 滚轮最后在哪一格、按着什么修饰键：(行, 列, 修饰键)
+pub fn wheel_at() -> (int, int, int) {
+    v = lterm_gui_wheel_at()
+    ((v >> 16) & 0xFFFF, v & 0xFFFF, (v >> 32) & 7)
+}

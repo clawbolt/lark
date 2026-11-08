@@ -1,0 +1,949 @@
+// ltls 的单元测试：lark test（在 apps/ltls 里运行）。期望值都抄自 RFC：阶段 1 是
+// RFC 8439（ChaCha20、Poly1305、AEAD）、RFC 5869 附录 A（HKDF-SHA256）、RFC 7748（X25519）；阶段 2 是 RFC 8448 第 3 节的握手记录；阶段 4 是 RFC 8032（Ed25519）和 RFC 8410 第 10 节（Ed25519 的公钥和证书）
+import "std/digest"
+import "std/base64"
+import "std/rand"
+import "tls/chacha20"
+import "tls/poly1305"
+import "tls/aead"
+import "tls/hkdf"
+import "tls/x25519"
+import "tls/record"
+import "tls/schedule"
+import "tls/client"
+import "tls/hello"
+import "tls/session"
+import "tls/ed25519"
+import "tls/der"
+import "tls/x509"
+
+fn hx(s: str) -> [u8] {
+    match take digest.from_hex(s) {
+        Ok(d) => d
+        Err(e) => panic(e)
+    }
+}
+
+// from, from+1, …, from+n-1
+fn seq(from: int, n: int) -> [u8] {
+    out: [u8] = []
+    for i in 0..n { out.push((from + i).wrap_u8()) }
+    out
+}
+
+fn sunscreen() -> [u8] {
+    "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.".to_bytes()
+}
+
+fn open_err(key: [u8], nonce: [u8], sealed: [u8], aad: [u8]) -> str {
+    match aead.open(key, nonce, sealed, aad) {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}
+
+fn shared_err(k: [u8], peer: [u8]) -> str {
+    match x25519.shared(k, peer) {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}
+
+fn rand_bytes(inout r: rand.Rng, n: int) -> [u8] {
+    out: [u8] = []
+    for _i in 0..n { out.push(r.range(0, 256).wrap_u8()) }
+    out
+}
+
+test "ChaCha20 块函数（RFC 8439 第 2.3.2 节）" {
+    ks = chacha20.block(seq(0, 32), 1, hx("000000090000004a00000000"))
+    assert_eq(digest.to_hex(ks), "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4ed2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e")
+}
+
+test "ChaCha20 加密（第 2.4.2 节）" {
+    key = seq(0, 32)
+    nonce = hx("000000000000004a00000000")
+    ct = chacha20.xor(key, 1, nonce, sunscreen())
+    assert_eq(digest.to_hex(ct), "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d")
+    // 再异或一次回到明文
+    assert(chacha20.xor(key, 1, nonce, ct) == sunscreen())
+    assert_eq(len(chacha20.xor(key, 1, nonce, [])), 0)
+}
+
+test "Poly1305（第 2.5.2 节）" {
+    key = hx("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b")
+    tag = poly1305.mac(key, "Cryptographic Forum Research Group".to_bytes())
+    assert_eq(digest.to_hex(tag), "a8061dc1305136c6c22b8baf0c0127a9")
+}
+
+test "ChaCha20-Poly1305（第 2.8.2 节）" {
+    key = seq(0x80, 32)
+    nonce = hx("070000004041424344454647")
+    aad = hx("50515253c0c1c2c3c4c5c6c7")
+    sealed = aead.seal(key, nonce, sunscreen(), aad)
+    assert_eq(digest.to_hex(sealed), "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116" + "1ae10b594f09e26a7e902ecbd0600691")
+    match aead.open(key, nonce, sealed, aad) {
+        Ok(p) => assert(p == sunscreen())
+        Err(e) => panic(e)
+    }
+    // 改了密文、标签、aad、nonce 都认证不过
+    bad = sealed.copy()
+    bad[0] = (bad[0].to_int() ^ 1).wrap_u8()
+    assert_eq(open_err(key, nonce, bad, aad), "chacha20-poly1305：认证失败")
+    bad = sealed.copy()
+    bad[len(bad) - 1] = (bad[len(bad) - 1].to_int() ^ 0x80).wrap_u8()
+    assert_eq(open_err(key, nonce, bad, aad), "chacha20-poly1305：认证失败")
+    assert_eq(open_err(key, nonce, sealed, []), "chacha20-poly1305：认证失败")
+    assert_eq(open_err(key, hx("070000004041424344454648"), sealed, aad), "chacha20-poly1305：认证失败")
+    assert_eq(open_err(key, nonce, seq(0, 15), aad), "chacha20-poly1305：数据比 16 字节的标签还短")
+}
+
+test "AEAD 随机往返" {
+    // 长度跨过 16（Poly1305 的块）和 64（ChaCha20 的块）的边界；随便改一个字节就认证不过
+    r = rand.new(5)
+    wrong = 0
+    for n in [0, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 300] {
+        key = rand_bytes(&r, 32)
+        nonce = rand_bytes(&r, 12)
+        plain = rand_bytes(&r, n)
+        aad = rand_bytes(&r, r.range(0, 40))
+        sealed = aead.seal(key, nonce, plain, aad)
+        if len(sealed) != n + 16 { wrong += 1 }
+        match aead.open(key, nonce, sealed, aad) {
+            Ok(p) => { if p != plain { wrong += 1 } }
+            Err(_) => { wrong += 1 }
+        }
+        p = r.range(0, len(sealed))
+        sealed[p] = (sealed[p].to_int() ^ (1 << r.range(0, 8))).wrap_u8()
+        if open_err(key, nonce, sealed, aad) != "chacha20-poly1305：认证失败" { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "HKDF-SHA256（RFC 5869 附录 A.1 到 A.3）" {
+    prk = hkdf.extract(hx("000102030405060708090a0b0c"), hx("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"))
+    assert_eq(digest.to_hex(prk), "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")
+    okm = hkdf.expand(prk, hx("f0f1f2f3f4f5f6f7f8f9"), 42)
+    assert_eq(digest.to_hex(okm), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+
+    prk = hkdf.extract(seq(0x60, 80), seq(0, 80))
+    assert_eq(digest.to_hex(prk), "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244")
+    okm = hkdf.expand(prk, seq(0xb0, 80), 82)
+    assert_eq(digest.to_hex(okm), "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87")
+
+    prk = hkdf.extract([], hx("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"))
+    assert_eq(digest.to_hex(prk), "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04")
+    okm = hkdf.expand(prk, [], 42)
+    assert_eq(digest.to_hex(okm), "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8")
+    assert_eq(len(hkdf.expand(prk, [], 0)), 0)
+}
+
+test "HKDF 的长度和 Expand-Label 的格式（Tls.lean 的 expand_len、labelInfo）" {
+    prk = seq(1, 32)
+    for n in [0, 1, 31, 32, 33, 64, 65, 8160] {
+        assert_eq(len(hkdf.expand(prk, [7], n)), n)
+    }
+    // 长度 16 → 00 10；"tls13 key" 9 字节 → 09 746c73313320 6b6579；context 空 → 00
+    info = hx("0010" + "09" + "746c73313320" + "6b6579" + "00")
+    assert(hkdf.expand_label(prk, "key", [], 16) == hkdf.expand(prk, info, 16))
+    // context 有 2 字节，Derive-Secret 固定 32 字节 → 00 20
+    info = hx("0020" + "0d" + "746c73313320" + "64657269766564" + "02" + "abcd")
+    assert(hkdf.derive_secret(prk, "derived", hx("abcd")) == hkdf.expand(prk, info, 32))
+}
+
+test "X25519（RFC 7748 第 5.2 节）" {
+    out = x25519.scalar_mult(hx("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"),
+        hx("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"))
+    assert_eq(digest.to_hex(out), "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552")
+    // 这个 u 的最高位是 1，要被忽略
+    out = x25519.scalar_mult(hx("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"),
+        hx("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493"))
+    assert_eq(digest.to_hex(out), "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957")
+    // 迭代一次：k = u = 9
+    nine = hx("0900000000000000000000000000000000000000000000000000000000000000")
+    assert_eq(digest.to_hex(x25519.scalar_mult(nine, nine)), "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079")
+}
+
+test "X25519 交换密钥（第 6.1 节）" {
+    a = hx("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+    b = hx("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+    pa = x25519.public_key(a)
+    pb = x25519.public_key(b)
+    assert_eq(digest.to_hex(pa), "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+    assert_eq(digest.to_hex(pb), "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+    want = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+    match x25519.shared(a, pb) {
+        Ok(k) => assert_eq(digest.to_hex(k), want)
+        Err(e) => panic(e)
+    }
+    match x25519.shared(b, pa) {
+        Ok(k) => assert_eq(digest.to_hex(k), want)
+        Err(e) => panic(e)
+    }
+    // 小阶点（0 和 1）算出来全是 0；长度不对也是错误
+    assert_eq(shared_err(a, hx("0000000000000000000000000000000000000000000000000000000000000000")), "x25519：对方的公钥是小阶点，算出来全是 0")
+    assert_eq(shared_err(a, hx("0100000000000000000000000000000000000000000000000000000000000000")), "x25519：对方的公钥是小阶点，算出来全是 0")
+    assert_eq(shared_err(a, seq(0, 31)), "x25519：对方的公钥要 32 字节，这里是 31 字节")
+}
+
+test "X25519 随机的两方算出同一个密钥" {
+    r = rand.new(7)
+    wrong = 0
+    for _i in 0..8 {
+        a = rand_bytes(&r, 32)
+        b = rand_bytes(&r, 32)
+        ka = x25519.scalar_mult(a, x25519.public_key(b))
+        kb = x25519.scalar_mult(b, x25519.public_key(a))
+        if ka != kb { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}
+
+// ---------- 阶段 2：RFC 8448 第 3 节（简单的 1-RTT 握手），和 formal/Lark/Tls13.lean 的 #guard 是同一批值 ----------
+
+fn rfc_ch() -> [u8] {
+    hx("010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7000006130113031302010000910000000b0009000006736572766572ff01000100000a00140012001d0017001800190100010101020103010400230000003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001")
+}
+
+fn rfc_sh() -> [u8] {
+    hx("020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304")
+}
+
+// EncryptedExtensions、Certificate、CertificateVerify、Finished
+fn rfc_flight() -> [u8] {
+    hx("080000240022000a00140012001d00170018001901000101010201030104001c00024001000000000b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de100000f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfacd42f74f3140000209b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718")
+}
+
+fn cat(a: [u8], b: [u8]) -> [u8] {
+    out = a.copy()
+    for x in b { out.push(x) }
+    out
+}
+
+fn part(d: [u8], a: int, b: int) -> [u8] {
+    out: [u8] = []
+    for i in a..b { out.push(d[i]) }
+    out
+}
+
+fn rec_err(d: [u8]) -> str {
+    match record.parse(d, 0) {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}
+
+fn unprotect_err(key: [u8], iv: [u8], seq: int, rec: [u8]) -> str {
+    match record.unprotect(key, iv, seq, rec) {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}
+
+test "RFC 8448：X25519 和共享的秘密" {
+    c = hx("49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005")
+    s = hx("b1580eeadf6dd589b8ef4f2d5652578cc810e9980191ec8d058308cea216a21e")
+    assert_eq(digest.to_hex(x25519.public_key(c)), "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c")
+    assert_eq(digest.to_hex(x25519.public_key(s)), "c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f")
+    match x25519.shared(c, x25519.public_key(s)) {
+        Ok(k) => assert_eq(digest.to_hex(k), "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d")
+        Err(e) => panic(e)
+    }
+}
+
+test "RFC 8448：记录和握手消息的格式" {
+    ch = rfc_ch()
+    sh = rfc_sh()
+    fl = rfc_flight()
+    assert_eq(len(ch), 196)
+    assert_eq(len(sh), 90)
+    assert_eq(len(fl), 657)
+    // 第一个 ClientHello 的版本写 3 1，后面的 3 3
+    assert_eq(digest.to_hex(part(record.write(22, 3, 1, ch), 0, 5)), "16030100c4")
+    assert_eq(digest.to_hex(part(record.write(22, 3, 3, sh), 0, 5)), "160303005a")
+    // 两条记录接在一起，后面再跟两个字节：一条条读出来
+    d = cat(cat(record.write(22, 3, 1, ch), record.write(22, 3, 3, sh)), [1, 2])
+    wrong = 0
+    match record.parse(d, 0) {
+        Ok(r) => {
+            if r.kind != 22 || r.body != ch || r.next != 201 { wrong += 1 }
+            match record.parse(d, r.next) {
+                Ok(r2) => { if r2.body != sh || r2.next != len(d) - 2 { wrong += 1 } }
+                Err(_) => { wrong += 1 }
+            }
+        }
+        Err(_) => { wrong += 1 }
+    }
+    // 服务器的一段拆成 4 条握手消息：类型和长度
+    kinds: [int] = []
+    lens: [int] = []
+    at = 0
+    for at < len(fl) {
+        match record.hs_parse(fl, at) {
+            Ok(m) => {
+                kinds.push(m.kind)
+                lens.push(len(m.body))
+                at = m.next
+            }
+            Err(e) => panic(e)
+        }
+    }
+    assert(kinds == [8, 11, 15, 20])
+    assert(lens == [36, 441, 132, 32])
+    // 写出来再读回去（hs_parse）
+    assert(record.hs_msg(20, part(fl, 625, 657)) == part(fl, 621, 657))
+    assert_eq(wrong, 0)
+}
+
+test "记录：坏的输入只返回错误" {
+    assert_eq(rec_err([22, 3]), "记录：头不完整")
+    assert_eq(rec_err([22, 3, 3, 0]), "记录：长度前缀要 2 字节，只剩 1 字节")
+    assert_eq(rec_err([22, 3, 3, 0, 5, 1, 2]), "记录：长度是 5，只剩 2 字节")
+    big: [u8] = [23, 3, 3, 0x41, 0x01]
+    for _i in 0..16641 { big.push(0) }
+    assert_eq(rec_err(big), "记录：长度 16641 超过 16640")
+    // 随机截断、随机字节：只能返回错误或者读出一条，不能 panic；读出来的都在范围里
+    r = rand.new(11)
+    good = record.write(22, 3, 3, rfc_sh())
+    wrong = 0
+    for _i in 0..2000 {
+        d = part(good, 0, r.range(0, len(good) + 1))
+        if r.range(0, 2) == 0 && len(d) > 0 { d[r.range(0, len(d))] = r.range(0, 256).wrap_u8() }
+        match record.parse(d, 0) {
+            Ok(x) => { if x.next > len(d) || len(x.body) > record.MAX_FRAG { wrong += 1 } }
+            Err(_) => {}
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "内层明文和 nonce" {
+    c = hx("0102030405")
+    for z in [0, 1, 7] {
+        match record.unpad(record.inner(c, 22, z)) {
+            Ok(x) => {
+                assert_eq(x.kind, 22)
+                assert(x.content == c)
+            }
+            Err(e) => panic(e)
+        }
+    }
+    match record.unpad([0, 0, 0]) {
+        Ok(_) => panic("全是 0 应该是错误")
+        Err(e) => assert_eq(e, "记录：内层明文全是 0，找不到类型")
+    }
+    iv = hx("5d313eb2671276ee13000b30")
+    assert_eq(digest.to_hex(record.nonce(iv, 0)), "5d313eb2671276ee13000b30")
+    assert_eq(digest.to_hex(record.nonce(iv, 1)), "5d313eb2671276ee13000b31")
+    assert_eq(digest.to_hex(record.nonce(iv, 0x0102030405060708)), "5d313eb2661075ea16060c38")
+}
+
+test "加密的记录：解得开、改了就认证不过" {
+    key = seq(0x40, 32)
+    iv = hx("5d313eb2671276ee13000b30")
+    fl = rfc_flight()
+    inr = record.inner(fl, 22, 0)
+    rec = record.protect(key, iv, 0, inr)
+    // 记录头和 RFC 8448 一样：657 字节 + 1 字节类型 + 16 字节标签 = 0x2a2
+    assert_eq(digest.to_hex(part(rec, 0, 5)), "17030302a2")
+    match record.parse(rec, 0) {
+        Ok(r) => {
+            assert_eq(r.kind, 23)
+            assert_eq(r.next, len(rec))
+        }
+        Err(e) => panic(e)
+    }
+    match record.unprotect(key, iv, 0, rec) {
+        Ok(p) => assert(p == inr)
+        Err(e) => panic(e)
+    }
+    // 序号不对、记录头被改、密文被改：都认证不过
+    assert_eq(unprotect_err(key, iv, 1, rec), "chacha20-poly1305：认证失败")
+    bad = rec.copy()
+    bad[1] = 1
+    assert_eq(unprotect_err(key, iv, 0, bad), "chacha20-poly1305：认证失败")
+    bad = rec.copy()
+    bad[100] = (bad[100].to_int() ^ 4).wrap_u8()
+    assert_eq(unprotect_err(key, iv, 0, bad), "chacha20-poly1305：认证失败")
+    assert_eq(unprotect_err(key, iv, 0, [23, 3]), "记录：头不完整")
+    // 客户端 Finished 的记录头也一样：36 + 1 + 16 = 0x35
+    fin = record.protect(key, iv, 0, record.inner(part(fl, 621, 657), 22, 0))
+    assert_eq(digest.to_hex(part(fin, 0, 5)), "1703030035")
+}
+
+test "RFC 8448：密钥计算" {
+    shared = hx("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d")
+    ch = rfc_ch()
+    sh = rfc_sh()
+    fl = rfc_flight()
+    th1 = digest.sha256(cat(ch, sh))
+    th_cv = digest.sha256(cat(cat(ch, sh), part(fl, 0, 621)))
+    th2 = digest.sha256(cat(cat(ch, sh), fl))
+    assert_eq(digest.to_hex(th1), "860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8")
+    assert_eq(digest.to_hex(th2), "9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13")
+
+    assert_eq(digest.to_hex(schedule.early()), "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a")
+    hs = schedule.handshake(shared)
+    assert_eq(digest.to_hex(hs), "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac")
+    c_hs = schedule.secret(hs, "c hs traffic", th1)
+    s_hs = schedule.secret(hs, "s hs traffic", th1)
+    assert_eq(digest.to_hex(c_hs), "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21")
+    assert_eq(digest.to_hex(s_hs), "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")
+    ms = schedule.master(hs)
+    assert_eq(digest.to_hex(ms), "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919")
+    c_ap = schedule.secret(ms, "c ap traffic", th2)
+    s_ap = schedule.secret(ms, "s ap traffic", th2)
+    assert_eq(digest.to_hex(c_ap), "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5")
+    assert_eq(digest.to_hex(s_ap), "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643")
+    assert_eq(digest.to_hex(schedule.secret(ms, "exp master", th2)), "fe22f881176eda18eb8f44529e6792c50c9a3f89452f68d8ae311b4309d3cf50")
+
+    // 流量密钥：RFC 8448 用 AES-128-GCM，密钥 16 字节
+    k = schedule.traffic(s_hs, 16)
+    assert_eq(digest.to_hex(k.key), "3fce516009c21727d0f2e4e86ee403bc")
+    assert_eq(digest.to_hex(k.iv), "5d313eb2671276ee13000b30")
+    k = schedule.traffic(c_hs, 16)
+    assert_eq(digest.to_hex(k.key), "dbfaa693d1762c5b666af5d950258d01")
+    assert_eq(digest.to_hex(k.iv), "5bd3c71b836e0b76bb73265f")
+    k = schedule.traffic(s_ap, 16)
+    assert_eq(digest.to_hex(k.key), "9f02283b6c9c07efc26bb9f2ac92e356")
+    assert_eq(digest.to_hex(k.iv), "cf782b88dd83549aadf1e984")
+    k = schedule.traffic(c_ap, 16)
+    assert_eq(digest.to_hex(k.key), "17422dda596ed5d9acd890e3c63f5051")
+    assert_eq(digest.to_hex(k.iv), "5b78923dee08579033e523d9")
+    // ChaCha20-Poly1305 的密钥 32 字节。长度写在 HkdfLabel 里（labelInfo），所以和 16 字节的完全不同，不是它多算一块
+    k32 = schedule.traffic(c_ap, 32)
+    assert_eq(len(k32.key), 32)
+    assert(part(k32.key, 0, 16) != k.key)
+
+    // Finished：服务器的正好是那一段最后 36 字节；客户端的对 CH..服务器 Finished
+    assert(record.hs_msg(20, schedule.finished(s_hs, th_cv)) == part(fl, 621, 657))
+    assert_eq(digest.to_hex(record.hs_msg(20, schedule.finished(c_hs, th2))),
+        "14000020a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61")
+}
+
+test "客户端状态机（Tls13.lean 的 handshake_order）" {
+    full: [client.Ev] = [client.SendCH, client.SH, client.EE, client.Cert, client.CV, client.Fin]
+    assert_eq(client.show(client.run(client.Start, full)), "Connected")
+    after = full.copy()
+    after.push(client.Post)
+    after.push(client.Post)
+    assert_eq(client.show(client.run(client.Start, after)), "Connected")
+    // 跳过 Certificate；Finished 之前的应用数据；Finished 的 MAC 不对；失败以后再给什么都还是失败
+    skip: [client.Ev] = [client.SendCH, client.SH, client.EE, client.CV, client.Fin]
+    assert_eq(client.show(client.run(client.Start, skip)), "Failed")
+    early: [client.Ev] = [client.SendCH, client.SH, client.EE, client.Cert, client.CV, client.Post]
+    assert_eq(client.show(client.run(client.Start, early)), "Failed")
+    bad: [client.Ev] = [client.SendCH, client.SH, client.EE, client.Cert, client.CV, client.Other, client.Fin]
+    assert_eq(client.show(client.run(client.Start, bad)), "Failed")
+    // 随机的事件序列：走到 Connected 的，开头一定是完整的握手，后面全是 Post
+    all: [client.Ev] = [client.SendCH, client.SH, client.EE, client.Cert, client.CV, client.Fin, client.Post, client.Other]
+    r = rand.new(13)
+    wrong = 0
+    hits = 0
+    for _i in 0..3000 {
+        es: [client.Ev] = []
+        n = r.range(0, 10)
+        for j in 0..n {
+            // 一半的时候给“对的”下一个事件，不然几乎走不到 Connected
+            if r.range(0, 4) != 0 && j < 6 { es.push(full[j].copy()) } else { es.push(all[r.range(0, len(all))].copy()) }
+        }
+        if client.run(client.Start, es) == client.Connected {
+            hits += 1
+            if len(es) < 6 { wrong += 1 } else {
+                for j in 0..len(es) {
+                    if j < 6 && es[j] != full[j] { wrong += 1 }
+                    if j >= 6 && es[j] != client.Post { wrong += 1 }
+                }
+            }
+        }
+    }
+    assert_eq(wrong, 0)
+    assert(hits > 0)
+}
+
+// ---------- 阶段 3：ClientHello 和 ServerHello（formal/Lark/Hello.lean） ----------
+
+test "RFC 8448：ClientHello 和 ServerHello 解析再写回去一样" {
+    ch = rfc_ch()
+    sh = rfc_sh()
+    body = part(ch, 4, len(ch))
+    match hello.ch_parse(body) {
+        Ok(h) => {
+            assert_eq(digest.to_hex(h.suites), "130113031302")
+            assert_eq(len(h.exts), 9)
+            assert(hello.ch_write(h) == body)
+            match hello.client_key(h) {
+                Ok(k) => assert_eq(digest.to_hex(k), "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c")
+                Err(e) => panic(e)
+            }
+        }
+        Err(e) => panic(e)
+    }
+    body = part(sh, 4, len(sh))
+    match hello.sh_parse(body) {
+        Ok(h) => {
+            assert_eq(h.suite, 0x1301)
+            assert_eq(len(h.exts), 2)
+            assert(hello.sh_write(h) == body)
+            match hello.server_key(h) {
+                Ok(k) => assert_eq(digest.to_hex(k), "c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f")
+                Err(e) => panic(e)
+            }
+        }
+        Err(e) => panic(e)
+    }
+}
+
+test "我们的 ClientHello 和 ServerHello" {
+    r = rand.new(17)
+    cpub = x25519.public_key(rand_bytes(&r, 32))
+    spub = x25519.public_key(rand_bytes(&r, 32))
+    sid = rand_bytes(&r, 32)
+    ch = hello.ch_write(hello.client_hello(rand_bytes(&r, 32), sid, cpub))
+    match hello.ch_parse(ch) {
+        Ok(h) => {
+            assert(hello.ch_write(h) == ch)
+            assert(h.session_id == sid)
+            match hello.client_key(h) {
+                Ok(k) => assert(k == cpub)
+                Err(e) => panic(e)
+            }
+        }
+        Err(e) => panic(e)
+    }
+    sh = hello.sh_write(hello.server_hello(rand_bytes(&r, 32), sid, spub))
+    match hello.sh_parse(sh) {
+        Ok(h) => {
+            assert(hello.sh_write(h) == sh)
+            assert_eq(h.suite, hello.TLS_CHACHA20_POLY1305_SHA256)
+            match hello.server_key(h) {
+                Ok(k) => assert(k == spub)
+                Err(e) => panic(e)
+            }
+        }
+        Err(e) => panic(e)
+    }
+}
+
+test "Hello：坏的输入只返回错误" {
+    ch = part(rfc_ch(), 4, 196)
+    sh = part(rfc_sh(), 4, 90)
+    // 随机截断、改字节：只能返回错误，或者读出来的写回去和输入一样（chP_some、shP_some）
+    r = rand.new(19)
+    wrong = 0
+    for _i in 0..1500 {
+        for which in 0..2 {
+            src = if which == 0 { ch.copy() } else { sh.copy() }
+            d = part(src, 0, r.range(0, len(src) + 1))
+            if r.range(0, 2) == 0 && len(d) > 0 { d[r.range(0, len(d))] = r.range(0, 256).wrap_u8() }
+            if which == 0 {
+                match hello.ch_parse(d) {
+                    Ok(h) => { if hello.ch_write(h) != d { wrong += 1 } }
+                    Err(_) => {}
+                }
+            } else {
+                match hello.sh_parse(d) {
+                    Ok(h) => { if hello.sh_write(h) != d { wrong += 1 } }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+// ---------- 阶段 3：在内存里完整握手一次（formal/Lark/Session.lean 的 honest、honest_data、bad_fin） ----------
+
+// 解开一条加密的记录，返回内层明文的内容（类型要是 want）
+fn open_rec(k: schedule.Keys, seq: int, rec: [u8], want: int) -> [u8] {
+    match record.unprotect(k.key, k.iv, seq, rec) {
+        Ok(inr) => {
+            match take record.unpad(inr) {
+                Ok(x) => {
+                    if x.kind != want { panic("内层类型是 #{x.kind}，要的是 #{want}") }
+                    x.content.copy()
+                }
+                Err(e) => panic(e)
+            }
+        }
+        Err(e) => panic(e)
+    }
+}
+
+fn seal_rec(k: schedule.Keys, seq: int, content: [u8], kind: int) -> [u8] {
+    record.protect(k.key, k.iv, seq, record.inner(content, kind, 0))
+}
+
+// 一条明文记录的内容
+fn plain_body(rec: [u8]) -> [u8] {
+    match take record.parse(rec, 0) {
+        Ok(r) => r.body.copy()
+        Err(e) => panic(e)
+    }
+}
+
+// 客户端收到服务器的一串记录以后：返回给状态机的事件。tamper ≥ 0 时把服务器 Finished 的第 tamper 个字节改掉再加密
+fn run_handshake(tamper: int) -> str {
+    r = rand.new(23)
+    sign_sk = rand_bytes(&r, 32)            // 服务器的 Ed25519 私钥；客户端事先知道公钥（钉住的公钥）
+    sign_pk = ed25519.public_key(sign_sk)
+    c_priv = rand_bytes(&r, 32)
+    s_priv = rand_bytes(&r, 32)
+
+    // 客户端 → 服务器：ClientHello（明文记录，版本 3 1）
+    ch = record.hs_msg(1, hello.ch_write(hello.client_hello(rand_bytes(&r, 32), rand_bytes(&r, 32), x25519.public_key(c_priv))))
+    rec_ch = record.write(22, 3, 1, ch)
+
+    // 服务器：解析 ClientHello，算共享秘密，回 ServerHello
+    ch_s = plain_body(rec_ch)
+    chh = match take hello.ch_parse(part(ch_s, 4, len(ch_s))) {
+        Ok(h) => h
+        Err(e) => panic(e)
+    }
+    c_pub = match take hello.client_key(chh) {
+        Ok(k) => k
+        Err(e) => panic(e)
+    }
+    shared_s = match take x25519.shared(s_priv, c_pub) {
+        Ok(k) => k
+        Err(e) => panic(e)
+    }
+    sh = record.hs_msg(2, hello.sh_write(hello.server_hello(rand_bytes(&r, 32), chh.session_id, x25519.public_key(s_priv))))
+    ee = record.hs_msg(8, record.frame(2, []))
+    cert = record.hs_msg(11, "placeholder certificate".to_bytes())
+    vs = session.server_flight(sign_sk, ch_s, sh, ee, cert, shared_s)
+    sk = session.keys_of(session.s_hs(vs))
+    sfin = vs.sfin.copy()
+    if tamper >= 0 { sfin[tamper] = (sfin[tamper].to_int() ^ 1).wrap_u8() }
+    flight: [[u8]] = [record.write(22, 3, 3, sh), seal_rec(sk, 0, ee, 22), seal_rec(sk, 1, cert, 22),
+        seal_rec(sk, 2, vs.cv, 22), seal_rec(sk, 3, sfin, 22)]
+
+    // 客户端：ServerHello 是明文，后面四条用服务器的握手密钥解开
+    sh_c = plain_body(flight[0])
+    shh = match take hello.sh_parse(part(sh_c, 4, len(sh_c))) {
+        Ok(h) => h
+        Err(e) => panic(e)
+    }
+    s_pub = match take hello.server_key(shh) {
+        Ok(k) => k
+        Err(e) => panic(e)
+    }
+    shared_c = match take x25519.shared(c_priv, s_pub) {
+        Ok(k) => k
+        Err(e) => panic(e)
+    }
+    v0 = session.View(ch: ch, sh: sh_c, ee: [], cert: [], cv: [], sfin: [], shared: shared_c.copy())
+    ck_c = session.keys_of(session.s_hs(v0))
+    vc = session.View(ch: v0.ch.copy(), sh: v0.sh.copy(), ee: open_rec(ck_c, 0, flight[1], 22),
+        cert: open_rec(ck_c, 1, flight[2], 22), cv: open_rec(ck_c, 2, flight[3], 22),
+        sfin: open_rec(ck_c, 3, flight[4], 22), shared: shared_c)
+    st = client.run(client.Start, session.client_events(sign_pk, vc))
+    if st != client.Connected { return client.show(st) }
+
+    // 客户端 → 服务器：Finished（用客户端的握手密钥），服务器核对
+    cfin_rec = seal_rec(session.keys_of(session.c_hs(vc)), 0, session.cfin_msg(vc), 22)
+    cfin = open_rec(session.keys_of(session.c_hs(vs)), 0, cfin_rec, 22)
+    if !session.server_accepts(vs, cfin) { return "服务器不接受 Finished" }
+
+    // 应用数据：两个方向各一条
+    msg = "GET / HTTP/1.1".to_bytes()
+    a1 = seal_rec(session.keys_of(session.c_ap(vc)), 0, msg, 23)
+    if open_rec(session.keys_of(session.c_ap(vs)), 0, a1, 23) != msg { return "服务器解出来的应用数据不对" }
+    reply = "HTTP/1.1 200 OK".to_bytes()
+    a2 = seal_rec(session.keys_of(session.s_ap(vs)), 0, reply, 23)
+    if open_rec(session.keys_of(session.s_ap(vc)), 0, a2, 23) != reply { return "客户端解出来的应用数据不对" }
+    "Connected，应用数据两个方向都对"
+}
+
+test "在内存里完整握手一次" {
+    assert_eq(run_handshake(-1), "Connected，应用数据两个方向都对")
+}
+
+test "服务器的 Finished 被改了：走不到 Connected（bad_fin）" {
+    // 改消息头后面的 MAC 的几个字节，客户端核对不过，状态机停在 Failed
+    for p in [4, 10, 35] {
+        assert_eq(run_handshake(p), "Failed")
+    }
+}
+
+test "CertificateVerify：用错的公钥、改了签名，走不到 Connected（bad_cv）" {
+    r = rand.new(29)
+    shared = rand_bytes(&r, 32)
+    ch = record.hs_msg(1, [1, 2, 3])
+    sh = record.hs_msg(2, [4, 5, 6])
+    sk_a = rand_bytes(&r, 32)
+    pk_a = ed25519.public_key(sk_a)
+    pk_b = ed25519.public_key(rand_bytes(&r, 32))
+    vs = session.server_flight(sk_a, ch, sh, record.hs_msg(8, [0, 0]), record.hs_msg(11, []), shared)
+    // 开头是 类型 15、长度 68、算法 08 07、签名长度 64
+    assert_eq(digest.to_hex(part(vs.cv, 0, 8)), "0f00004408070040")
+    assert(session.cv_ok(pk_a, vs))
+    assert_eq(client.show(client.run(client.Start, session.client_events(pk_a, vs))), "Connected")
+    assert_eq(client.show(client.run(client.Start, session.client_events(pk_b, vs))), "Failed")
+    bad = session.View(ch: vs.ch.copy(), sh: vs.sh.copy(), ee: vs.ee.copy(), cert: vs.cert.copy(), cv: vs.cv.copy(), sfin: vs.sfin.copy(), shared: vs.shared.copy())
+    bad.cv[40] = (bad.cv[40].to_int() ^ 1).wrap_u8()
+    assert(!session.cv_ok(pk_a, bad))
+    assert_eq(client.show(client.run(client.Start, session.client_events(pk_a, bad))), "Failed")
+}
+
+// ---------- 阶段 4a：Ed25519（RFC 8032 第 7.1 节，和 formal/Lark/Ed25519.lean 的 #guard 是同一批向量） ----------
+
+fn ed_check(sk: str, pk: str, msg: [u8], sig: str) -> int {
+    wrong = 0
+    if digest.to_hex(ed25519.public_key(hx(sk))) != pk { wrong += 1 }
+    if digest.to_hex(ed25519.sign(hx(sk), msg)) != sig { wrong += 1 }
+    if !ed25519.verify(hx(pk), msg, hx(sig)) { wrong += 1 }
+    wrong
+}
+
+test "Ed25519：RFC 8032 的 TEST 1、2、3、SHA(abc)" {
+    assert_eq(digest.to_hex(ed25519.encode(ed25519.base())), "5866666666666666666666666666666666666666666666666666666666666666")
+    assert_eq(ed_check("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", [],
+        "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"), 0)
+    assert_eq(ed_check("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+        "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", [0x72],
+        "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"), 0)
+    assert_eq(ed_check("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+        "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025", [0xaf, 0x82],
+        "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"), 0)
+    assert_eq(ed_check("833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42",
+        "ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf", digest.sha512("abc".to_bytes()),
+        "dc2a4459e7369633a52b1bf277839a00201009a3efbf3ecb69bea2186c26b58909351fc9ac90b3ecfdfbc7c66431e0303dca179c138ac17ad9bef1177331a704"), 0)
+}
+
+test "Ed25519：验证不过的签名（verify_len、verify_big_s、decode_big_y）" {
+    pk = hx("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+    sig = hx("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")
+    assert(ed25519.verify(pk, [], sig))
+    assert(!ed25519.verify(pk, [0], sig))                 // 消息不对
+    assert(!ed25519.verify(pk, [], part(sig, 0, 63)))     // 不是 64 字节
+    for p in [0, 31, 32, 63] {
+        bad = sig.copy()
+        bad[p] = (bad[p].to_int() ^ 1).wrap_u8()
+        assert(!ed25519.verify(pk, [], bad))
+    }
+    // S 加上 L：数学上一样，但 S ≥ L，验证不过
+    l = hx("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010")
+    big: [u8] = part(sig, 0, 32)
+    c = 0
+    for i in 0..32 {
+        v = sig[32 + i].to_int() + l[i].to_int() + c
+        big.push((v & 255).wrap_u8())
+        c = v >> 8
+    }
+    assert_eq(c, 0)
+    assert(!ed25519.verify(pk, [], big))
+    // y = p（2^255 - 19 的小端）不是唯一的写法，解码失败
+    yp: [u8] = [0xed]
+    for _i in 1..31 { yp.push(0xff) }
+    yp.push(0x7f)
+    match ed25519.decode(yp) {
+        Ok(_) => panic("y = p 应该解码失败")
+        Err(e) => assert_eq(e, "ed25519：y 不小于 p")
+    }
+}
+
+test "Ed25519：随机的签了再验" {
+    r = rand.new(31)
+    wrong = 0
+    for _i in 0..4 {
+        sk = rand_bytes(&r, 32)
+        msg = rand_bytes(&r, r.range(0, 100))
+        sig = ed25519.sign(sk, msg)
+        if !ed25519.verify(ed25519.public_key(sk), msg, sig) { wrong += 1 }
+        msg.push(1)
+        if ed25519.verify(ed25519.public_key(sk), msg, sig) { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+    // CertificateVerify 的内容：98 字节的前缀 + 摘要；服务器和客户端的不一样
+    th = rand_bytes(&r, 32)
+    assert_eq(len(ed25519.cv_content(true, th)), 98 + 32)
+    assert(ed25519.cv_content(true, th) != ed25519.cv_content(false, th))
+}
+
+// ---------- 阶段 4b：DER 和证书（formal/Lark/Der.lean，和它的 #guard 是同一批 RFC 8410 第 10 节的例子） ----------
+
+fn len_err(d: [u8]) -> str {
+    match der.dec_len(d, 0) {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}
+
+fn tlv_err(d: [u8]) -> str {
+    match der.parse_tlv(d, 0) {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}
+
+fn cert_err(d: [u8]) -> str {
+    match x509.parse_cert(d) {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}
+
+fn spki_ok(d: [u8]) -> bool {
+    match x509.parse_spki(d) {
+        Ok(_) => true
+        Err(_) => false
+    }
+}
+
+fn b64(s: str) -> [u8] {
+    match take base64.decode(s) {
+        Ok(d) => d
+        Err(e) => panic(e)
+    }
+}
+
+fn cert_of(d: [u8]) -> x509.Cert {
+    match take x509.parse_cert(d) {
+        Ok(c) => c
+        Err(e) => panic(e)
+    }
+}
+
+fn rfc_cert() -> [u8] {
+    b64("MIIBLDCB36ADAgECAghWAUdKKo3DMDAFBgMrZXAwGTEXMBUGA1UEAwwOSUVURiBUZXN0IERlbW8wHhcNMTYwODAxMTIxOTI0WhcNNDAxMjMxMjM1OTU5WjAZMRcwFQYDVQQDDA5JRVRGIFRlc3QgRGVtbzAqMAUGAytlbgMhAIUg8AmJMKdUdIt93LQ+91oNvzoNJjga9OukqY6qm05qo0UwQzAPBgNVHRMBAf8EBTADAQEAMA4GA1UdDwEBAAQEAwIDCDAgBgNVHQ4BAQAEFgQUmx9e7e0EM4Xk97xiPFl1uQvIuzswBQYDK2VwA0EAryMB/t3J5v/BzKc9dNZIpDmAgs3babFOTQbs+BolzlDUwsPrdGxO3YNGhW7Ibz3OGhhlxXrCe1Cgw1AH9efZBw==")
+}
+
+test "DER：长度只认最短的写法（Der.lean 的 decLen_encLen、decLen_some）" {
+    wrong = 0
+    for n in [0, 1, 127, 128, 200, 255, 256, 300, 65535, 65536, 16777215] {
+        w = der.enc_len(n)
+        w.push(7)
+        match der.dec_len(w, 0) {
+            Ok(l) => { if l.n != n || l.next != len(w) - 1 { wrong += 1 } }
+            Err(_) => { wrong += 1 }
+        }
+    }
+    assert_eq(wrong, 0)
+    assert_eq(digest.to_hex(der.enc_len(127)), "7f")
+    assert_eq(digest.to_hex(der.enc_len(128)), "8180")
+    assert_eq(digest.to_hex(der.enc_len(300)), "82012c")
+    assert_eq(digest.to_hex(der.enc_len(65536)), "83010000")
+    assert_eq(len_err([0x81, 5]), "der：长度 5 不是最短的写法")
+    assert_eq(len_err([0x82, 0, 200]), "der：长度 200 不是最短的写法")
+    assert_eq(len_err([0x83, 0, 1, 0]), "der：长度 256 不是最短的写法")
+    assert_eq(len_err([0x80]), "der：长度的第一个字节是 128，只支持小于 128 和 0x81 到 0x83")
+    assert_eq(len_err([0x84, 0, 0, 1, 0]), "der：长度的第一个字节是 132，只支持小于 128 和 0x81 到 0x83")
+    assert_eq(len_err([0x82, 1]), "der：长度要 2 个字节，只剩 1 个")
+    assert_eq(len_err([]), "der：缺长度")
+}
+
+test "DER：元素写出来再读回来（parseTlv_tlv、parseTlv_some）" {
+    r = rand.new(41)
+    wrong = 0
+    for n in [0, 1, 127, 128, 255, 256, 1000] {
+        v = rand_bytes(&r, n)
+        rest = rand_bytes(&r, r.range(0, 5))
+        d = cat(der.tlv(0x30, v), rest)
+        match der.parse_tlv(d, 0) {
+            Ok(e) => {
+                if e.tag != 0x30 || e.body != v || part(d, e.next, len(d)) != rest { wrong += 1 }
+                // 读成功时，前面正好是标准写法
+                if part(d, 0, e.next) != der.tlv(e.tag, e.body) { wrong += 1 }
+            }
+            Err(_) => { wrong += 1 }
+        }
+    }
+    assert_eq(wrong, 0)
+    assert_eq(tlv_err([]), "der：缺标签")
+    assert_eq(tlv_err([0x30]), "der：缺长度")
+    assert_eq(tlv_err([0x30, 3, 1, 2]), "der：长度是 3，只剩 2 字节")
+    assert_eq(tlv_err([0x30, 0x81, 3, 1, 2, 3]), "der：长度 3 不是最短的写法")
+    // 接连的几个元素
+    match der.all(cat(der.tlv(2, [1]), cat(der.tlv(4, []), der.tlv(0x30, [5, 6])))) {
+        Ok(es) => {
+            assert_eq(len(es), 3)
+            assert_eq(es[2].tag, 0x30)
+            assert(es[2].body == [5, 6])
+        }
+        Err(e) => panic(e)
+    }
+    match der.all([2, 1, 1, 4]) {
+        Ok(_) => panic("最后一个元素不完整，应该失败")
+        Err(e) => assert_eq(e, "der：缺长度")
+    }
+}
+
+test "RFC 8410：Ed25519 公钥和证书（parseSpki_some、parseCert_some）" {
+    pub_der = b64("MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=")
+    pk = hx("19bf44096984cdfe8541bac167dc3b96c85086aa30b6b6cb0c5c38ad703166e1")
+    match x509.parse_spki(pub_der) {
+        Ok(p) => assert(p == pk)
+        Err(e) => panic(e)
+    }
+    assert(x509.spki(pk) == pub_der)
+    // 第 10.3 节的私钥算出来的就是这个公钥
+    assert(ed25519.public_key(hx("d4ee72dbf913584ad5b6d8f1f769f8ad3afe7c28cbf1d4fbe097a88f44755842")) == pk)
+    // 改一个字节（OID 换成 X25519 的 1.3.101.110）、多一个字节、少一个字节都不认
+    bad = pub_der.copy()
+    bad[8] = 110
+    assert(!spki_ok(bad))
+    more = pub_der.copy()
+    more.push(0)
+    assert(!spki_ok(more))
+    assert(!spki_ok(part(pub_der, 0, 43)))
+
+    d = rfc_cert()
+    assert_eq(len(d), 304)
+    c = cert_of(d)
+    assert_eq(len(c.tbs), 226)
+    assert_eq(digest.to_hex(c.sig), "af2301feddc9e6ffc1cca73d74d648a4398082cddb69b14e4d06ecf81a25ce50d4c2c3eb746c4edd8346856ec86f3dce1a1865c57ac27b50a0c35007f5e7d907")
+    assert(x509.cert_write(c.tbs, c.sig) == d)
+    // tbsCertificate：[0] 版本、序列号、签名算法、签发者、有效期、主体、公钥、[3] 扩展
+    tags: [int] = []
+    match x509.tbs_fields(c) {
+        Ok(fs) => { for f in fs { tags.push(f.tag) } }
+        Err(e) => panic(e)
+    }
+    assert(tags == [0xa0, 2, 0x30, 0x30, 0x30, 0x30, 0x30, 0xa3])
+    // 签名用第 10.1 节的公钥验证得过；改了证书就验不过
+    assert(x509.verify(pk, c))
+    changed = d.copy()
+    changed[100] = 0
+    match x509.parse_cert(changed) {
+        Ok(c2) => assert(!x509.verify(pk, c2))
+        Err(_) => {}
+    }
+}
+
+test "证书：自己签发再解析，坏的输入只返回错误（parseCert_certW）" {
+    r = rand.new(43)
+    sk = rand_bytes(&r, 32)
+    pk = ed25519.public_key(sk)
+    tbs = der.tlv(0x30, cat(der.tlv(2, [1]), x509.spki(pk)))
+    sig = ed25519.sign(sk, tbs)
+    d = x509.cert_write(tbs, sig)
+    c = cert_of(d)
+    assert(c.tbs == tbs)
+    assert(c.sig == sig)
+    assert(x509.verify(pk, c))
+    assert(!x509.verify(ed25519.public_key(rand_bytes(&r, 32)), c))
+    // 证书里的公钥取得出来
+    match x509.tbs_fields(c) {
+        Ok(fs) => {
+            assert_eq(len(fs), 2)
+            key = der.tlv(fs[1].tag, fs[1].body.copy())
+            match x509.parse_spki(key) {
+                Ok(p) => assert(p == pk)
+                Err(e) => panic(e)
+            }
+        }
+        Err(e) => panic(e)
+    }
+    // 后面多一个字节、签名少一个字节、签名算法换成 X25519、tbs 不是 SEQUENCE
+    more = d.copy()
+    more.push(0)
+    assert_eq(cert_err(more), "x509：证书要正好是一个 SEQUENCE")
+    assert_eq(cert_err(x509.cert_write(tbs, part(sig, 0, 63))), "x509：签名算法和签名一共要 74 字节，这里是 73 字节")
+    x = d.copy()
+    x[len(d) - 68] = 110    // 签名算法 OID 的最后一个字节 112 换成 110
+    assert_eq(cert_err(x), "x509：签名算法不是 Ed25519")
+    assert_eq(cert_err(x509.cert_write(der.tlv(4, [1]), sig)), "x509：tbsCertificate 不是 SEQUENCE")
+    assert_eq(cert_err([]), "der：缺标签")
+}

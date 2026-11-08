@@ -1,0 +1,7 @@
+// 期望错误：select 没有 done 分支时，各分支不能有值
+fn main() {
+    ch: Chan[int] = chan()
+    x = select {
+        v <- ch => v
+    }
+}

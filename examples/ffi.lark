@@ -1,0 +1,33 @@
+// 调用 C 函数：extern "c" { … }（需要 lark1 及以后的版本）
+// 块里只写签名，调用时直接调用 C 库里的同名函数。c_int、usize 这类 C 类型只能写在这里，在 Lark 这边都是 int：
+// 传过去时检查范围（超出 panic），不会悄悄截断。str 传以 0 结尾的字节，C 返回的字符串复制一份；
+// [u8] 传数据指针，写成 inout 时 C 可以往里写（长度由你自己保证够用）。
+
+extern "c" {
+    fn getpid() -> c_int
+    fn strlen(s: str) -> usize
+    fn abs(n: c_int) -> c_int
+    fn labs(n: c_long) -> c_long
+    fn atoi(s: str) -> c_int
+    fn toupper(ch: c_int) -> c_int
+    fn getenv(name: str) -> str
+    fn strncpy(inout dst: [u8], src: str, n: usize) -> str
+}
+
+fn main() {
+    print("strlen：#{strlen("Lark 云雀")}")
+    print("abs：#{abs(-42)}，labs：#{labs(-9000000000)}")
+    print("atoi：#{atoi("123abc")}，toupper：#{from_byte(toupper('a'))}")
+    print("pid 是正数：#{getpid() > 0}")
+    // getenv 返回 NULL 时得到空串
+    v = getenv("LARK_SURELY_UNSET_VARIABLE")
+    print("没设置的环境变量：\"#{v}\"")
+
+    // C 往 [u8] 缓冲区里写
+    buf: [u8] = []
+    for _i in 0..16 { buf.push(0) }
+    r = strncpy(&buf, "云雀", 15)
+    head: [u8] = []
+    for i in 0..7 { head.push(buf[i]) }
+    print("strncpy 返回 #{r}，缓冲区开头 #{head}")
+}

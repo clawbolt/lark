@@ -1,0 +1,205 @@
+== init
+位于分支 main
+还没有提交
+没有要提交的内容，工作区是干净的
+== 新建文件
+位于分支 main
+还没有提交
+未跟踪的文件：
+  a.txt
+  empty.txt
+  src/b.txt
+== add .
+位于分支 main
+还没有提交
+要提交的变更：
+  新文件：a.txt
+  新文件：empty.txt
+  新文件：src/b.txt
+== commit
+[main（根提交） <id>] 第一次提交
+位于分支 main
+没有要提交的内容，工作区是干净的
+100644 blob ce013625030ba8dba906f756967f9e9ca394464a	a.txt
+100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391	empty.txt
+100644 blob ce013625030ba8dba906f756967f9e9ca394464a	src/b.txt
+== 修改、删除、新建
+位于分支 main
+尚未暂存的变更：
+  修改：  a.txt
+  删除：  empty.txt
+未跟踪的文件：
+  new.txt
+位于分支 main
+要提交的变更：
+  修改：  a.txt
+  删除：  empty.txt
+未跟踪的文件：
+  new.txt
+[main <id>] 第二次
+lgit：没有要提交的变更
+== log
+<id> 第二次
+<id> 第一次提交
+commit <id>
+Author: 测试 <t@example.com>
+Date:   Wed Nov 15 06:13:20 2023 +0800
+
+    第二次
+== diff
+diff --git a/a.txt b/a.txt
+index <h>..<h> 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,3 @@
+ hello
++there
+ world
+diff --git a/a.txt b/a.txt
+index <h>..<h> 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,3 @@
+ hello
++there
+ world
+[main <id>] 第三次
+== 分支
+切换到分支 'dev'
+[dev <id>] dev 上的提交
+* dev
+  main
+切换到分支 'main'
+a.txt
+new.txt
+src
+diff --git a/dev.txt b/dev.txt
+new file mode 100644
+index 0000000..<h>
+--- /dev/null
++++ b/dev.txt
+@@ -0,0 +1 @@
++dev
+lgit：分支 dev 还没有完全合并到当前分支；确定要删除就用 -D
+lgit：工作区中下列未跟踪的文件会被检出操作覆盖：
+  dev.txt
+请在切换分支前移动或删除它们。
+切换到分支 'dev'
+位于分支 dev
+尚未暂存的变更：
+  修改：  src/b.txt
+未跟踪的文件：
+  new.txt
+切换到一个新分支 'topic'
+  dev
+  main
+* topic
+切换到分支 'main'
+已删除分支 topic（曾为 <id>）。
+已经位于 'main'
+位于分支 main
+未跟踪的文件：
+  new.txt
+== 真 git 读 lgit 的仓库
+?? new.txt
+测试|第三次
+测试|第二次
+测试|第一次提交
+  dev
+* main
+两个分支之间：和真 git 一样
+工作区的修改：和真 git 一样
+暂存的修改：和真 git 一样
+== 合并
+[main（根提交） <id>] 起点
+[main <id>] main 改第 8 行
+切换到分支 'side'
+[side <id>] side 改第 1 行
+切换到分支 'main'
+自动合并 f.txt
+合并完成（三方合并），新的提交 <id>
+ONE
+2
+3
+4
+5
+6
+7
+EIGHT
+f.txt
+k.txt
+s.txt
+<id> Merge branch 'side'
+<id> main 改第 8 行
+<id> 起点
+Merge: <id> <id>
+已经是最新的。
+-- 快进
+切换到分支 'side'
+更新 <id>..<id>
+快进
+切换到分支 'main'
+-- 冲突
+[main <id>] main 改第 4 行
+切换到分支 'side'
+[side <id>] side 改第 4 行、删掉 k
+切换到分支 'main'
+退出码 1
+自动合并 f.txt
+冲突（内容）：合并冲突于 f.txt
+冲突（修改/删除）：k.txt 在 side 中被删除，在 HEAD 中被修改。HEAD 的 k.txt 版本被保留在树中。
+lgit：自动合并失败，修正冲突然后提交修正的结果。
+ONE
+2
+3
+<<<<<<< HEAD
+main
+=======
+side
+>>>>>>> side
+5
+6
+7
+EIGHT
+位于分支 main
+正在合并，有没解决的冲突（改好后 lgit add，再 lgit commit；放弃合并用 lgit merge --abort）
+未合并的路径：
+  双方修改：f.txt
+  由他们删除：k.txt
+UU f.txt
+UD k.txt
+lgit：还有没解决的冲突：f.txt、k.txt（改好后 lgit add，再提交）
+lgit：暂存区里有没解决的冲突，请先解决（或者 lgit merge --abort）
+位于分支 main
+正在合并，冲突都解决了（运行 lgit commit 结束合并）
+要提交的变更：
+  修改：  f.txt
+  删除：  k.txt
+[main <id>] Merge branch 'side'
+Merge: <id> <id>
+位于分支 main
+没有要提交的内容，工作区是干净的
+-- 放弃合并
+切换到分支 'side'
+切换到分支 'main'
+退出码 1
+y
+位于分支 main
+没有要提交的内容，工作区是干净的
+== 真 git 读合并过的仓库
+main 改 s
+Merge branch 'side'
+main 改第 4 行
+Merge branch 'side'
+main 改第 8 行
+起点
+2
+merge-file 不挨着的改动：和真 git 一样
+merge-file 同一行的冲突：和真 git 一样
+merge-file 挨着的两行：和真 git 一样
+== 可执行权限
+100755 blob <id>	run.sh
+100755 <id> 0	run.sh
+切到 main：run.sh 不在了
+切回 exe：run.sh 可以执行
+再切回 exe：执行权限又恢复了

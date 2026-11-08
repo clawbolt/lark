@@ -1,0 +1,10 @@
+矩形 2x3，圆的：false
+圆 r=2，圆的：true
+字符串，面积 4，圆的：false
+别的形状，圆的：true
+第 0 个是矩形，宽 2
+第 0 个是圆吗：false
+第 2 个的字符串：lark
+Some 里是矩形 2x3
+a == b：true，a == e：false，a == f：false，a != f：true
+列表里的圆 == f：true，自己 == 自己：true

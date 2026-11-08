@@ -1,0 +1,8 @@
+// 期望错误：extern "c" 里只写签名
+extern "c" {
+    fn getpid() -> c_int { 1 }
+}
+
+fn main() {
+    print("#{getpid()}")
+}

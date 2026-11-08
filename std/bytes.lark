@@ -1,0 +1,74 @@
+// Lark 标准库 · 字节和二进制编码（用 Lark 自己写）
+// 用法：import "std/bytes"
+//
+//   bytes.push_u32_be(&out, v)       // 往 [u8] 末尾追加 4 个字节，大端（网络字节序）；push_u32_le 是小端
+//   n = bytes.u32_be(d, at)          // 从 d[at] 开始读 4 个字节，大端；u32_le 是小端
+//
+// 有 u16、u32 的大端和小端，u64 的大端（和 Go 的 encoding/binary 一样：BigEndian.Uint32 / AppendUint32）。
+// 值都放在 int 里：写的时候只取低 16 / 32 / 64 位；u16、u32 读出来在 0..2^16、0..2^32 里，u64 读出来可能是负数（int 是有符号的 64 位）。
+// 读越界时 panic，和 d[i] 一样：读文件、网络来的数据，先检查 at + 宽度 <= len(d)。
+// 可增长的字节缓冲就是 [u8]：push 追加是摊还 O(1)，事先知道大小时先 reserve。
+
+pub fn push_u16_be(inout out: [u8], v: int) {
+    out.push(((v >>> 8) & 0xFF).wrap_u8())
+    out.push((v & 0xFF).wrap_u8())
+}
+
+pub fn push_u16_le(inout out: [u8], v: int) {
+    out.push((v & 0xFF).wrap_u8())
+    out.push(((v >>> 8) & 0xFF).wrap_u8())
+}
+
+pub fn push_u32_be(inout out: [u8], v: int) {
+    for s in [24, 16, 8, 0] { out.push(((v >>> s) & 0xFF).wrap_u8()) }
+}
+
+pub fn push_u32_le(inout out: [u8], v: int) {
+    for s in [0, 8, 16, 24] { out.push(((v >>> s) & 0xFF).wrap_u8()) }
+}
+
+pub fn push_u64_be(inout out: [u8], v: int) {
+    for s in [56, 48, 40, 32, 24, 16, 8, 0] { out.push(((v >>> s) & 0xFF).wrap_u8()) }
+}
+
+pub fn u16_be(d: [u8], at: int) -> int { (d[at].to_int() << 8) | d[at + 1].to_int() }
+
+pub fn u16_le(d: [u8], at: int) -> int { d[at].to_int() | (d[at + 1].to_int() << 8) }
+
+pub fn u32_be(d: [u8], at: int) -> int {
+    (d[at].to_int() << 24) | (d[at + 1].to_int() << 16) | (d[at + 2].to_int() << 8) | d[at + 3].to_int()
+}
+
+pub fn u32_le(d: [u8], at: int) -> int {
+    d[at].to_int() | (d[at + 1].to_int() << 8) | (d[at + 2].to_int() << 16) | (d[at + 3].to_int() << 24)
+}
+
+pub fn u64_be(d: [u8], at: int) -> int { (u32_be(d, at) << 32) | u32_be(d, at + 4) }
+
+// 无符号 varint（LEB128，protobuf、wasm 用的那种；和 Go 的 binary.AppendUvarint / binary.Uvarint 一样）：
+// 每个字节放 7 位，低位在前，最高位是 1 表示后面还有。v 按 64 位看（负数是最高位为 1 的大数，和 u64_be 一样），
+// 最多写 10 个字节。写和读照着 formal/Lark/Varint.lean 的 enc / dec 写，证明见那里
+pub fn push_uvarint(inout out: [u8], v: int) {
+    x = v
+    for x >>> 7 != 0 {
+        out.push(((x & 0x7F) | 0x80).wrap_u8())
+        x = x >>> 7
+    }
+    out.push(x.wrap_u8())
+}
+
+// 从 d[at] 起读一个 varint，返回 (值, 读了几个字节)。数据不完整、或者超出 64 位时返回错误，读外部数据不会 panic
+// （at 本身要在 0..len(d) 里）。不是最短的写法也接受（比如 0x80 0x00 是 0），和 Go 一样
+pub fn uvarint(d: [u8], at: int) -> (int, int)! {
+    x = 0
+    for i in 0..10 {
+        if at + i >= len(d) { return Err("varint：数据不完整（读到第 #{i + 1} 个字节时到了结尾）") }
+        b = d[at + i].to_int()
+        if b < 0x80 {
+            if i == 9 && b > 1 { return Err("varint：超出 64 位") }
+            return Ok((x | (b << (7 * i)), i + 1))
+        }
+        x = x | ((b & 0x7F) << (7 * i))
+    }
+    Err("varint：超出 64 位")
+}

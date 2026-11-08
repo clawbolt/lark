@@ -1,0 +1,45 @@
+// 结果类型 T! 与 ? 传播（需要 lark1 及以后的版本）
+
+fn parse_age(s: str) -> int! {
+    n = try_parse_int(s)?
+    if n < 0 { return Err("年龄不能为负：#{n}") }
+    n
+}
+
+fn file_len(path: str) -> int! {
+    text = try_read_file(path)?
+    Ok(len(text))
+}
+
+// ()! ：只关心成功与否
+fn check_all(xs: [str]) -> ()! {
+    for x in xs {
+        _a = parse_age(x)?
+    }
+}
+
+fn show(s: str) {
+    match parse_age(s) {
+        Ok(n) => print("#{s} → #{n}")
+        Err(e) => print("#{s} → 错误：#{e}")
+    }
+}
+
+fn main() {
+    show("30")
+    show("-5")
+    show("abc")
+    // 超出 int 范围的数字是错误，不会被悄悄卡在最大值上
+    show("9223372036854775808")
+    missing = "不存在.txt"
+    n = file_len(missing) ?? -1
+    print("缺失文件的长度：#{n}")
+    match check_all(["1", "2"]) {
+        Ok => print("第一组全部通过")
+        Err(e) => print("第一组失败：#{e}")
+    }
+    match check_all(["1", "x", "3"]) {
+        Ok => print("第二组全部通过")
+        Err(e) => print("第二组失败：#{e}")
+    }
+}

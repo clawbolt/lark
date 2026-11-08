@@ -1,0 +1,7 @@
+// 期望错误：xs 以 inout 传入的同时又被其它参数使用（违反排他性）
+fn fill(inout a: [int], b: [int]) {}
+
+fn main() {
+    xs = [1, 2]
+    fill(&xs, xs)
+}

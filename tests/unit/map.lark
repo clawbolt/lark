@@ -1,0 +1,133 @@
+// std/map 的边界：空表、覆盖、删除以后的顺序、扩容、大量的键、撞在一起的哈希
+import "std/map"
+
+// 故意让很多键撞在同一个槽附近，而且哈希是负数
+type P {
+    a: int
+}
+
+fn hash(p: P) -> int { 0 - (p.a % 3) - 5 }
+
+fn show(m: map.Map[str, int]) -> str {
+    parts: [str] = []
+    for (k, v) in m { parts.push("#{k}=#{v}") }
+    join(parts, ",")
+}
+
+test "放、取、覆盖、顺序" {
+    m: map.Map[str, int] = map.new()
+    assert(m.is_empty())
+    assert_eq(m.get("x") ?? -1, -1)
+    assert(!m.contains_key(""))
+    m.insert("b", 1)
+    m.insert("a", 2)
+    m.insert("", 3)
+    // 覆盖不改变顺序和个数
+    m.insert("b", 10)
+    assert_eq(len(m), 3)
+    assert_eq(show(m), "b=10,a=2,=3")
+    assert_eq(m[""], 3)
+    m["a"] += 5
+    assert_eq(m.get("a") ?? -1, 7)
+    m["new"] = 0
+    assert_eq(show(m), "b=10,a=7,=3,new=0")
+}
+
+test "删除以后顺序不变、可以再放" {
+    m: map.Map[str, int] = map.new()
+    for w in ["a", "bb", "c", "dd"] { m.insert(w.copy(), len(w)) }
+    assert_eq(m.remove("bb") ?? -1, 2)
+    assert_eq(m.remove("bb") ?? -1, -1)
+    assert_eq(show(m), "a=1,c=1,dd=2")
+    assert(!m.contains_key("bb"))
+    assert_eq(m.get("dd") ?? -1, 2)
+    m.insert("bb", 9)
+    assert_eq(show(m), "a=1,c=1,dd=2,bb=9")
+    assert_eq(m.remove("a") ?? -1, 1)
+    assert_eq(m.remove("bb") ?? -1, 9)
+    assert_eq(show(m), "c=1,dd=2")
+    m.clear()
+    assert(m.is_empty())
+    assert_eq(m.get("c") ?? -1, -1)
+    m.insert("z", 1)
+    assert_eq(show(m), "z=1")
+}
+
+test "扩容和大量的键" {
+    m: map.Map[int, int] = map.new()
+    for i in 0..10000 { m.insert(i * 7919 - 50000, i) }
+    assert_eq(len(m), 10000)
+    wrong = 0
+    for i in 0..10000 {
+        if (m.get(i * 7919 - 50000) ?? -1) != i { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+    assert(!m.contains_key(1))
+    // 删掉一半：retain 只挪一遍、重建一次
+    removed = m.retain(|_k, v| v % 2 == 0)
+    assert_eq(removed, 5000)
+    assert_eq(len(m), 5000)
+    assert_eq(m.get(7919 - 50000) ?? -1, -1)
+    assert_eq(m.get(2 * 7919 - 50000) ?? -1, 2)
+    assert_eq(m.retain(|_k, _v| true), 0)
+    // 剩下的还是按插入顺序
+    assert_eq(m.keys[0], -50000)
+    assert_eq(m.keys[1], 2 * 7919 - 50000)
+}
+
+test "update、to_list、自己的哈希" {
+    m: map.Map[str, int] = map.new()
+    for w in ["x", "y", "x", "x"] { m.update(w.copy(), 1, |n| n + 1) }
+    assert_eq(show(m), "x=3,y=1")
+    // 没有这个键时直接放入 init，不经过 f
+    m2: map.Map[str, int] = map.new()
+    m2.update("z", 10, |n| n * 2)
+    m2.update("z", 10, |n| n * 2)
+    assert_eq(m2["z"], 20)
+    es = m.to_list()
+    assert_eq(len(es), 2)
+    assert_eq(es[1].0, "y")
+    assert_eq(es[1].1, 1)
+    assert_eq(m.iter_len(), 2)
+    k, v = m.iter_at(0)
+    assert_eq(k, "x")
+    assert_eq(v, 3)
+    // 哈希大量相撞：照样都找得到，删掉一个以后其它的还在
+    ps: map.Map[P, int] = map.new()
+    for i in 0..200 { ps.insert(P(a: i), i * 2) }
+    missing = 0
+    for i in 0..200 {
+        if (ps.get(P(a: i)) ?? -1) != i * 2 { missing += 1 }
+    }
+    assert_eq(missing, 0)
+    assert_eq(ps.remove(P(a: 100)) ?? -1, 200)
+    assert(!ps.contains_key(P(a: 100)))
+    assert_eq(ps.get(P(a: 101)) ?? -1, 202)
+    assert_eq(len(ps), 199)
+}
+
+type Q {
+    n: int
+}
+
+// 低位全一样的哈希：槽位要先和种子一起打散，不然全挤在一串槽里（每次插入都要走过前面所有的）
+fn hash(q: Q) -> int { q.n << 20 }
+
+test "随机种子和字符串哈希" {
+    // 同一个进程里稳定；中间的 \0 也算（按长度，不是按 C 字符串）
+    assert_eq(hash("abc"), hash("ab" + "c"))
+    assert(hash("a") != hash("b"))
+    assert(hash("a" + from_byte(0) + "b") != hash("a" + from_byte(0) + "c"))
+    assert(hash("") != hash(from_byte(0)))
+    m: map.Map[Q, int] = map.new()
+    for i in 0..20_000 { m.insert(Q(n: i), i) }
+    assert_eq(len(m.keys), 20_000)
+    assert_eq(m.get(Q(n: 12_345)) ?? -1, 12_345)
+    // 把一个 Map 的键按顺序放进另一个：两个 Map 的种子不同，不会越来越挤
+    a: map.Map[str, int] = map.new()
+    for i in 0..50_000 { a.insert("k#{i}", i) }
+    b: map.Map[str, int] = map.new()
+    for k in a.keys { b.insert(k.copy(), 1) }
+    assert_eq(len(b.keys), 50_000)
+    assert(b.contains_key("k49999") && !b.contains_key("k50000"))
+}

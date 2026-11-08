@@ -1,0 +1,196 @@
+// 终端：解析器（vt/parse）、UTF-8 解码（vt/decode）、宽度（vt/width）、屏幕（vt/screen）串起来：喂字节，屏幕跟着变。
+// 这一层是把动作换成屏幕的操作（Op），没有证明；各部分的性质见各自的文件。
+//   Print 的字节交给解码器，拼成字符、查宽度、写到屏幕上；别的动作之前先把没凑齐的字节交出去（每个 U+FFFD，decode.flush）。
+//   控制字符：CR 回车、LF / VT / FF 换行、BS 退格、HT 制表。
+//   CSI（没有私有标记和中间字节的）：A B C D 移动光标、E F 下 / 上几行到行首、G 列、d 行、H f 位置、J ED、K EL、
+//   L IL、M DL、P DCH、@ ICH、X ECH、S SU、T SD、r DECSTBM、m SGR（颜色和样式，vt/style）。别的先不管。
+//   CSI ? n h / CSI ? n l：模式（vt/mode）：?7 自动换行、?25 显示光标、?2004 括号粘贴、?47 / ?1047 / ?1049 备用屏幕；CSI s / CSI u 保存、恢复光标。
+//   滚动缓冲和改大小（阶段 6，vt/mode）：history 是滚出屏幕的行，resize 改大小。
+//   ESC：D IND（换行）、M RI（反向换行）、E NEL（回车换行）、c RIS（整个复位）、7 / 8 保存、恢复光标。
+//   字符集（阶段 10，vt/charset，证明在 formal/Lark/VtCharset.lean）：ESC ( 0 / ESC ) 0 画线字符集、ESC ( B / ESC ) B ASCII、SO / SI；写字之前先经过字符集。
+//   回答查询（阶段 9，证明在 formal/Lark/VtReply.lean）：CSI 6 n 光标位置（dsr ↔ dsr）、CSI 5 n 状态、CSI c DA1、CSI > c DA2；
+//     回答放在 reply 里，lterm run 拿走（take_reply）交给 shell。?1（DECCKM）、ESC = / ESC >（小键盘）记着，交给外面的终端。
+import "std/utf8"
+import "vt/parse"
+import "vt/decode"
+import "vt/width"
+import "vt/screen"
+import "vt/style"
+import "vt/mode"
+import "vt/charset"
+import "vt/mouse"
+
+pub type Term {
+    pub p: parse.P
+    pub dec: decode.Dec
+    pub m: mode.M         // 屏幕和模式（vt/mode：自动换行、备用屏幕、保存光标）
+    pub sty: style.Sty    // 现在的样式（SGR 改它，屏幕的 pen 是它的 pack）
+    pub reply: str        // 要交给程序的回答（查询的回答）
+    pub ckm: bool         // ?1：方向键发 ESC O A（应用光标键）
+    pub kpam: bool        // ESC =：小键盘发应用键
+    pub cs: charset.Cs    // G0 / G1 是不是画线字符集、现在用哪个（vt/charset）
+    pub title: str        // OSC 0 / OSC 2 设的标题（lterm app 显示成窗口标题）
+    pub mouse: mouse.M    // ?1000 / 1002 / 1003 / 1006：鼠标交给程序（vt/mouse，VtMouse.lean）
+}
+
+pub fn new(rows: int, cols: int) -> Term { Term(p: parse.new(), dec: decode.new(), m: mode.new(rows, cols), sty: style.dflt(), reply: "", ckm: false, kpam: false, cs: charset.new(), title: "", mouse: mouse.start()) }
+
+fn put_char(inout t: Term, ch: str) {
+    cp = charset.map(t.cs, decode.code(ch))
+    mode.scr(&t.m, screen.Write(cp, width.width(cp)))
+}
+
+fn flush(inout t: Term) {
+    for ch in decode.flush(&t.dec) { put_char(&t, ch) }
+}
+
+fn arg(ps: [int], i: int) -> int { if i < len(ps) { ps[i] } else { 0 } }
+
+fn csi(inout t: Term, ps: [int], f: int) {
+    if f == 0x6E {
+        n = arg(ps, 0)
+        y = t.m.scr.y
+        x = t.m.scr.x
+        if n == 6 { t.reply += dsr(y, x) } else if n == 5 { t.reply += "\x1b[0n" }
+        return
+    }
+    if f == 0x63 {
+        if arg(ps, 0) == 0 { t.reply += "\x1b[?1;2c" }
+        return
+    }
+    if f == 0x6D {
+        style.apply(&t.sty, ps)
+        v = style.pack(t.sty)
+        mode.scr(&t.m, screen.Pen(v))
+        return
+    }
+    a = arg(ps, 0)
+    b = arg(ps, 1)
+    x = t.m.scr.x
+    y = t.m.scr.y
+    if f == 0x41 { mode.scr(&t.m, screen.Up(a)) } else if f == 0x42 { mode.scr(&t.m, screen.Down(a)) } else if f == 0x43 { mode.scr(&t.m, screen.Fwd(a)) } else if f == 0x44 { mode.scr(&t.m, screen.Back(a)) } else if f == 0x45 {
+        mode.scr(&t.m, screen.Down(a))
+        mode.scr(&t.m, screen.Cr)
+    } else if f == 0x46 {
+        mode.scr(&t.m, screen.Up(a))
+        mode.scr(&t.m, screen.Cr)
+    } else if f == 0x47 { mode.scr(&t.m, screen.Cup(y + 1, a)) } else if f == 0x64 { mode.scr(&t.m, screen.Cup(a, x + 1)) } else if f == 0x48 || f == 0x66 { mode.scr(&t.m, screen.Cup(a, b)) } else if f == 0x4A { mode.scr(&t.m, screen.Ed(a)) } else if f == 0x4B { mode.scr(&t.m, screen.El(a)) } else if f == 0x4C { mode.scr(&t.m, screen.Il(a)) } else if f == 0x4D { mode.scr(&t.m, screen.Dl(a)) } else if f == 0x50 { mode.scr(&t.m, screen.Dch(a)) } else if f == 0x40 { mode.scr(&t.m, screen.Ich(a)) } else if f == 0x58 { mode.scr(&t.m, screen.Ech(a)) } else if f == 0x53 { mode.scr(&t.m, screen.Su(a)) } else if f == 0x54 { mode.scr(&t.m, screen.Sd(a)) } else if f == 0x72 { mode.scr(&t.m, screen.Stbm(a, b)) } else if f == 0x73 { mode.step(&t.m, mode.Save) } else if f == 0x75 { mode.step(&t.m, mode.Restore) }
+}
+
+fn act(inout t: Term, take a: parse.Act) {
+    match take a {
+        Print(c) => {
+            for ch in decode.feed(&t.dec, c) { put_char(&t, ch) }
+        }
+        Exec(c) => {
+            flush(&t)
+            if c == 0x0E { charset.so(&t.cs) } else if c == 0x0F { charset.si(&t.cs) } else if c == 13 { mode.scr(&t.m, screen.Cr) } else if c == 10 || c == 11 || c == 12 { mode.scr(&t.m, screen.Lf) } else if c == 8 { mode.scr(&t.m, screen.Bs) } else if c == 9 { mode.scr(&t.m, screen.Tab) }
+        }
+        Csi(ps, inter, f) => {
+            flush(&t)
+            if len(inter) == 0 {
+                csi(&t, ps, f)
+            } else if len(inter) == 1 && inter[0] == 0x3F && (f == 0x68 || f == 0x6C) {
+                // CSI ? n h 打开、CSI ? n l 关掉，可以一次好几个
+                for n in ps {
+                    if n == 1 { t.ckm = f == 0x68 }
+                    mouse.set_mode(&t.mouse, n, f == 0x68)
+                    mode.step(&t.m, mode.Mode(n, f == 0x68))
+                }
+            } else if len(inter) == 1 && inter[0] == 0x3E && f == 0x63 && arg(ps, 0) == 0 {
+                t.reply += "\x1b[>0;10;1c"
+            }
+        }
+        Esc(inter, f) => {
+            flush(&t)
+            if len(inter) == 1 && (inter[0] == 0x28 || inter[0] == 0x29) {
+                charset.designate(&t.cs, inter[0] - 0x28, f)
+            } else if len(inter) == 0 {
+                if f == 0x3D { t.kpam = true } else if f == 0x3E { t.kpam = false } else if f == 0x37 { mode.step(&t.m, mode.Save) } else if f == 0x38 { mode.step(&t.m, mode.Restore) } else if f == 0x44 { mode.scr(&t.m, screen.Lf) } else if f == 0x4D { mode.scr(&t.m, screen.Ri) } else if f == 0x45 {
+                    mode.scr(&t.m, screen.Cr)
+                    mode.scr(&t.m, screen.Lf)
+                } else if f == 0x63 {
+                    r = t.m.scr.rows
+                    c = t.m.scr.cols
+                    t.m = mode.new(r, c)
+                    t.sty = style.dflt()
+                    t.ckm = false
+                    t.kpam = false
+                    t.cs = charset.new()
+                    t.mouse = mouse.start()
+                }
+            }
+        }
+        Osc(data) => {
+            flush(&t)
+            // OSC 0 ; 标题 / OSC 2 ; 标题
+            if len(data) >= 2 && (slice(data, 0, 2) == "0;" || slice(data, 0, 2) == "2;") { t.title = slice(data, 2, len(data)) }
+        }
+        _ => { flush(&t) }
+    }
+}
+
+// 喂一段字节；序列和字符都可以跨两段
+pub fn feed(inout t: Term, d: str) {
+    for i in 0..len(d) {
+        match take parse.step(&t.p, byte_at(d, i)) {
+            Some(a) => act(&t, a)
+            None => {}
+        }
+    }
+}
+
+// 第 i 行的文字（UTF-8）：宽字符的右半跳过
+pub fn text(t: Term, i: int) -> str {
+    out = ""
+    for v in screen.row(t.m.scr, i) {
+        if v != screen.SPACER { out += utf8.from_code_point(screen.cell_ch(v)) }
+    }
+    out
+}
+
+// 第 i 行带着颜色：样式变了就写一个 CSI … m（style.sgr），最后复位
+pub fn ansi(t: Term, i: int) -> str {
+    out = ""
+    prev = 0
+    cs = screen.row(t.m.scr, i)
+    ss = screen.srow(t.m.scr, i)
+    for j in 0..len(cs) {
+        if cs[j] != screen.SPACER {
+            if ss[j] != prev {
+                out += style.sgr(style.unpack(ss[j]))
+                prev = ss[j]
+            }
+            out += utf8.from_code_point(screen.cell_ch(cs[j]))
+        }
+    }
+    if prev != 0 { out += "\x1b[0m" }
+    out
+}
+
+// 改大小（vt/mode.resize）：主屏幕挪走的顶上的行进滚动缓冲
+pub fn resize(inout t: Term, rows: int, cols: int) { mode.resize(&t.m, rows, cols) }
+
+// 滚动缓冲里的行（最旧的在前），和 text 一样写成 UTF-8
+pub fn history(t: Term) -> [str] {
+    out: [str] = []
+    for i in 0..mode.sb_len(t.m) {
+        r = mode.sb_row(t.m, i)
+        l = ""
+        for v in r {
+            if v != screen.SPACER { l += utf8.from_code_point(screen.cell_ch(v)) }
+        }
+        out.push(l)
+    }
+    out
+}
+
+// 回答光标位置：ESC [ 行 ; 列 R（y、x 从 0 开始，回答里从 1 开始；VtReply 的 dsr）
+pub fn dsr(y: int, x: int) -> str { "\x1b[#{y + 1};#{x + 1}R" }
+
+// 拿走要交给程序的回答
+pub fn take_reply(inout t: Term) -> str {
+    r = t.reply.copy()
+    t.reply = ""
+    r
+}

@@ -1,0 +1,187 @@
+// 模式（DECSET / DECRST，CSI ? n h / CSI ? n l）、备用屏幕、保存光标。
+// 先证明再写：对应 formal/Lark/VtMode.lean，函数和定义一一对应：
+//   M ↔ T、new ↔ init、ok ↔ Ok、scr_step ↔ scrStep（自动换行关掉时用 screen.write_nowrap ↔ noWrap）、
+//   enter ↔ enter、leave ↔ leave、is_alt ↔ isAlt、set_mode ↔ setMode、Op ↔ Op、step ↔ step。
+// 证明了：任何操作以后，现在的屏幕和存着的主屏幕都是好的（step_ok、run_ok、init_ok）；
+// 进备用屏幕、做任何不切换屏幕的操作、再出来，主屏幕原样回来（alt_restore）；自动换行关掉时写字不换行（nowrap_y）。
+//   ?7 自动换行、?25 显示光标、?2004 括号粘贴、?47 / ?1047 / ?1049 备用屏幕；ESC 7 / ESC 8、CSI s / CSI u 保存、恢复光标。
+// 模型里没有样式：切换屏幕时现在写字用的样式（pen）跟着过去（没有证明，tests.lark 里检查）。
+// 阶段 6（formal/Lark/VtSb.lean）：滚动缓冲 sb（主屏幕滚出去的行，最多 cap 行，keep ↔ keep）、改大小 resize ↔ resizeT。
+// 没做：DECOM（?6）、IRM（插入模式）、鼠标的那些模式；DECSC 只存光标位置，不存样式；改列数时滚动缓冲里的行不改。
+import "vt/screen"
+
+pub type M {
+    pub scr: screen.S           // 现在显示的屏幕
+    pub other: screen.S?        // 在备用屏幕上时：存着的主屏幕
+    pub awm: bool
+    pub tcem: bool
+    pub paste: bool
+    pub sx: int                 // DECSC 存的光标
+    pub sy: int
+    pub sb: [[int]]             // 滚动缓冲：最旧的在前（VtSb）
+    pub sbs: [[int]]            // 滚动缓冲里每一行的样式
+    pub cap: int                // 滚动缓冲最多存几行（keep）
+    pub sb0: int                // sb 前面已经丢掉、还没挪走的行数：逻辑上的缓冲是 sb[sb0..]（sb_len、sb_row）
+    pub pushed: int             // 一共进过滚动缓冲几行（丢掉的也算）：屏幕第 y 行的绝对行号是 pushed + y（vt/sel 用）
+}
+
+pub fn new(rows: int, cols: int) -> M {
+    e1: [[int]] = []
+    e2: [[int]] = []
+    M(scr: screen.new(rows, cols), other: None, awm: true, tcem: true, paste: false, sx: 0, sy: 0, sb: e1, sbs: e2, cap: 1000, sb0: 0, pushed: 0)
+}
+
+pub fn in_alt(t: M) -> bool {
+    match t.other {
+        Some(_) => true
+        None => false
+    }
+}
+
+pub fn ok(t: M) -> bool {
+    if !screen.ok(t.scr) { return false }
+    match t.other {
+        Some(m) => screen.ok(m)
+        None => true
+    }
+}
+
+fn scr_step(inout t: M, o: screen.Op) {
+    if !t.awm {
+        match o {
+            Write(c, w) => {
+                screen.write_nowrap(&t.scr, c, w)
+                drain(&t)
+                return
+            }
+            _ => {}
+        }
+    }
+    screen.step(&t.scr, o.copy())
+    drain(&t)
+}
+
+// 进备用屏幕：主屏幕整个存起来，换成空的屏幕，光标位置不变
+fn enter(inout t: M) {
+    if in_alt(t) { return }
+    old = t.scr.copy()
+    n = screen.new(old.rows, old.cols)
+    screen.step(&n, screen.Cup(old.y + 1, old.x + 1))
+    n.pen = old.pen
+    t.other = Some(old)
+    t.scr = n
+}
+
+// 出备用屏幕：主屏幕原样换回来
+fn leave(inout t: M) {
+    e: screen.S? = None
+    match replace(&t.other, e) {
+        Some(m) => {
+            pen = t.scr.pen
+            t.scr = m.copy()
+            t.scr.pen = pen
+        }
+        None => {}
+    }
+}
+
+pub fn is_alt(m: int) -> bool { m == 47 || m == 1047 || m == 1049 }
+
+fn set_mode(inout t: M, m: int, on: bool) {
+    if m == 7 {
+        t.awm = on
+    } else if m == 25 {
+        t.tcem = on
+    } else if m == 2004 {
+        t.paste = on
+    } else if is_alt(m) {
+        if on { enter(&t) } else { leave(&t) }
+    }
+}
+
+pub enum Op {
+    Scr(o: screen.Op)
+    Mode(m: int, on: bool)
+    Save
+    Restore
+}
+
+pub fn step(inout t: M, op: Op) {
+    match op {
+        Scr(o) => scr_step(&t, o.copy())
+        Mode(m, on) => set_mode(&t, m, on)
+        Save => {
+            x = t.scr.x
+            y = t.scr.y
+            t.sx = x
+            t.sy = y
+        }
+        // Cup 把位置限制在屏幕里（lim）
+        Restore => {
+            r = t.sy + 1
+            c = t.sx + 1
+            screen.step(&t.scr, screen.Cup(r, c))
+        }
+    }
+}
+
+// 屏幕的操作（term 用它）
+pub fn scr(inout t: M, o: screen.Op) { step(&t, Scr(o.copy())) }
+
+// ---------- 滚动缓冲、改大小（formal/Lark/VtSb.lean） ----------
+
+// 只留最新的 cap 行（keep）
+pub fn keep(l: [[int]], cap: int) -> [[int]] {
+    out: [[int]] = []
+    k = if len(l) > cap { len(l) - cap } else { 0 }
+    for i in k..len(l) { out.push(l[i].copy()) }
+    out
+}
+
+fn push_sb(inout t: M, a: [[int]], b: [[int]]) {
+    if len(a) == 0 { return }
+    t.pushed += len(a)
+    for r in a { t.sb.push(r.copy()) }
+    for z in b { t.sbs.push(z.copy()) }
+    // 只留最新的 cap 行（keep）：先把 sb0 往后挪，丢掉的攒多了再一次挪走，每行摊下来是常数时间
+    if len(t.sb) - t.sb0 > t.cap { t.sb0 = len(t.sb) - t.cap }
+    if t.sb0 >= t.cap && t.sb0 >= 256 {
+        cap = t.cap
+        t.sb = keep(t.sb, cap)
+        t.sbs = keep(t.sbs, cap)
+        t.sb0 = 0
+    }
+}
+
+// 滚动缓冲有几行（逻辑上的，不超过 cap）
+pub fn sb_len(t: M) -> int { len(t.sb) - t.sb0 }
+
+// 滚动缓冲的第 i 行（最旧的是 0）和它的样式
+pub fn sb_row(t: M, i: int) -> [int] { t.sb[t.sb0 + i].copy() }
+
+pub fn sb_sty(t: M, i: int) -> [int] { t.sbs[t.sb0 + i].copy() }
+
+// 屏幕滚出去的行放进滚动缓冲；在备用屏幕上时丢掉（全屏程序的画面不进历史）
+fn drain(inout t: M) {
+    if len(t.scr.out) == 0 { return }
+    alt = in_alt(t)
+    a, b = screen.take_out(&t.scr)
+    if !alt { push_sb(&t, a, b) }
+}
+
+// 改大小（resizeT）：现在的屏幕和存着的主屏幕都改；主屏幕挪走的顶上的行放进滚动缓冲
+pub fn resize(inout t: M, rows: int, cols: int) {
+    screen.resize(&t.scr, rows, cols)
+    drain(&t)
+    e: screen.S? = None
+    match replace(&t.other, e) {
+        Some(m) => {
+            mm = m.copy()
+            screen.resize(&mm, rows, cols)
+            a, b = screen.take_out(&mm)
+            push_sb(&t, a, b)
+            t.other = Some(mm)
+        }
+        None => {}
+    }
+}

@@ -1,0 +1,6 @@
+tests/err1/multi_errors.lark:3:14: 错误：未定义的变量 aaaa
+ 3 |     print("#{aaaa}")
+   |              ^
+tests/err1/multi_errors.lark:8:14: 错误：未定义的变量 bbbb
+ 8 |     print("#{bbbb}")
+   |              ^

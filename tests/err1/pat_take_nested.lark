@@ -1,0 +1,12 @@
+// 期望错误：match take 的模式只能拆一层
+enum T {
+    A(s: str?)
+}
+
+fn main() {
+    t = A(Some("x"))
+    match take t {
+        A(Some(s)) => print(s)
+        A(None) => print("无")
+    }
+}

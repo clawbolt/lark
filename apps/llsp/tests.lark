@@ -1,0 +1,1008 @@
+// llsp 的单元测试：lark test（在 apps/llsp 里运行）。阶段 1 是分帧、位置换算和修改文档，阶段 2 是 JSON-RPC 和生命周期（LspRpc.lean），阶段 3 是打开的文档（LspDoc.lean），阶段 4 是诊断（LspDiag.lean），阶段 5 是跳到定义（LspDef.lean），阶段 6 是文档大纲（LspSym.lean），阶段 7 是格式化（LspFmt.lean），阶段 8 是补全（LspComp.lean），
+// 例子和 formal/Lark/Lsp.lean 的 #guard 是同一批；随机的测试检查证明过的性质（pos_off、off_pos、off_boundary、edit_len）
+import "std/rand"
+import "lsp/frame"
+import "lsp/pos"
+import "lsp/edit"
+import "std/json"
+import "lsp/server"
+import "lsp/docs"
+import "lsp/diag"
+import "lsp/defn"
+import "lsp/symbols"
+import "lsp/format"
+import "lsp/complete"
+import "lsp/semantic"
+import "std/os"
+import "std/str"
+
+// 解析的结果写成字符串，方便比较：消息是 "msg <内容> <next>"，不够是 "more"，错误是错误信息
+fn got(d: str, at: int) -> str {
+    match frame.parse(d, at) {
+        Ok(Msg(b, n)) => "msg #{b} #{n}"
+        Ok(More) => "more"
+        Err(e) => e.copy()
+    }
+}
+
+fn p(l: int, c: int) -> pos.Pos { pos.Pos(line: l, ch: c) }
+
+fn show_pos(q: pos.Pos) -> str { "(#{q.line}, #{q.ch})" }
+
+// a😀b\r\nc：😀 是 F0 9F 98 80，UTF-16 里占 2 个单元
+fn ex() -> str { "a\xf0\x9f\x98\x80b\r\nc" }
+
+test "分帧：写出来再读回来（Lsp.lean 的 parse_frame）" {
+    for b in ["", "{}", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}", "中文😀"] {
+        d = frame.frame(b)
+        assert_eq(got(d, 0), "msg #{b} #{len(d)}")
+    }
+    assert_eq(frame.frame("{}"), "Content-Length: 2\r\n\r\n{}")
+    // 两条消息接在一起：一条一条读出来，第二条从第一条的 next 开始
+    two = frame.frame("{}") + frame.frame("[1]")
+    first = len(frame.frame("{}"))
+    assert_eq(got(two, 0), "msg {} #{first}")
+    assert_eq(got(two, first), "msg [1] #{len(two)}")
+}
+
+test "分帧：Content-Type、数据不够、格式不对" {
+    assert_eq(got("Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: 2\r\n\r\n{}x", 0), "msg {} 80")
+    assert_eq(got("Content-Length: 007\r\n\r\n1234567", 0), "msg 1234567 30")
+    assert_eq(got("Content-Length: 3\r\n\r\n{}", 0), "more")
+    assert_eq(got("Content-Length: 2\r\n", 0), "more")
+    assert_eq(got("", 0), "more")
+    assert_eq(got("Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}", 0), "LSP 消息头里有两个 Content-Length")
+    assert_eq(got("Content-Length: x\r\n\r\n{}", 0), "LSP 消息头：Content-Length 后面不是数字")
+    assert_eq(got("Content-Length: \r\n\r\n{}", 0), "LSP 消息头：Content-Length 后面没有数字")
+    assert_eq(got("\r\n{}", 0), "LSP 消息头里没有 Content-Length")
+    assert_eq(got("Content-Length: 99999999999999999999\r\n\r\n", 0), "LSP 消息：内容超过 67108864 字节")
+    long = ""
+    for _i in 0..9000 { long += "x" }
+    assert_eq(got(long, 0), "LSP 消息头超过 8192 字节还没有结束")
+}
+
+test "分帧：一个字节一个字节地到" {
+    d = frame.frame("{\"id\":1}")
+    wrong = 0
+    for k in 0..len(d) {
+        if got(slice(d, 0, k), 0) != "more" { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+    assert_eq(got(d, 0), "msg {\"id\":1} #{len(d)}")
+}
+
+test "位置：a😀b\\r\\nc（和 Lsp.lean 的 #guard 一样）" {
+    xs = pos.doc(ex())
+    assert_eq(len(xs), 5)
+    u = pos.U16
+    assert_eq(show_pos(pos.pos_of(u, xs, 5)), "(0, 3)")
+    assert_eq(show_pos(pos.pos_of(u, xs, 6)), "(0, 4)")
+    assert_eq(show_pos(pos.pos_of(u, xs, 7)), "(0, 4)")     // \r 和 \n 之间：取 \r\n 的开头
+    assert_eq(show_pos(pos.pos_of(u, xs, 8)), "(1, 0)")
+    assert_eq(show_pos(pos.pos_of(u, xs, 9)), "(1, 1)")
+    assert_eq(show_pos(pos.pos_of(u, xs, 3)), "(0, 1)")     // 😀 的中间：取 😀 的开头
+    assert_eq(pos.off_of(u, xs, p(0, 2)), 1)               // 代理对的中间：取 😀 的开头
+    assert_eq(pos.off_of(u, xs, p(0, 3)), 5)
+    assert_eq(pos.off_of(u, xs, p(0, 99)), 6)              // 超过行尾：停在 \r\n 之前
+    assert_eq(pos.off_of(u, xs, p(1, 0)), 8)
+    assert_eq(pos.off_of(u, xs, p(5, 0)), 9)               // 超过最后一行：文档末尾
+    assert_eq(pos.off_of(u, xs, p(-1, -1)), 0)
+    assert_eq(pos.off_of(pos.U8, xs, p(0, 5)), 5)
+    assert_eq(show_pos(pos.pos_of(pos.U8, xs, 5)), "(0, 5)")
+    assert_eq(show_pos(pos.pos_of(u, pos.doc("a\rb"), 2)), "(1, 0)")   // 单独的 \r 也是换行
+    // 坏的字节一个一个算，每个 1 个单元
+    assert_eq(show_pos(pos.pos_of(u, pos.doc("\xff\xfeb"), 2)), "(0, 2)")
+}
+
+// 随机的文档：中文、emoji、三种换行、坏的字节混在一起
+fn rand_doc(inout r: rand.Rng) -> str {
+    parts = ["a", "b", "中", "\xf0\x9f\x98\x80", "\n", "\r", "\r\n", "\xff", "\xc3"]
+    s = ""
+    for _i in 0..r.range(0, 30) { s += parts[r.range(0, len(parts))] }
+    s
+}
+
+// 文档里每个元素的边界（0、第一个元素之后、……、末尾）
+fn bounds(xs: [str]) -> [int] {
+    out: [int] = [0]
+    o = 0
+    for e in xs {
+        o += len(e)
+        out.push(o)
+    }
+    out
+}
+
+fn has(xs: [int], x: int) -> bool {
+    for y in xs { if y == x { return true } }
+    false
+}
+
+test "位置：随机的文档来回换（pos_off、off_pos、off_boundary）" {
+    r = rand.new(7)
+    wrong = 0
+    for _t in 0..200 {
+        d = rand_doc(&r)
+        xs = pos.doc(d)
+        bs = bounds(xs)
+        if bs[len(bs) - 1] != len(d) { wrong += 1 }     // 切开再拼起来就是原来的字节（norm_join、chars_concat）
+        for enc in [pos.U16, pos.U8] {
+            // 边界上的偏移 → 位置 → 偏移
+            for o in bs {
+                if pos.off_of(enc, xs, pos.pos_of(enc, xs, o)) != o { wrong += 1 }
+            }
+            // 任意的位置 → 偏移：在边界上；文档里真有的位置换回来不变
+            for _k in 0..20 {
+                q = p(r.range(0, 6), r.range(0, 12))
+                o = pos.off_of(enc, xs, q)
+                if !has(bs, o) { wrong += 1 }
+                q2 = pos.pos_of(enc, xs, o)
+                if pos.off_of(enc, xs, q2) != o { wrong += 1 }
+            }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "修改：didChange 的增量修改（edit_len、edit_noop、edit_all）" {
+    u = pos.U16
+    assert_eq(edit.change(u, ex(), p(0, 1), p(0, 3), "x"), "axb\r\nc")
+    assert_eq(edit.change(u, ex(), p(0, 3), p(0, 1), "x"), "axb\r\nc")      // 反过来的范围
+    assert_eq(edit.change(u, ex(), p(1, 0), p(1, 0), "d\n"), "a\xf0\x9f\x98\x80b\r\nd\nc")
+    assert_eq(edit.change(u, ex(), p(0, 4), p(1, 0), ""), "a\xf0\x9f\x98\x80bc")   // 删掉 \r\n
+    assert_eq(edit.edit("abc", 1, 1, ""), "abc")
+    assert_eq(edit.edit("abc", 0, 3, "xyz!"), "xyz!")
+    assert_eq(edit.edit("abc", -5, 99, "z"), "z")
+    r = rand.new(11)
+    wrong = 0
+    for _t in 0..200 {
+        d = rand_doc(&r)
+        t = rand_doc(&r)
+        xs = pos.doc(d)
+        a = p(r.range(0, 4), r.range(0, 10))
+        b = p(r.range(0, 4), r.range(0, 10))
+        oa = pos.off_of(u, xs, a)
+        ob = pos.off_of(u, xs, b)
+        lo = if oa < ob { oa } else { ob }
+        hi = if oa < ob { ob } else { oa }
+        out = edit.change(u, d, a, b, t)
+        if len(out) != len(d) - (hi - lo) + len(t) { wrong += 1 }
+        if slice(out, 0, lo) != slice(d, 0, lo) { wrong += 1 }
+        if slice(out, lo + len(t), len(out)) != slice(d, hi, len(d)) { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}
+
+// ---------- 阶段 2：JSON-RPC 和生命周期（formal/Lark/LspRpc.lean） ----------
+
+// 一条输出写成字符串，方便比较：成功是 "ok <id>"，错误是 "err <id> <code>"，退出是 "exit <退出码>"
+fn show_out(o: server.Out) -> str {
+    match o {
+        Reply(id, _) => "ok #{json.format(id)}"
+        Fail(id, c, _) => "err #{json.format(id)} #{c}"
+        Exit(c) => "exit #{c}"
+        Diag(u, v) => "diag #{u} #{v}"
+    }
+}
+
+// 一条一条交给 step（模型的 run），输出连起来
+fn run(msgs: [str]) -> str {
+    s = server.new()
+    out = ""
+    for m in msgs {
+        for o in server.step(&s, server.classify(m)) { out += show_out(o) + "; " }
+    }
+    out
+}
+
+fn req(id: int, m: str) -> str { "{\"jsonrpc\":\"2.0\",\"id\":#{id},\"method\":\"#{m}\"}" }
+
+fn note(m: str) -> str { "{\"jsonrpc\":\"2.0\",\"method\":\"#{m}\"}" }
+
+// 和 LspRpc.lean 的 session 一样。阶段 2 还没有认识的方法，所以模型里 known 的 hover 这里回复 -32601
+fn session() -> [str] {
+    [req(1, "textDocument/hover"), req(2, "initialize"), note("initialized"), req(3, "textDocument/hover"),
+        req(4, "foo"), req(5, "initialize"), "{", "{\"jsonrpc\":\"2.0\",\"id\":9}",
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":null}", req(6, "shutdown"), req(7, "textDocument/hover"),
+        note("exit"), req(8, "textDocument/hover")]
+}
+
+test "生命周期：一次完整的会话（和 LspRpc.lean 的 #guard 一样）" {
+    assert_eq(run(session()), "err 1 -32002; ok 2; err 3 -32601; err 4 -32601; err 5 -32600; err null -32700; err 9 -32600; ok 6; err 7 -32600; exit 0; ")
+    // 没有 shutdown 就 exit：退出码 1；initialize 之前的通知丢掉；退出以后什么都不做（exited_stuck）
+    assert_eq(run([note("initialized"), note("exit")]), "exit 1; ")
+    assert_eq(run([req(1, "initialize"), note("exit"), note("exit")]), "ok 1; exit 1; ")
+    // shutdown 以后的通知也丢掉，exit 的退出码是 0
+    assert_eq(run([req(1, "initialize"), req(2, "shutdown"), note("initialized"), note("exit")]), "ok 1; ok 2; exit 0; ")
+}
+
+test "消息的分类：不是请求的 JSON、字符串 id、客户端的回复" {
+    assert_eq(run(["[1]"]), "err null -32600; ")
+    assert_eq(run(["{\"id\":1,\"method\":\"initialize\"}"]), "err 1 -32600; ")                     // 没有 "jsonrpc":"2.0"
+    assert_eq(run(["{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"initialize\"}"]), "ok \"a\"; ")   // 字符串 id 原样照抄
+    assert_eq(run(["{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"initialize\"}"]), "err null -32600; ")
+    assert_eq(run(["{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"initialize\"}"]), "err null -32600; ")
+    assert_eq(run(["{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":5}"]), "err 1 -32600; ")
+    assert_eq(run(["{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":1,\"message\":\"m\"}}"]), "")     // 客户端的回复：丢掉
+    assert_eq(run(["", "{\"jsonrpc\":"]), "err null -32700; err null -32700; ")
+}
+
+test "回复的 JSON；initialize 时商量列的单位" {
+    assert_eq(server.encode(server.Fail(json.Null, -32700, "x")), "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"x\"}}")
+    s = server.new()
+    outs = server.step(&s, server.classify(req(2, "initialize")))
+    assert_eq(len(outs), 1)
+    assert_eq(server.encode(outs[0]), "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-16\",\"textDocumentSync\":{\"openClose\":true,\"change\":2},\"definitionProvider\":true,\"documentSymbolProvider\":true,\"documentFormattingProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\",\"type\",\"function\",\"parameter\",\"variable\",\"property\",\"selfTypeKeyword\",\"enumMember\",\"selfKeyword\"],\"tokenModifiers\":[\"declaration\",\"defaultLibrary\"]},\"full\":true}},\"serverInfo\":{\"name\":\"llsp\",\"version\":\"0.1.0\"}}}")
+    assert_eq(s.st == server.Running, true)
+    assert_eq(s.enc == pos.U16, true)
+    outs2 = server.step(&s, server.classify(req(6, "shutdown")))
+    assert_eq(server.encode(outs2[0]), "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":null}")
+    assert_eq(s.st == server.Shutdown, true)
+    // 客户端说它能用 utf-8：列按字节算
+    t = server.new()
+    p8 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-16\",\"utf-8\"]}}}}"
+    outs3 = server.step(&t, server.classify(p8))
+    assert_eq(t.enc == pos.U8, true)
+    assert_eq(server.encode(outs3[0]), "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-8\",\"textDocumentSync\":{\"openClose\":true,\"change\":2},\"definitionProvider\":true,\"documentSymbolProvider\":true,\"documentFormattingProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\",\"type\",\"function\",\"parameter\",\"variable\",\"property\",\"selfTypeKeyword\",\"enumMember\",\"selfKeyword\"],\"tokenModifiers\":[\"declaration\",\"defaultLibrary\"]},\"full\":true}},\"serverInfo\":{\"name\":\"llsp\",\"version\":\"0.1.0\"}}}")
+}
+
+// feed 的结果；分帧错了时退出码写成 -2
+fn feed1(inout s: server.Server, inout buf: str) -> (str, int) {
+    match take server.feed(&s, &buf, "") {
+        Ok(r) => r
+        Err(e) => ("错误：#{e}", -2)
+    }
+}
+
+test "stdin 的字节流：分帧、一个字节一个字节地到、exit 以后不再读" {
+    stream = ""
+    for m in session() { stream += frame.frame(m) }
+    // 应该写出去的：同样的消息一条一条 step，回复编码、分帧
+    s0 = server.new()
+    want = ""
+    for m in session() {
+        for o in server.step(&s0, server.classify(m)) {
+            match o {
+                Exit(_) => {}
+                _ => { want += frame.frame(server.encode(o)) }
+            }
+        }
+    }
+    s = server.new()
+    buf = stream.copy()
+    out, code = feed1(&s, &buf)
+    assert_eq(code, 0)
+    assert_eq(out, want)
+    assert_eq(buf, frame.frame(req(8, "textDocument/hover")))     // exit 以后的消息不读
+    // 一个字节一个字节地到：写出去的一样，最后退出码 0
+    s2 = server.new()
+    buf2 = ""
+    got_out = ""
+    last = -1
+    for k in 0..len(stream) {
+        if last < 0 {
+            buf2 += slice(stream, k, k + 1)
+            o2, c2 = feed1(&s2, &buf2)
+            got_out += o2
+            last = c2
+        }
+    }
+    assert_eq(last, 0)
+    assert_eq(got_out, want)
+    // 不完整的消息：什么都不写，等着；分帧错了：Err
+    s3 = server.new()
+    half = slice(frame.frame(req(1, "initialize")), 0, 30)
+    o3, c3 = feed1(&s3, &half)
+    assert_eq(o3, "")
+    assert_eq(c3, -1)
+    bad = "Content-Length: x\r\n\r\n{}"
+    _o4, c4 = feed1(&s3, &bad)
+    assert_eq(c4, -2)
+}
+
+// ---------- 阶段 3：打开的文档（formal/Lark/LspDoc.lean） ----------
+
+// 记着的文档写成字符串："<版本> <内容>"，没有是 "none"
+fn doc_of(s: [docs.Doc], uri: str) -> str {
+    match take docs.get(s, uri) {
+        Some(d) => "#{d.ver} #{d.text}"
+        None => "none"
+    }
+}
+
+fn run_docs(evs: [docs.Ev]) -> [docs.Doc] {
+    s: [docs.Doc] = []
+    for e in evs { docs.step(pos.U16, &s, e.copy()) }
+    s
+}
+
+test "打开的文档：打开、修改、关闭（和 LspDoc.lean 的 #guard 一样）" {
+    evs = [docs.Opn("file:///a", 1, "ab"),
+        docs.Chg("file:///a", 2, [docs.Range(p(0, 1), p(0, 1), "x")]),     // axb
+        docs.Chg("file:///a", 2, [docs.Whole("zzz")]),                      // 版本没变大：丢掉（change_stale）
+        docs.Chg("file:///b", 5, [docs.Whole("q")]),                        // 没打开：丢掉（change_unknown）
+        docs.Chg("file:///a", 3, [docs.Range(p(0, 2), p(0, 2), "y")]),     // axyb
+        docs.Opn("file:///b", 1, "c"),
+        docs.Cls("file:///b")]
+    s = run_docs(evs)
+    assert_eq(doc_of(s, "file:///a"), "3 axyb")
+    assert_eq(doc_of(s, "file:///b"), "none")
+    // 一次通知里的两处修改：第二处的位置是相对第一处改完以后的文档
+    assert_eq(docs.apply_all(pos.U16, "ab", [docs.Whole("hello"), docs.Range(p(0, 5), p(0, 5), "!")]), "hello!")
+    assert_eq(docs.apply_all(pos.U16, "a\r\nb", [docs.Range(p(0, 1), p(1, 0), ""), docs.Range(p(0, 0), p(0, 0), ">")]), ">ab")
+    // 再打开一次：换掉，版本可以变小（open_get）
+    s2 = run_docs([docs.Opn("u", 7, "old"), docs.Opn("u", 1, "new")])
+    assert_eq(doc_of(s2, "u"), "1 new")
+    assert_eq(len(s2), 1)
+}
+
+fn rand_change(inout r: rand.Rng) -> docs.Change {
+    if r.range(0, 5) == 0 { return docs.Whole(rand_doc(&r)) }
+    a = p(r.range(0, 4), r.range(0, 10))
+    b = p(r.range(0, 4), r.range(0, 10))
+    docs.Range(a, b, rand_doc(&r))
+}
+
+test "打开的文档：随机的修改（change_split、change_mono、step_other）" {
+    r = rand.new(13)
+    wrong = 0
+    for _t in 0..200 {
+        d = rand_doc(&r)
+        cs: [docs.Change] = []
+        for _i in 0..r.range(0, 4) { cs.push(rand_change(&r)) }
+        ds: [docs.Change] = []
+        for _i in 0..r.range(0, 4) { ds.push(rand_change(&r)) }
+        both = cs.copy()
+        for c in ds { both.push(c.copy()) }
+        // 一次发和拆成两次发（版本递增）结果一样
+        one = run_docs([docs.Opn("a", 1, d.copy()), docs.Opn("b", 1, "keep"), docs.Chg("a", 5, both.copy())])
+        two = run_docs([docs.Opn("a", 1, d.copy()), docs.Opn("b", 1, "keep"), docs.Chg("a", 2, cs.copy()), docs.Chg("a", 5, ds.copy())])
+        if doc_of(one, "a") != doc_of(two, "a") { wrong += 1 }
+        if doc_of(one, "a") != "5 #{docs.apply_all(pos.U16, d, both)}" { wrong += 1 }
+        // 别的文档不受影响
+        if doc_of(two, "b") != "1 keep" { wrong += 1 }
+        // 乱序到的旧版本：丢掉，版本不变小
+        late = run_docs([docs.Opn("a", 1, d.copy()), docs.Chg("a", 5, cs.copy()), docs.Chg("a", 3, ds.copy())])
+        if doc_of(late, "a") != "5 #{docs.apply_all(pos.U16, d, cs)}" { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}
+
+fn did_open(uri: str, v: int, text: str) -> str {
+    "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\",\"languageId\":\"lark\",\"version\":#{v},\"text\":#{json.quote(text)}}}}"
+}
+
+fn did_change(uri: str, v: int, changes: str) -> str {
+    "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\",\"version\":#{v}},\"contentChanges\":[#{changes}]}}"
+}
+
+fn rng(l1: int, c1: int, l2: int, c2: int, t: str) -> str {
+    "{\"range\":{\"start\":{\"line\":#{l1},\"character\":#{c1}},\"end\":{\"line\":#{l2},\"character\":#{c2}}},\"text\":#{json.quote(t)}}"
+}
+
+test "打开的文档：经过服务器的 JSON 通知" {
+    s = server.new()
+    // initialize 之前的 didOpen 丢掉
+    _a = server.step(&s, server.classify(did_open("file:///x.lark", 1, "a\xf0\x9f\x98\x80b")))
+    assert_eq(len(s.files), 0)
+    _b = server.step(&s, server.classify(req(1, "initialize")))
+    outs = server.step(&s, server.classify(did_open("file:///x.lark", 1, "a\xf0\x9f\x98\x80b")))
+    assert_eq(show_out(outs[0]), "diag file:///x.lark 1")                // 通知不回复，只要求发诊断
+    assert_eq(len(outs), 1)
+    assert_eq(doc_of(s.files, "file:///x.lark"), "1 a\xf0\x9f\x98\x80b")
+    // UTF-16：😀 占 2 列，(0, 3) 是 b 的前面
+    _c = server.step(&s, server.classify(did_change("file:///x.lark", 2, rng(0, 3, 0, 3, "\n") + "," + rng(1, 0, 1, 1, "B"))))
+    assert_eq(doc_of(s.files, "file:///x.lark"), "2 a\xf0\x9f\x98\x80\nB")
+    // 整个替换；缺了字段的通知丢掉
+    _d = server.step(&s, server.classify(did_change("file:///x.lark", 3, "{\"text\":\"fn main() {}\"}")))
+    assert_eq(doc_of(s.files, "file:///x.lark"), "3 fn main() {}")
+    _e = server.step(&s, server.classify(did_change("file:///x.lark", 4, "{\"range\":{}}")))
+    assert_eq(doc_of(s.files, "file:///x.lark"), "3 fn main() {}")
+    _f = server.step(&s, server.classify("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"file:///x.lark\"}}}"))
+    assert_eq(doc_of(s.files, "file:///x.lark"), "none")
+}
+
+// ---------- 阶段 4：诊断（formal/Lark/LspDiag.lean） ----------
+
+fn show_dpos(enc: pos.Enc, d: str, l: int, c: int) -> str { show_pos(diag.dpos(enc, d, l, c)) }
+
+test "诊断的位置：编译器的行列 → LSP 的位置（和 LspDiag.lean 的 #guard 一样）" {
+    e = "a\xf0\x9f\x98\x80b\nc"
+    assert_eq(diag.c_off(e, 1, 6), 5)
+    assert_eq(show_dpos(pos.U16, e, 1, 6), "(0, 3)")
+    assert_eq(show_dpos(pos.U8, e, 1, 6), "(0, 5)")
+    assert_eq(show_dpos(pos.U16, e, 2, 1), "(1, 0)")
+    assert_eq(show_dpos(pos.U16, e, 1, 99), "(0, 4)")      // 列超过行尾：停在 \n 上
+    assert_eq(show_dpos(pos.U16, e, 9, 1), "(1, 1)")       // 行超过最后一行：文档末尾
+    l, c = diag.c_pos(e, 7)
+    assert_eq("#{l} #{c}", "1 0")
+    // 单独的 \r：编译器不当它换行（第 1 行第 3 列是 b），LSP 当它换行
+    assert_eq(show_dpos(pos.U16, "a\rb", 1, 3), "(1, 0)")
+    assert_eq(show_dpos(pos.U16, "a\r\nb", 2, 1), "(1, 0)")
+}
+
+test "诊断的位置：随机的文档（c_round、cOff_le、diag_round）" {
+    r = rand.new(17)
+    wrong = 0
+    for _t in 0..200 {
+        d = rand_doc(&r)
+        xs = pos.doc(d)
+        for o in 0..len(d) + 1 {
+            l, c = diag.c_pos(d, o)
+            if diag.c_go(d, l, c) != o { wrong += 1 }
+        }
+        for _k in 0..20 {
+            if diag.c_off(d, r.range(0, 8), r.range(0, 12)) > len(d) { wrong += 1 }
+        }
+        // 编译器指着字符的开头（元素的边界）时，编辑器里标在同一个字节上
+        for o in bounds(xs) {
+            l, c = diag.c_pos(d, o)
+            for enc in [pos.U16, pos.U8] {
+                if pos.off_of(enc, xs, diag.dpos(enc, d, l + 1, c + 1)) != o { wrong += 1 }
+            }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+fn show_line(name: str, s: str) -> str {
+    match take diag.parse_line(name, s) {
+        Some(x) => "#{x.line} #{x.col} #{x.rest}"
+        None => "none"
+    }
+}
+
+test "编译器的错误行（parse_fmt）" {
+    assert_eq(show_line("f.lark", "f.lark:12:5: E: x"), "12 5 E: x")
+    assert_eq(show_line("f.lark", "g.lark:12:5: E: x"), "none")
+    assert_eq(show_line("f.lark", " 12 | let x"), "none")
+    assert_eq(show_line("f.lark", "f.lark:x:5: E"), "none")
+    assert_eq(show_line("f.lark", "f.lark:1:5:E"), "none")
+    assert_eq(show_line("/t/a b.lark", "/t/a b.lark:3:1: 错误：x"), "3 1 错误：x")
+    e = "a\xf0\x9f\x98\x80b\nc"
+    err = "/t/x.lark:1:6: 错误：找不到 y\n 1 | ab\n   |  ^\n/t/x.lark:2:1: 警告：没用到\nother.lark:1:1: 错误：别的\n"
+    its = diag.items(pos.U16, "/t/x.lark", e, err)
+    assert_eq(len(its), 2)
+    assert_eq("#{show_pos(its[0].start)} #{show_pos(its[0].end)} #{its[0].sev} #{its[0].msg}", "(0, 3) (0, 4) 1 找不到 y")
+    assert_eq("#{show_pos(its[1].start)} #{show_pos(its[1].end)} #{its[1].sev} #{its[1].msg}", "(1, 0) (1, 1) 2 没用到")
+}
+
+fn show_pubs(ps: [diag.Pub]) -> str {
+    out = ""
+    for x in ps { out += "#{x.uri} #{x.ver}; " }
+    out
+}
+
+test "什么时候发诊断（pubs_latest、pubs_quiet、pubs_len）" {
+    evs = [docs.Opn("file:///a", 1, "ab"),
+        docs.Chg("file:///a", 2, [docs.Range(p(0, 1), p(0, 1), "x")]),
+        docs.Chg("file:///a", 2, [docs.Whole("zzz")]),
+        docs.Chg("file:///b", 5, [docs.Whole("q")]),
+        docs.Chg("file:///a", 3, [docs.Range(p(0, 2), p(0, 2), "y")]),
+        docs.Opn("file:///b", 1, "c"),
+        docs.Cls("file:///b")]
+    s: [docs.Doc] = []
+    acc = ""
+    for e in evs {
+        acc += show_pubs(diag.pubs(s, e))
+        docs.step(pos.U16, &s, e.copy())
+    }
+    // 和 LspDiag.lean 的 runPubs 一样；-1 是清空
+    assert_eq(acc, "file:///a 1; file:///a 2; file:///a 3; file:///b 1; file:///b -1; ")
+}
+
+test "诊断的 JSON；经过服务器" {
+    item1 = diag.Item(start: p(0, 3), end: p(0, 4), sev: 1, msg: "m")
+    assert_eq(diag.publish("file:///x.lark", 3, [item1]), "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///x.lark\",\"version\":3,\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":3},\"end\":{\"line\":0,\"character\":4}},\"severity\":1,\"source\":\"lark\",\"message\":\"m\"}]}}")
+    empty: [diag.Item] = []
+    assert_eq(diag.publish("u", -1, empty), "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"u\",\"diagnostics\":[]}}")
+    assert_eq(diag.file_path("file:///a/b%20c.lark"), "/a/b c.lark")
+    assert_eq(diag.file_path("untitled:1"), "")
+    // 经过服务器：打开、旧版本的修改、关掉
+    s = server.new()
+    _a = server.step(&s, server.classify(req(1, "initialize")))
+    o1 = server.step(&s, server.classify(did_open("file:///x.lark", 4, "x")))
+    o2 = server.step(&s, server.classify(did_change("file:///x.lark", 4, "{\"text\":\"y\"}")))
+    o3 = server.step(&s, server.classify("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"file:///x.lark\"}}}"))
+    acc = ""
+    for o in o1 { acc += show_out(o) + "; " }
+    for o in o2 { acc += show_out(o) + "; " }
+    for o in o3 { acc += show_out(o) + "; " }
+    assert_eq(acc, "diag file:///x.lark 4; diag file:///x.lark -1; ")
+    // 关掉时 feed 写出清空的诊断（不需要编译器）
+    t = server.new()
+    stream = frame.frame(req(1, "initialize")) + frame.frame(did_open("file:///y.lark", 1, "z")) + frame.frame("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"file:///y.lark\"}}}")
+    out, code = feed1(&t, &stream)
+    assert_eq(code, -1)
+    assert_eq(str.contains(out, frame.frame(diag.publish("file:///y.lark", -1, empty))), true)
+}
+
+test "诊断：真的运行编译器" {
+    home = diag.find_home()
+    assert_eq(home != "", true)
+    dir = match take os.cwd() {
+        Ok(d) => d
+        Err(e) => e.copy()
+    }
+    uri = "file://" + dir + "/llsp_probe.lark"
+    bad = diag.check(home, uri, "fn main() {\n    print(nope)\n}\n", pos.U16)
+    assert_eq(len(bad) >= 1, true)
+    assert_eq(bad[0].sev, 1)
+    assert_eq(bad[0].start.line, 1)
+    // 没有错误；import 按包的根目录找（apps/llsp 里有 lark.pkg）
+    good = diag.check(home, uri, "import \"lsp/pos\"\n\nfn main() {\n    q = pos.Pos(line: 0, ch: 0)\n    print(\"\#{q.line}\")\n}\n", pos.U16)
+    assert_eq(len(good), 0)
+    // 不是 .lark 文件：不检查
+    assert_eq(len(diag.check(home, "untitled:1", "fn", pos.U16)), 0)
+}
+
+// ---------- 阶段 5：跳到定义（formal/Lark/LspDef.lean） ----------
+
+fn def_src() -> str {
+    "import \"lsp/pos\"\n\npub fn add1(x: int) -> int { x + 1 }\ntype P {\n    x: int\n}\nfn main() { print(add1(2)) }\nconst N = 3\n"
+}
+
+fn show_decls(d: str) -> str {
+    out = ""
+    for x in defn.decls(d) { out += "#{x.name}@#{x.at} " }
+    out
+}
+
+fn show_decl(d: str) -> str {
+    match take defn.decl_at(d, 0) {
+        Some(x) => "#{x.name}@#{x.at}"
+        None => "none"
+    }
+}
+
+test "跳到定义：声明和光标下的词（和 LspDef.lean 的 #guard 一样）" {
+    d = def_src()
+    assert_eq(show_decls(d), "add1@25 P@60 main@80 N@112 ")
+    assert_eq(defn.find(d, "P"), 60)
+    assert_eq(defn.find(d, "add"), -1)          // 不会把 add1 当成 add
+    assert_eq(defn.find(d, "x"), -1)            // 字段、参数不是声明
+    assert_eq(defn.word_start(d, 97), 95)
+    assert_eq(defn.word_end(d, 97), 99)
+    assert_eq(defn.word(d, 97), "add1")
+    assert_eq(defn.find(d, defn.word(d, 97)), 25)
+    assert_eq(defn.word(d, 99), "add1")         // 光标在词的结尾（紧挨着括号）也算这个词
+    assert_eq(show_decl("pub enum Got {"), "Got@9")
+    assert_eq(show_decl("fnx y"), "none")
+    assert_eq(show_decl("fn ("), "none")
+    assert_eq(defn.qualifier("q = pos.Pos(", 9), "pos")
+    assert_eq(defn.qualifier("q = Pos(", 5), "")
+    assert_eq(defn.import_of(d, "pos"), "lsp/pos")
+    assert_eq(defn.import_of(d, "json"), "")
+}
+
+fn id_byte(c: int) -> bool { (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || (c >= 48 && c <= 57) }
+
+test "跳到定义：随机的文档（word_bounds、word_end、decls_word、find_word）" {
+    parts = ["fn ", "pub ", "type ", "enum ", "const ", "interface ", "ab", "x1", "_", "9", "\n", " ", "(", "{", "\xe4\xb8\xad", "\r\n"]
+    r = rand.new(19)
+    wrong = 0
+    for _t in 0..300 {
+        d = ""
+        for _i in 0..r.range(0, 40) { d += parts[r.range(0, len(parts))] }
+        // 光标下的词
+        for o in 0..len(d) + 1 {
+            s = defn.word_start(d, o)
+            e = defn.word_end(d, o)
+            if !(s <= o && o <= e && e <= len(d)) { wrong += 1 }
+            if e < len(d) && id_byte(byte_at(d, e)) { wrong += 1 }
+        }
+        // 每个声明：偏移上正好是这个名字、非空、都是标识符的字节、是完整的词，并且在某一行上
+        for x in defn.decls(d) {
+            n = len(x.name)
+            if n == 0 || slice(d, x.at, x.at + n) != x.name { wrong += 1 }
+            for i in 0..n { if !id_byte(byte_at(x.name, i)) { wrong += 1 } }
+            if x.at + n < len(d) && id_byte(byte_at(d, x.at + n)) { wrong += 1 }
+            // 和关键字在同一行（find_line）：从名字往回找到的行首，就是这个声明开始的地方
+            ls = x.at
+            for ls > 0 && byte_at(d, ls - 1) != 10 { ls -= 1 }
+            match take defn.decl_at(d, ls) {
+                Some(y) => { if y.at != x.at || y.name != x.name { wrong += 1 } }
+                None => { wrong += 1 }
+            }
+            if defn.find(d, x.name) < 0 { wrong += 1 }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+fn def_req(id: int, uri: str, l: int, c: int) -> str {
+    "{\"jsonrpc\":\"2.0\",\"id\":#{id},\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\"},\"position\":{\"line\":#{l},\"character\":#{c}}}}"
+}
+
+fn reply_of(inout s: server.Server, msg: str) -> str {
+    outs = server.step(&s, server.classify(msg))
+    if len(outs) != 1 { return "没有回复" }
+    server.encode(outs[0])
+}
+
+test "跳到定义：经过服务器" {
+    s = server.new()
+    _a = server.step(&s, server.classify(req(1, "initialize")))
+    _b = server.step(&s, server.classify(did_open("file:///t/a.lark", 1, def_src())))
+    // 第 6 行第 20 列是调用 add1(2) 的 d；定义在第 2 行第 7 到 11 列
+    assert_eq(reply_of(&s, def_req(2, "file:///t/a.lark", 6, 20)), "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"uri\":\"file:///t/a.lark\",\"range\":{\"start\":{\"line\":2,\"character\":7},\"end\":{\"line\":2,\"character\":11}}}}")
+    // 找不到：结果是 null（成功的回复）
+    assert_eq(reply_of(&s, def_req(3, "file:///t/a.lark", 4, 4)), "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}")
+    assert_eq(reply_of(&s, def_req(4, "file:///t/none.lark", 0, 0)), "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":null}")
+}
+
+test "跳到定义：模块.名字，找 import 进来的文件" {
+    dir = match take os.cwd() {
+        Ok(d) => d
+        Err(e) => e.copy()
+    }
+    uri = "file://" + dir + "/llsp_probe.lark"
+    s = server.new()
+    _a = server.step(&s, server.classify(req(1, "initialize")))
+    _b = server.step(&s, server.classify(did_open(uri, 1, "import \"lsp/pos\"\nfn main() { q = pos.Pos(line: 0, ch: 0) }\n")))
+    // pos.Pos 的 P 在第 1 行第 20 列；lsp/pos.lark 的第 17 行（从 0 数是 16）是 pub type Pos {
+    want = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"uri\":\"file://#{dir}/lsp/pos.lark\",\"range\":{\"start\":{\"line\":16,\"character\":9},\"end\":{\"line\":16,\"character\":12}}}}"
+    assert_eq(reply_of(&s, def_req(2, uri, 1, 21)), want)
+    // 模块里没有这个名字
+    _c = server.step(&s, server.classify(did_change(uri, 2, "{\"text\":\"import \\\"lsp/pos\\\"\\nfn main() { pos.nope() }\\n\"}")))
+    assert_eq(reply_of(&s, def_req(3, uri, 1, 17)), "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}")
+}
+
+// ---------- 阶段 6：文档大纲（formal/Lark/LspSym.lean） ----------
+
+fn show_syms(d: str) -> str {
+    out = ""
+    for x in symbols.symbols(d) { out += "#{x.name}@#{x.at}:#{x.kind} " }
+    out
+}
+
+test "文档大纲：声明和种类（和 LspSym.lean 的 #guard 一样）" {
+    assert_eq(show_syms(def_src()), "add1@25:12 P@60:23 main@80:12 N@112:14 ")
+    assert_eq(show_syms("pub enum Got {\n  Msg\n}\npub interface Show {}\n"), "Got@9:10 Show@37:11 ")
+    assert_eq(symbols.kind_of("fn f()", 0), 12)
+    assert_eq(symbols.kind_of("pub fn f()", 0), 12)
+    assert_eq(symbols.kind_of("type T {", 0), 23)
+    assert_eq(symbols.kind_of("pub enum E {", 0), 10)
+    assert_eq(symbols.kind_of("const N = 1", 0), 14)
+    assert_eq(symbols.kind_of("interface I {}", 0), 11)
+    assert_eq(symbols.kind_of("x = 1", 0), 0)
+}
+
+test "文档大纲：随机的文档（symbols_decls、symbols_word、symbols_in）" {
+    parts = ["fn ", "pub ", "type ", "enum ", "const ", "interface ", "ab", "x1", "_", "\n", " ", "(", "\xe4\xb8\xad", "\r\n"]
+    r = rand.new(23)
+    wrong = 0
+    for _t in 0..300 {
+        d = ""
+        for _i in 0..r.range(0, 40) { d += parts[r.range(0, len(parts))] }
+        ss = symbols.symbols(d)
+        ds = defn.decls(d)
+        // 去掉种类以后正好是 decls
+        if len(ss) != len(ds) { wrong += 1 }
+        for i in 0..len(ss) {
+            if i < len(ds) && (ss[i].name != ds[i].name || ss[i].at != ds[i].at) { wrong += 1 }
+            n = len(ss[i].name)
+            if ss[i].at + n > len(d) || slice(d, ss[i].at, ss[i].at + n) != ss[i].name { wrong += 1 }
+            if ss[i].kind == 0 { wrong += 1 }      // 声明一定有关键字
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+fn sym_req(id: int, uri: str) -> str {
+    "{\"jsonrpc\":\"2.0\",\"id\":#{id},\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\"}}}"
+}
+
+test "文档大纲：经过服务器" {
+    s = server.new()
+    _a = server.step(&s, server.classify(req(1, "initialize")))
+    _b = server.step(&s, server.classify(did_open("file:///t/s.lark", 1, "fn f() {}\ntype T {}\n")))
+    r0 = "{\"start\":{\"line\":0,\"character\":3},\"end\":{\"line\":0,\"character\":4}}"
+    r1 = "{\"start\":{\"line\":1,\"character\":5},\"end\":{\"line\":1,\"character\":6}}"
+    want = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":[{\"name\":\"f\",\"kind\":12,\"range\":#{r0},\"selectionRange\":#{r0}},{\"name\":\"T\",\"kind\":23,\"range\":#{r1},\"selectionRange\":#{r1}}]}"
+    assert_eq(reply_of(&s, sym_req(2, "file:///t/s.lark")), want)
+    // 没有声明：空的列表；没打开：null
+    _c = server.step(&s, server.classify(did_open("file:///t/e.lark", 1, "// 只有注释\n")))
+    assert_eq(reply_of(&s, sym_req(3, "file:///t/e.lark")), "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":[]}")
+    assert_eq(reply_of(&s, sym_req(4, "file:///t/none.lark")), "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":null}")
+}
+
+// ---------- 阶段 7：格式化（formal/Lark/LspFmt.lean） ----------
+
+fn show_diff(d: str, t: str) -> str {
+    match take format.diff(d, t) {
+        Some(e) => "#{e.a} #{e.b} #{e.text}"
+        None => "none"
+    }
+}
+
+test "格式化：只换不一样的那段（和 LspFmt.lean 的 #guard 一样）" {
+    d1 = "fn  main( ) {}\n"
+    t1 = "fn main() {}\n"
+    assert_eq(format.pre_len(d1, t1), 3)
+    assert_eq(format.suf_len(d1, t1), 5)
+    assert_eq(format.mid(d1, t1, 3, 10), "main(")
+    assert_eq(edit.edit(d1, 3, 10, format.mid(d1, t1, 3, 10)), t1)
+    assert_eq(show_diff(d1, t1), "3 10 main(")
+    // 不一样的地方在 emoji 中间（😀 → 😁）：a 从 4 退到字符边界 1
+    d2 = "a\xf0\x9f\x98\x80x"
+    t2 = "a\xf0\x9f\x98\x81x"
+    assert_eq(format.pre_len(d2, t2), 4)
+    assert_eq(format.suf_len(d2, t2), 1)
+    assert_eq(show_diff(d2, t2), "1 5 \xf0\x9f\x98\x81")
+    assert_eq(edit.change(pos.U16, d2, p(0, 1), p(0, 3), "\xf0\x9f\x98\x81"), t2)
+    // 一样的时候不发修改
+    assert_eq(show_diff(t1, t1), "none")
+    assert_eq(json.format(format.edits_json(pos.U16, t1, t1)), "[]")
+    assert_eq(json.format(format.edits_json(pos.U16, d1, t1)), "[{\"range\":{\"start\":{\"line\":0,\"character\":3},\"end\":{\"line\":0,\"character\":10}},\"newText\":\"main(\"}]")
+}
+
+test "格式化：随机的文档（fmt_edit、fmt_change）" {
+    r = rand.new(29)
+    wrong = 0
+    for _t in 0..300 {
+        d = rand_doc(&r)
+        // t：d 改掉中间的一小段（也可能一样）
+        a0 = r.range(0, len(d) + 1)
+        b0 = a0 + r.range(0, len(d) - a0 + 1)
+        t = slice(d, 0, a0) + rand_doc(&r) + slice(d, b0, len(d))
+        p0 = format.pre_len(d, t)
+        s0 = format.suf_len(d, t)
+        if p0 + s0 > len(d) || p0 + s0 > len(t) { wrong += 1 }      // pre_suf
+        if slice(d, 0, p0) != slice(t, 0, p0) { wrong += 1 }         // pre_take
+        if slice(d, len(d) - s0, len(d)) != slice(t, len(t) - s0, len(t)) { wrong += 1 }   // suf_ok
+        match take format.diff(d, t) {
+            Some(e) => {
+                if d == t { wrong += 1 }
+                if edit.edit(d, e.a, e.b, e.text) != t { wrong += 1 }     // fmt_edit
+                // 编辑器做的事：换成 LSP 的位置，再按 Lsp.change 作用（fmt_change）
+                for enc in [pos.U16, pos.U8] {
+                    xs = pos.doc(d)
+                    if edit.change(enc, d, pos.pos_of(enc, xs, e.a), pos.pos_of(enc, xs, e.b), e.text) != t { wrong += 1 }
+                }
+            }
+            None => { if d != t { wrong += 1 } }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+fn fmt_req(id: int, uri: str) -> str {
+    "{\"jsonrpc\":\"2.0\",\"id\":#{id},\"method\":\"textDocument/formatting\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\"},\"options\":{\"tabSize\":4,\"insertSpaces\":true}}}"
+}
+
+test "格式化：经过服务器、真的运行格式化工具" {
+    // 文档没打开、或者没有格式化工具（home 是 ""）：null
+    s = server.new()
+    _a = server.step(&s, server.classify(req(1, "initialize")))
+    _b = server.step(&s, server.classify(did_open("file:///t/f.lark", 1, "fn  main( ) {}\n")))
+    assert_eq(reply_of(&s, fmt_req(2, "file:///t/none.lark")), "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}")
+    assert_eq(reply_of(&s, fmt_req(3, "file:///t/f.lark")), "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}")
+    // 有 build/lark-fmt（make fmt-tool）时：格式化以后再格式化一次不变，按修改作用以后就是格式化的结果
+    home = diag.find_home()
+    src = "fn  main( ) {\n  x = 1\n    print(\"\#{x}\")\n}\n"
+    match take format.run_fmt(home, src) {
+        Some(t) => {
+            assert_eq(format.run_fmt(home, t) ?? "出错", t)
+            match take format.diff(src, t) {
+                Some(e) => { assert_eq(edit.edit(src, e.a, e.b, e.text), t) }
+                None => { assert_eq(src, t) }
+            }
+        }
+        None => { assert_eq(os.is_file(os.join_path(home, "build/lark-fmt")), false) }
+    }
+}
+
+// ---------- 阶段 8：补全（formal/Lark/LspComp.lean） ----------
+
+fn joined(xs: [str]) -> str {
+    out = ""
+    for x in xs { out += x + " " }
+    out
+}
+
+fn has_str(xs: [str], x: str) -> bool {
+    for y in xs { if y == x { return true } }
+    false
+}
+
+test "补全：前缀和候选（和 LspComp.lean 的 #guard 一样）" {
+    d = def_src()
+    assert_eq(complete.prefix_at(d, 97), "ad")
+    assert_eq(joined(complete.complete(complete.cands(d), complete.prefix_at(d, 97))), "add1 ")
+    assert_eq(joined(complete.complete(complete.cands(d), "m")), "main match ")
+    assert_eq(joined(complete.complete(complete.cands(d), "P")), "P ")
+    assert_eq(joined(complete.complete(complete.cands(d), "zz")), "")
+    assert_eq(joined(complete.pub_names(d)), "add1 ")
+    assert_eq(complete.is_pub(d, 25), true)
+    assert_eq(complete.is_pub(d, 60), false)
+    assert_eq(joined(complete.complete(complete.cands("fn f()\nfn f()\n"), "f")), "f fn for false float ")
+    assert_eq(len(complete.complete(complete.cands(d), complete.prefix_at(d, 95))), 4 + len(complete.kw_names()))
+    assert_eq(joined(complete.uniq(["a", "b", "a", "c", "b"])), "a c b ")    // 留最后一个
+}
+
+test "补全：随机的文档（complete_iff、complete_nodup、local_sound）" {
+    parts = ["fn ", "pub ", "type ", "enum ", "const ", "f", "fo", "ab", "a", "x1", "_", "\n", " ", "(", "\xe4\xb8\xad"]
+    r = rand.new(31)
+    wrong = 0
+    for _t in 0..300 {
+        d = ""
+        for _i in 0..r.range(0, 30) { d += parts[r.range(0, len(parts))] }
+        o = r.range(0, len(d) + 1)
+        pre = complete.prefix_at(d, o)
+        cs = complete.cands(d)
+        got = complete.complete(cs, pre)
+        for i in 0..len(got) {
+            g = got[i]
+            if !(len(pre) <= len(g) && slice(g, 0, len(pre)) == pre) { wrong += 1 }     // 以前缀开头
+            if !has_str(cs, g) { wrong += 1 }                                          // 是候选
+            if !has_str(complete.kw_names(), g) && defn.find(d, g) < 0 { wrong += 1 }  // local_sound
+            for j in i + 1..len(got) { if got[j] == g { wrong += 1 } }               // 没有重复
+        }
+        // 一个不漏
+        for c in cs {
+            if len(pre) <= len(c) && slice(c, 0, len(pre)) == pre && !has_str(got, c) { wrong += 1 }
+        }
+        // module_sound：别的模块看到的都是 pub 的声明
+        for n in complete.pub_names(d) {
+            at = -1
+            for x in defn.decls(d) { if x.name == n && complete.is_pub(d, x.at) { at = x.at } }
+            if at < 0 { wrong += 1 }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+fn comp_req(id: int, uri: str, l: int, c: int) -> str {
+    "{\"jsonrpc\":\"2.0\",\"id\":#{id},\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\"},\"position\":{\"line\":#{l},\"character\":#{c}}}}"
+}
+
+test "补全：经过服务器、模块.名字" {
+    s = server.new()
+    _a = server.step(&s, server.classify(req(1, "initialize")))
+    _b = server.step(&s, server.classify(did_open("file:///t/c.lark", 1, def_src())))
+    // 第 6 行第 20 列：print(ad|d1(2)) 的 ad 后面
+    assert_eq(reply_of(&s, comp_req(2, "file:///t/c.lark", 6, 20)), "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":[{\"label\":\"add1\",\"kind\":3}]}")
+    assert_eq(reply_of(&s, comp_req(3, "file:///t/none.lark", 0, 0)), "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}")
+    // pos. 后面：lsp/pos.lark 里 pub 的声明
+    dir = match take os.cwd() {
+        Ok(x) => x
+        Err(e) => e.copy()
+    }
+    uri = "file://" + dir + "/llsp_probe.lark"
+    _c = server.step(&s, server.classify(did_open(uri, 1, "import \"lsp/pos\"\nfn main() { pos.o }\n")))
+    assert_eq(reply_of(&s, comp_req(4, uri, 1, 17)), "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":[{\"label\":\"off_of\",\"kind\":3}]}")
+    want_all = "[{\"label\":\"Enc\",\"kind\":13},{\"label\":\"Pos\",\"kind\":22},{\"label\":\"is_eol\",\"kind\":3},{\"label\":\"units\",\"kind\":3},{\"label\":\"doc\",\"kind\":3},{\"label\":\"off_of\",\"kind\":3},{\"label\":\"pos_of\",\"kind\":3}]"
+    assert_eq(reply_of(&s, comp_req(5, uri, 1, 16)), "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":#{want_all}}")
+}
+
+// ---------- 阶段 9：语义高亮（formal/Lark/LspSem.lean） ----------
+
+fn sem_words(d: str) -> str {
+    out = ""
+    for w in semantic.words(d) { out += "(#{w.at},#{w.n})" }
+    out
+}
+
+fn sem_ints(xs: [int]) -> str {
+    out = ""
+    for x in xs { out += "#{x}," }
+    out
+}
+
+fn sem_kinds(d: str) -> str {
+    out = ""
+    for i in 0..len(semantic.words(d)) { out += semantic.kind_name(d, i) + " " }
+    out
+}
+
+fn sem_id(c: int) -> bool { (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || (c >= 48 && c <= 57) }
+
+// 相对的差解回来（decode）
+fn sem_decode(xs: [int]) -> [semantic.Tok] {
+    out: [semantic.Tok] = []
+    l = 0
+    c = 0
+    k = 0
+    for k + 5 <= len(xs) {
+        nl = l + xs[k]
+        nc = if xs[k] == 0 { c + xs[k + 1] } else { xs[k + 1] }
+        out.push(semantic.Tok(line: nl, ch: nc, n: xs[k + 2], kind: xs[k + 3], md: xs[k + 4]))
+        l = nl
+        c = nc
+        k += 5
+    }
+    out
+}
+
+test "语义高亮：找词和编码（和 LspSem.lean 的 #guard 一样）" {
+    assert_eq(sem_words("fn f(x: int) { x }"), "(0,2)(3,1)(5,1)(8,3)(15,1)")
+    assert_eq(sem_words("a \"b \\\" c\" d // e f\ng 'h' i"), "(0,1)(11,1)(20,1)(26,1)")
+    assert_eq(sem_words("0xff 1_000 x1 2e5"), "(11,2)")
+    assert_eq(sem_words("a/b"), "(0,1)(2,1)")
+    // 插值里是代码（和 LspSem.lean 新加的 #guard 一样）
+    assert_eq(sem_words("\"a \#{x} b\" y"), "(5,1)(11,1)")
+    assert_eq(sem_words("\"\#{f(\"\#{g}\")} {h}\" k"), "(3,1)(8,1)(19,1)")
+    assert_eq(sem_words("\"\#{ {a} }b\" c"), "(5,1)(12,1)")
+    assert_eq(sem_words("\"\\\#{x}\" y"), "(8,1)")
+    ts = [semantic.Tok(line: 0, ch: 3, n: 4, kind: 1, md: 0), semantic.Tok(line: 0, ch: 10, n: 2, kind: 2, md: 1), semantic.Tok(line: 2, ch: 4, n: 1, kind: 3, md: 2)]
+    assert_eq(sem_ints(semantic.encode(ts)), "0,3,4,1,0,0,7,2,2,1,2,4,1,3,2,")
+}
+
+test "语义高亮：随机的文档（scan_word、scan_disjoint、decode_encode）" {
+    parts = ["fn ", "type ", "a", "b1", "_x", "9", "0x", " ", "\n", "\"", "\\", "'", "//", "/", ".", "(", ")", "{", "}", ":", "=", ",", "\xe4\xb8\xad", "\#{", "\#"]
+    r = rand.new(41)
+    wrong = 0
+    for _t in 0..300 {
+        d = ""
+        for _i in 0..r.range(0, 40) { d += parts[r.range(0, len(parts))] }
+        ws = semantic.words(d)
+        for i in 0..len(ws) {
+            w = ws[i].copy()
+            // 一串标识符的字节，非空，不以数字开头，往左往右都到头
+            if w.n <= 0 || w.at + w.n > len(d) { wrong += 1 } else {
+                for k in w.at..w.at + w.n { if !sem_id(byte_at(d, k)) { wrong += 1 } }
+                if byte_at(d, w.at) >= 48 && byte_at(d, w.at) <= 57 { wrong += 1 }
+                if w.at + w.n < len(d) && sem_id(byte_at(d, w.at + w.n)) { wrong += 1 }
+                if w.at > 0 && sem_id(byte_at(d, w.at - 1)) { wrong += 1 }
+            }
+            // 按位置排好、互不重叠
+            if i + 1 < len(ws) && w.at + w.n > ws[i + 1].at { wrong += 1 }
+        }
+        // 上色的词：位置按顺序、编码解回来不变
+        ts = semantic.tokens(pos.U16, d)
+        n = 0
+        for i in 0..len(ws) { if semantic.kind_name(d, i) != "-" { n += 1 } }
+        if len(ts) != n { wrong += 1 }
+        back = sem_decode(semantic.encode(ts))
+        if len(back) != len(ts) { wrong += 1 } else {
+            for i in 0..len(ts) {
+                a = ts[i].copy()
+                b = back[i].copy()
+                if a.line != b.line || a.ch != b.ch || a.n != b.n || a.kind != b.kind || a.md != b.md { wrong += 1 }
+                if i > 0 && (ts[i - 1].line > a.line || (ts[i - 1].line == a.line && ts[i - 1].ch >= a.ch)) { wrong += 1 }
+            }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "语义高亮：每个词的种类" {
+    d = "import \"lsp/pos\"\ntype P {\n    pub x: int\n}\nfn add(a: int, b: P) -> int {\n    s = a + b.x\n    for i in 0..s { s += i }\n    pos.doc(\"k\")\n    s\n}\n"
+    want = "selfTypeKeyword selfTypeKeyword type.declaration selfTypeKeyword property type.defaultLibrary selfTypeKeyword function.declaration parameter type.defaultLibrary parameter type type.defaultLibrary variable parameter parameter property selfTypeKeyword variable selfTypeKeyword variable variable variable namespace function variable "
+    assert_eq(sem_kinds(d), want)
+    assert_eq(sem_kinds("enum E {\n    A\n    B(n: int)\n}\nfn f(self) { g(k: 1, self.m()) }\n"), "selfTypeKeyword type.declaration enumMember enumMember property type.defaultLibrary selfTypeKeyword function.declaration selfKeyword function property selfKeyword function ")
+    // 列按商量好的单位：前面有个 “中” 时 UTF-16 少 2
+    t = "fn f() { y = \"\xe4\xb8\xad\" + y }"
+    assert_eq(sem_ints(semantic.encode(semantic.tokens(pos.U16, t))), "0,0,2,6,0,0,3,1,2,1,0,6,1,4,0,0,10,1,4,0,")
+    assert_eq(sem_ints(semantic.encode(semantic.tokens(pos.U8, t))), "0,0,2,6,0,0,3,1,2,1,0,6,1,4,0,0,12,1,4,0,")
+}
+
+test "语义高亮：match 的模式、闭包的参数、test / lock / defer、常量" {
+    d = "const MAX = 3\nfn f(e: E) -> int {\n    g = |a, b| a + b\n    match e {\n        EInt(n) => n + MAX\n        Pair(x, _) => x\n    }\n    lock m { defer { test } }\n    0\n}\ntest \"t\" { }\n"
+    want = "selfTypeKeyword enumMember selfTypeKeyword function.declaration parameter type type.defaultLibrary variable parameter parameter parameter parameter selfTypeKeyword parameter enumMember variable variable enumMember enumMember variable - variable selfTypeKeyword - selfTypeKeyword - selfTypeKeyword "
+    assert_eq(sem_kinds(d), want)
+    // a || b 不是闭包；不带 => 的 f(a, b) 不是模式
+    assert_eq(sem_kinds("fn h(a: bool) { a || q\n    f(a, z)\n}\n"), "selfTypeKeyword function.declaration parameter type.defaultLibrary parameter - function parameter - ")
+    // 插值里的代码照样上色
+    assert_eq(sem_kinds("fn f(x: int) -> str { \"v \#{x} \#{g(x)}\" }"), "selfTypeKeyword function.declaration parameter type.defaultLibrary type.defaultLibrary parameter function parameter ")
+    // 大写开头的：模块.Pos 是类型、模块.Str(x) 和按位置的 Num(_) 是变体、名字: 值 构造的 Word(at: 1) 是类型、模式里的 Null => 是变体
+    d2 = "import \"std/json\"\nimport \"lsp/pos\"\nfn f(p: pos.Pos) { json.Str(\"x\")\n    q = Word(at: 1)\n    match q {\n        Num(_) => 1\n        Null => 2\n    }\n}\n"
+    assert_eq(sem_kinds(d2), "selfTypeKeyword selfTypeKeyword selfTypeKeyword function.declaration parameter namespace type namespace enumMember variable type property selfTypeKeyword variable enumMember - enumMember ")
+    // 插值里的字符串有 } 时，函数体的范围照样对：h 的参数 b 不受影响
+    assert_eq(sem_kinds("fn f(a: int) -> str { \"\#{g(\"}\")}\" }\nfn h(b: int) { b }"), "selfTypeKeyword function.declaration parameter type.defaultLibrary type.defaultLibrary function selfTypeKeyword function.declaration parameter type.defaultLibrary parameter ")
+    // 别的模块的常量
+    assert_eq(sem_kinds("fn h() { pos.MAX }"), "selfTypeKeyword function.declaration - enumMember ")
+}
+
+fn sem_req(id: int, uri: str) -> str {
+    "{\"jsonrpc\":\"2.0\",\"id\":#{id},\"method\":\"textDocument/semanticTokens/full\",\"params\":{\"textDocument\":{\"uri\":\"#{uri}\"}}}"
+}
+
+test "语义高亮：经过服务器" {
+    s = server.new()
+    _a = server.step(&s, server.classify(req(1, "initialize")))
+    _b = server.step(&s, server.classify(did_open("file:///t/s.lark", 1, "fn f() { y = \"\xe4\xb8\xad\" + y }")))
+    assert_eq(reply_of(&s, sem_req(2, "file:///t/s.lark")), "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"data\":[0,0,2,6,0,0,3,1,2,1,0,6,1,4,0,0,10,1,4,0]}}")
+    assert_eq(reply_of(&s, sem_req(3, "file:///t/none.lark")), "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}")
+}

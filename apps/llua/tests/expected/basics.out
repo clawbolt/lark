@@ -1,0 +1,11 @@
+alice: 175.50
+false	tests/lua/basics.lua:17: 余额不足：alice
+31	3.875	1	9
+11	22	33
+lark  |  4
+lua   |  3
+c     |  1
+ocaml |  5
+ 99.4%	true	97	98	99
+3	3.0	-2	2	1.4142135623731	inf	3
+-2	-9223372036854775808	inf	inf

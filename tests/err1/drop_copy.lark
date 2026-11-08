@@ -1,0 +1,11 @@
+// 期望错误：有析构函数的类型不能复制，否则同一个资源会被关闭两次
+type File {
+    fd: int
+}
+
+fn drop(inout f: File) {}
+
+fn main() {
+    a = File(fd: 1)
+    b = a.copy()
+}

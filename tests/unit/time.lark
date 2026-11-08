@@ -1,0 +1,105 @@
+// std/time 的边界：1970 年前后、闰年、公元前、很远的年份、日期和毫秒数来回、各种写错的时间、时长的进位
+import "std/time"
+
+fn iso_ms(s: str) -> int {
+    match take time.parse_iso(s) {
+        Ok(n) => n
+        Err(e) => panic(e)
+    }
+}
+
+fn iso_err(s: str) -> str {
+    match take time.parse_iso(s) {
+        Ok(n) => "<成功：#{n}>"
+        Err(e) => e
+    }
+}
+
+test "1970 年前后、闰年、公元前" {
+    d = time.date_utc(0)
+    assert_eq(d.format(), "1970-01-01 00:00:00")
+    assert_eq(d.weekday, 4)
+    b = time.date_utc(-1)
+    assert_eq(b.format_iso(), "1969-12-31T23:59:59.999Z")
+    assert_eq(b.weekday, 3)
+    assert_eq(time.date_utc(iso_ms("2024-02-29")).format(), "2024-02-29 00:00:00")
+    assert(iso_ms("2000-02-29") > 0)
+    assert_eq(iso_err("2025-02-29"), "没有这一天：2025-02-29")
+    assert_eq(iso_err("1900-02-29"), "没有这一天：1900-02-29")
+    assert_eq(time.days_in_month(2024, 2), 29)
+    assert_eq(time.days_in_month(2023, 2), 28)
+    assert_eq(time.days_in_month(2023, 12), 31)
+    assert_eq(time.days_in_month(2023, 11), 30)
+    assert_eq(time.date_utc(iso_ms("0001-01-01")).format(), "0001-01-01 00:00:00")
+    // 公元前 1 年（ISO 里写成 -0001）
+    far = time.Date(year: -1, month: 12, day: 31, hour: 0, minute: 0, second: 0, ms: 0, weekday: 0)
+    assert_eq(time.date_utc(time.to_unix_ms(far)).format(), "-0001-12-31 00:00:00")
+    assert_eq(time.date_utc(iso_ms("9999-12-31T23:59:59.999Z")).format_iso(), "9999-12-31T23:59:59.999Z")
+    // format_iso 写出来的都能读回来：公元前、5 位的年份
+    for s in ["-0002-12-17T14:13:20.000Z", "10000-01-01T00:00:00.000Z", "-12345-06-07T08:09:10.011Z"] {
+        assert_eq(time.date_utc(iso_ms(s)).format_iso(), s)
+    }
+    assert_eq(iso_ms("+2026-10-26"), iso_ms("2026-10-26"))
+    assert_eq(iso_err("1234567-01-01"), "时间格式不对：1234567-01-01（应该像 2026-10-26T07:52:00Z）")
+    assert_eq(iso_err("-02-12-17"), "时间格式不对：-02-12-17（应该像 2026-10-26T07:52:00Z）")
+}
+
+test "日期和毫秒数来回" {
+    // 从 1600 年到 2400 年，每隔 97 天又 1 小时 1 分 1.001 秒取一个点
+    t = iso_ms("1600-01-01")
+    stop = iso_ms("2400-12-31")
+    step = 97 * 86_400_000 + 3_661_001
+    bad = 0
+    n = 0
+    for t < stop {
+        d = time.date_utc(t)
+        if time.to_unix_ms(d) != t || d.month < 1 || d.month > 12 || d.day < 1 || d.day > time.days_in_month(d.year, d.month) { bad += 1 }
+        if iso_ms(d.format_iso()) != t { bad += 1 }
+        t += step
+        n += 1
+    }
+    assert(n > 2900)
+    assert_eq(bad, 0)
+}
+
+test "写错的时间" {
+    assert_eq(iso_err("2026-1a-26"), "这里应该是数字：1a")
+    assert_eq(iso_err("2026/10/26"), "时间格式不对：2026/10/26（应该像 2026-10-26T07:52:00Z）")
+    assert_eq(iso_err("2026-13-01"), "没有这一天：2026-13-01")
+    assert_eq(iso_err("2026-10-00"), "没有这一天：2026-10-00")
+    assert_eq(iso_err("2026-10-26T24:00:00Z"), "时间不对：24:00:00")
+    assert_eq(iso_err("2026-10-26T07:52"), "时间格式不对：2026-10-26T07:52（应该像 2026-10-26T07:52:00Z）")
+    assert_eq(iso_err("2026-10-26x"), "时间格式不对：2026-10-26x（应该像 2026-10-26T07:52:00Z）")
+    assert_eq(iso_err("2026-10-26T07:52:00.1Z"), "毫秒要写 3 位：2026-10-26T07:52:00.1Z")
+    assert_eq(iso_err("2026-10-26T07:52:00Zjunk"), "时间后面有多余的内容：junk")
+    // T 可以写成空格，Z 可以省略
+    assert_eq(iso_ms("2026-10-26 07:52:00"), iso_ms("2026-10-26T07:52:00Z"))
+}
+
+test "时长的写法" {
+    assert_eq(time.format_dur(0), "0ns")
+    assert_eq(time.format_dur(999), "999ns")
+    assert_eq(time.format_dur(1_000), "1µs")
+    assert_eq(time.format_dur(1_500), "1.5µs")
+    // 一位小数是截断的，不进位
+    assert_eq(time.format_dur(999_999), "999.9µs")
+    assert_eq(time.format_dur(1_000_000), "1ms")
+    assert_eq(time.format_dur(59_999_999_999), "59.9s")
+    assert_eq(time.format_dur(60_000_000_000), "1m")
+    assert_eq(time.format_dur(61_000_000_000), "1m1s")
+    assert_eq(time.format_dur(3_599_000_000_000), "59m59s")
+    assert_eq(time.format_dur(3_600_000_000_000), "1h")
+    assert_eq(time.format_dur(3_661_000_000_000), "1h1m")
+    assert_eq(time.format_dur(-1_500), "-1.5µs")
+    // format_dur 写出来的 parse_dur 读得回去
+    assert_eq(time.parse_dur(time.format_dur(90_000_000_000)) ?? 0, 90_000_000_000)
+}
+
+test "时钟" {
+    t = time.now()
+    sleep_ms(20)
+    assert(time.elapsed_ns(t) >= 20_000_000)
+    assert(time.elapsed_ms(t) >= 20)
+    assert(time.unix_ms() > 1_700_000_000_000)
+    assert(time.unix_ns() / 1_000_000 >= time.unix_ms() - 1000)
+}

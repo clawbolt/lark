@@ -1,0 +1,9 @@
+// 期望错误：Vec 没有定义 fn add，不能用 +
+type Vec {
+    x: int
+}
+
+fn main() {
+    a = Vec(x: 1)
+    b = a + Vec(x: 2)
+}

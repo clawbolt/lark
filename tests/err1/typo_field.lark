@@ -1,0 +1,10 @@
+// 期望错误：Point 没有字段 xx，提示 x
+type Point {
+    x: int
+    y: int
+}
+
+fn main() {
+    p = Point(x: 1, y: 2)
+    n = p.xx
+}

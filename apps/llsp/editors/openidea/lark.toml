@@ -1,0 +1,27 @@
+# Lark 的语言服务器 llsp（OpenIDEA）。
+# 复制到 ~/Library/Application Support/ai.l0ng.openidea/languages/lark.toml，
+# 把 /path/to/lark 换成你的 Lark 仓库路径，然后重启 OpenIDEA。
+#
+# OpenIDEA 的 tree-sitter 语法是编进程序里的，加不了新的，所以没有 tree-sitter 这一行：
+# 文档大纲靠 llsp 的 documentSymbol，高亮借用 CodeMirror 的 Rust 模式（见下面 ui-mode）。
+
+id = "lark"
+name = "Lark"
+extensions = ["lark"]
+line-comment = "//"
+block-comment = ["/*", "*/"]
+indent = { tab-size = 4, insert-spaces = true }
+
+# 近似高亮：Lark 的关键字（fn / type / enum / if / else / match / for / in / return /
+# break / continue / true / false / pub / const）和 Rust 基本重合，注释、字符串、数字也一样。
+# take / inout / interface / scope / select 不是 Rust 关键字，不会被上色。
+ui-mode = "Rust"
+
+[[language-servers]]
+name = "llsp"
+command = "/path/to/lark/apps/llsp/build/llsp"
+args = []
+# llsp 靠它找 build/lark1 发诊断；不设置时 llsp 会从自己的位置往上找
+env = { LARK_HOME = "/path/to/lark" }
+root-markers = ["lark.pkg"]
+install-hint = "在 Lark 仓库根目录 make lark-tool，再 cd apps/llsp && LARK_HOME=\"$PWD/../..\" ../../build/lark build"

@@ -1,0 +1,144 @@
+// 不递归的枚举和 T? 按值存放，不再每个值分配一次（见 design/enum-by-value.md）。
+// 放进结构体、元组、列表、T?、Map、交给别的线程，以及 match take、自定义析构，用法和结果都和以前一样
+import "std/map"
+
+enum Shape {
+    Circle(r: int)
+    Rect(w: int, h: int)
+    Dot
+}
+
+type Item {
+    name: str
+    shape: Shape
+}
+
+// 有自定义析构的按值枚举
+enum Res {
+    Open(name: str)
+    Closed
+}
+
+fn drop(inout r: Res) {
+    match r {
+        Open(n) => print("关闭 #{n}")
+        Closed => {}
+    }
+}
+
+// Tree 经过结构体 Wrap 包含了自己，所以仍放在堆上
+type Wrap {
+    inner: Tree
+}
+
+enum Tree {
+    Leaf(int)
+    Node(Wrap, Wrap)
+}
+
+// Link? 经过 Link 的字段包含了自己，所以这个 T? 仍是指针；int?、Shape? 这些按值存放
+type Link {
+    v: int
+    next: Link?
+}
+
+type Job {
+    shape: Shape
+    out: Chan[int]
+}
+
+fn area(s: Shape) -> int {
+    match s {
+        Circle(r) => 3 * r * r
+        Rect(w, h) => w * h
+        Dot => 0
+    }
+}
+
+fn show(s: Shape) -> str {
+    match s {
+        Circle(r) => "圆(#{r})"
+        Rect(w, h) => "矩形(#{w}×#{h})"
+        Dot => "点"
+    }
+}
+
+fn sum_tree(t: Tree) -> int {
+    match t {
+        Leaf(n) => n
+        Node(a, b) => sum_tree(a.inner) + sum_tree(b.inner)
+    }
+}
+
+fn sum_link(l: Link) -> int {
+    match l.next {
+        Some(n) => l.v + sum_link(n)
+        None => l.v
+    }
+}
+
+fn worker(take job: Job) { job.out.send(area(job.shape)) }
+
+fn main() {
+    shapes: [Shape] = [Circle(r: 2), Rect(w: 3, h: 4), Dot]
+    total = 0
+    for s in shapes { total += area(s) }
+    print("面积合计 #{total}")
+    print("列表：#{shapes}")
+    item = Item(name: "盒子", shape: Rect(w: 2, h: 5))
+    print("#{item.name}：#{item.shape}")
+    pair = (Dot, Circle(r: 1))
+    print("#{pair.0} #{pair.1}")
+
+    // T? 和 Map 的值
+    first: Shape? = shapes[0].copy()
+    match first {
+        Some(s) => print("第一个：#{s}")
+        None => print("没有")
+    }
+    m: map.Map[str, Shape] = map.new()
+    m.insert("a", Rect(w: 1, h: 1))
+    m.insert("b", Circle(r: 3))
+    got_b = m.get("b")
+    match got_b {
+        Some(s) => print("b 是 #{s}")
+        None => print("没有 b")
+    }
+
+    // 复制、比较、拆开
+    c2 = item.shape.copy()
+    same = c2 == item.shape
+    print("相等：#{same}")
+    s3 = Rect(w: 7, h: 8)
+    match take s3 {
+        Rect(w, h) => print("拆开：#{w} #{h}")
+        _ => {}
+    }
+
+    // 自定义析构：被覆盖时调用一次，离开作用域时再调用一次
+    r1 = Open(name: "a.txt")
+    rs: [Res] = []
+    rs.push(Open(name: "b.txt"))
+    r1 = Closed
+
+    // 交给别的线程
+    results: Chan[int] = chan()
+    scope {
+        spawn(worker, Job(shape: Circle(r: 1), out: results.copy()))
+        spawn(worker, Job(shape: Rect(w: 2, h: 2), out: results.copy()))
+    }
+    got = 0
+    for {
+        r = results.recv()
+        match r {
+            Some(v) => { got += v }
+            None => break
+        }
+    }
+    print("线程算的面积 #{got}")
+
+    t = Node(Wrap(inner: Leaf(1)), Wrap(inner: Node(Wrap(inner: Leaf(2)), Wrap(inner: Leaf(3)))))
+    print("树的和 #{sum_tree(t)}")
+    chain = Link(v: 1, next: Link(v: 2, next: Link(v: 3, next: None)))
+    print("链表的和 #{sum_link(chain)}")
+}

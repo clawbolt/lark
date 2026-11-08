@@ -1,0 +1,43 @@
+// 借用遍历：for (k, v) in m（需要 lark1 及以后的版本）
+// 类型定义了 fn iter_len(x: T) -> int 和 fn iter_at(x: T, i: int) -> E 时，for x in v 借用 v，
+// 依次取 iter_at(v, 0)、iter_at(v, 1)……，每轮的值归循环变量所有。和遍历列表一样，循环期间 v 不能修改，循环之后照常能用。
+// std/map 的 Map 给出 (键, 值)，std/set 的 Set 给出元素，都按插入顺序，而且不会先复制整张表。
+// 编译：lark1 examples/borrowiter.lark -o out.c
+import "std/map"
+import "std/set"
+import "std/iter"
+
+// 自己的类型也行：只存起点、步长和个数的等差数列，取第 i 项时才算出来
+type Steps {
+    start: int
+    step: int
+    n: int
+}
+
+fn iter_len(s: Steps) -> int { s.n }
+
+fn iter_at(s: Steps, i: int) -> int { s.start + s.step * i }
+
+fn main() {
+    ages: map.Map[str, int] = map.new()
+    ages.insert("小明", 12)
+    ages.insert("小红", 11)
+    ages.insert("小刚", 13)
+    for (name, age) in ages {
+        print("#{name} #{age} 岁")
+    }
+    // 循环只是借用 ages，之后照常能改
+    ages["小红"] += 1
+    for i, (name, age) in ages {
+        if i == 1 { print("第二个是 #{name}，现在 #{age} 岁") }
+    }
+
+    tags = set.of(["红", "绿", "红", "蓝"])
+    for t in tags { print("标签 #{t}") }
+
+    s = Steps(start: 10, step: 5, n: 4)
+    for x in s { print("#{x}") }
+    // 能借用遍历的类型也满足 Iter，可以交给 std/iter 的函数（它们会拿走来源，所以这里给一份副本）
+    total = s.copy().fold(0, |acc, x| acc + x)
+    print("和：#{total}，s 还能用：#{s.n} 项")
+}

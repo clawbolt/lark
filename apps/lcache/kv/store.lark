@@ -1,0 +1,97 @@
+// lcache · 存数据的部分：分成 NSHARD 段，每段一个 Mutex，按键的哈希分段，不同段的读写互不等待。
+// 时间由调用者传进来（Unix 毫秒），单元测试用固定的时间
+import "std/map"
+
+const NSHARD = 16              // 2 的幂（下面用 & 取段号）
+
+type Entry {
+    val: str
+    exp: int                   // 过期时间（Unix 毫秒），0 表示不过期
+}
+
+type Shard {
+    m: map.Map[str, Entry]
+    hits: int
+    misses: int
+}
+
+// 复制 Store 只是复制 16 个互斥量的引用（各自计数加一），拿到的是同一份数据：每个连接一份
+pub type Store {
+    shards: [Mutex[Shard]]
+}
+
+pub type Stats {
+    pub keys: int              // 包括已经过期、还没被清掉的
+    pub hits: int
+    pub misses: int
+}
+
+pub fn new() -> Store {
+    shards: [Mutex[Shard]] = []
+    for _i in 0..NSHARD { shards.push(mutex(Shard(m: map.new(), hits: 0, misses: 0))) }
+    Store(shards: shards)
+}
+
+// hash 是接口 map.Hash 的方法：不属于哪个模块，不写 map.
+fn shard_of(k: str) -> int { hash(k) & (NSHARD - 1) }
+
+fn live(e: Entry, now: int) -> bool { e.exp == 0 || e.exp > now }
+
+// 键的值；没有或已过期时是 None（过期的顺手删掉）
+pub fn get(s: Store, k: str, now: int) -> str? {
+    lock s.shards[shard_of(k)] as sh {
+        match take sh.m.get(k) {
+            Some(e) => {
+                if live(e, now) {
+                    sh.hits += 1
+                    Some(e.val)
+                } else {
+                    _gone = sh.m.remove(k)
+                    sh.misses += 1
+                    None
+                }
+            }
+            None => {
+                sh.misses += 1
+                None
+            }
+        }
+    }
+}
+
+// 放进去；ttl_ms > 0 时 ttl_ms 毫秒后过期，否则不过期（覆盖原来的过期时间）
+pub fn set(s: Store, k: str, v: str, ttl_ms: int, now: int) {
+    exp = if ttl_ms > 0 { now + ttl_ms } else { 0 }
+    lock s.shards[shard_of(k)] as sh { sh.m.insert(k, Entry(val: v, exp: exp)) }
+}
+
+// 删掉；返回删之前它在不在（已过期的算不在）
+pub fn del(s: Store, k: str, now: int) -> bool {
+    lock s.shards[shard_of(k)] as sh {
+        match take sh.m.remove(k) {
+            Some(e) => live(e, now)
+            None => false
+        }
+    }
+}
+
+// 清掉所有已过期的，返回清掉了几个。一段一段地锁，不会一直占着所有的段
+pub fn sweep(s: Store, now: int) -> int {
+    n = 0
+    for i in 0..NSHARD {
+        n += lock s.shards[i] as sh { sh.m.retain(|_k, e| live(e, now)) }
+    }
+    n
+}
+
+pub fn stats(s: Store) -> Stats {
+    st = Stats(keys: 0, hits: 0, misses: 0)
+    for i in 0..NSHARD {
+        lock s.shards[i] as sh {
+            st.keys += len(sh.m)
+            st.hits += sh.hits
+            st.misses += sh.misses
+        }
+    }
+    st
+}

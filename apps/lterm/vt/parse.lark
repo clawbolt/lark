@@ -1,0 +1,319 @@
+// 转义序列的解析器：终端从程序那里收到的字节流，切成一个个动作（Act），屏幕（下一阶段）再按动作去改格子。
+// 状态机照 DEC / ANSI 的标准（vt100.net 上 Paul Williams 的那张图）。
+// 先证明再写：对应 formal/Lark/VtParse.lean，函数和定义一一对应：
+//   St ↔ St、Act ↔ Act、P ↔ P、reset ↔ clear、step ↔ step（CAN / SUB、ESC 先于状态处理）、body ↔ body、
+//   params ↔ params、finish ↔ finish、all_params ↔ allParams、run ↔ run
+// 证明了：任何状态、任何字节都有下一步（字节流总能吃完）；CAN / SUB 从任何状态回到 Ground、清掉读了一半的序列
+// （step_cancel）；ESC 从任何状态重新开始（step_escape）；每个字节最多出一个动作（run_len）；
+// Ground 里的普通文字原样按顺序变成 Print（run_text）；OSC 字符串里的文字不会变成 Print（run_osc）。
+// 字节按字节看：UTF-8 的多字节字符一个字节一个 Print，下一阶段拼成字符；C1 控制字符（0x80–0x9F）不认。
+// 模型里没有的一条：OSC / DCS 的内容最多 MAX_DATA 字节，多的丢掉（不让坏的输入一直攒着）；结果的动作和模型一样，只是内容截短。
+// 没做：参数里的 :（子参数，SGR 38:2::r:g:b）当成 ; 处理。
+
+// 每个参数最大 65535（maxParam）
+pub const MAX_PARAM = 65535
+pub const MAX_DATA = 65536
+
+pub enum St {
+    Ground       // 普通文字
+    Escape       // ESC 之后
+    EscInter     // ESC 中间字节
+    CsiEntry     // ESC [ 之后
+    CsiParam
+    CsiInter
+    CsiIgnore    // 坏的 CSI：读到结尾字节为止，整段丢掉
+    OscString    // ESC ] 之后，BEL 或 ESC \ 结束
+    DcsEntry     // ESC P 之后
+    DcsParam
+    DcsInter
+    DcsPass      // DCS 的内容
+    DcsIgnore
+    SosString    // ESC X / ESC ^ / ESC _ 之后，整段丢掉
+}
+
+pub enum Act {
+    Print(c: int)                                   // 显示一个字节
+    Exec(c: int)                                    // 控制字符：换行、回车、退格、响铃……
+    Esc(inter: [int], f: int)                       // ESC 中间字节 结尾字节
+    Csi(params: [int], inter: [int], f: int)        // ESC [ 参数 中间字节 结尾字节；私有标记（? 等）在 inter 的开头
+    Osc(data: str)                                  // ESC ] 内容 BEL
+    Dcs(params: [int], inter: [int], f: int, data: str)
+}
+
+pub type P {
+    pub st: St
+    pub params: [int]    // 读完的参数
+    pub cur: int         // 正在读的参数
+    pub any: bool        // 读到过数字或分隔符（没有时参数是空的，不是 [0]）
+    pub inter: [int]     // 中间字节和私有标记
+    pub final: int       // DCS 的结尾字节（之后是它的内容）
+    pub data: str        // OSC / DCS 的内容
+}
+
+fn ints() -> [int] {
+    out: [int] = []
+    out
+}
+
+pub fn new() -> P { P(st: Ground, params: ints(), cur: 0, any: false, inter: ints(), final: 0, data: "") }
+
+// clear
+fn reset(inout p: P, st: St) {
+    p.st = st.copy()
+    p.params = ints()
+    p.cur = 0
+    p.any = false
+    p.inter = ints()
+    p.final = 0
+    p.data = ""
+}
+
+fn is_dig(c: int) -> bool { c >= 0x30 && c <= 0x39 }
+fn is_inter(c: int) -> bool { c >= 0x20 && c <= 0x2F }
+fn is_priv(c: int) -> bool { c >= 0x3C && c <= 0x3F }
+fn is_final(c: int) -> bool { c >= 0x40 && c <= 0x7E }
+fn is_sep(c: int) -> bool { c == 0x3B || c == 0x3A }
+
+fn put(inout p: P, c: int) {
+    if len(p.data) < MAX_DATA { p.data += from_byte(c) }
+}
+
+// allParams
+pub fn all_params(p: P) -> [int] {
+    if !p.any { return ints() }
+    out = p.params.copy()
+    out.push(p.cur)
+    out
+}
+
+// ESC 打断时要交出去的：OSC 和 DCS 的内容（ESC \ 是它们的结束符）
+fn finish(p: P) -> Act? {
+    if p.st == OscString { return Some(Osc(p.data.copy())) }
+    if p.st == DcsPass { return Some(Dcs(all_params(p), p.inter.copy(), p.final, p.data.copy())) }
+    None
+}
+
+// CSI 和 DCS 的参数部分；dcs：是不是 DCS
+fn params(inout p: P, c: int, dcs: bool) -> Act? {
+    if is_dig(c) {
+        v = p.cur * 10 + (c - 0x30)
+        p.cur = if v > MAX_PARAM { MAX_PARAM } else { v }
+        p.any = true
+        p.st = if dcs { DcsParam } else { CsiParam }
+        return None
+    }
+    if is_sep(c) {
+        p.params.push(p.cur)
+        p.cur = 0
+        p.any = true
+        p.st = if dcs { DcsParam } else { CsiParam }
+        return None
+    }
+    if is_inter(c) {
+        p.inter.push(c)
+        p.st = if dcs { DcsInter } else { CsiInter }
+        return None
+    }
+    if is_final(c) {
+        if dcs {
+            p.st = DcsPass
+            p.final = c
+            return None
+        }
+        a = Csi(all_params(p), p.inter.copy(), c)
+        reset(&p, Ground)
+        return Some(a)
+    }
+    None
+}
+
+fn body(inout p: P, c: int) -> Act? {
+    st = p.st.copy()
+    if st == Ground {
+        if c < 0x20 { return Some(Exec(c)) }
+        if c == 0x7F { return None }
+        return Some(Print(c))
+    }
+    if st == Escape {
+        if c < 0x20 { return Some(Exec(c)) }
+        if is_inter(c) {
+            p.inter.push(c)
+            p.st = EscInter
+            return None
+        }
+        if c == 0x5B {
+            reset(&p, CsiEntry)
+            return None
+        }
+        if c == 0x5D {
+            reset(&p, OscString)
+            return None
+        }
+        if c == 0x50 {
+            reset(&p, DcsEntry)
+            return None
+        }
+        if c == 0x58 || c == 0x5E || c == 0x5F {
+            reset(&p, SosString)
+            return None
+        }
+        if c == 0x7F { return None }
+        a = Esc(p.inter.copy(), c)
+        reset(&p, Ground)
+        return Some(a)
+    }
+    if st == EscInter {
+        if c < 0x20 { return Some(Exec(c)) }
+        if is_inter(c) {
+            p.inter.push(c)
+            return None
+        }
+        if c == 0x7F { return None }
+        a = Esc(p.inter.copy(), c)
+        reset(&p, Ground)
+        return Some(a)
+    }
+    if st == CsiEntry {
+        if c < 0x20 { return Some(Exec(c)) }
+        if is_priv(c) {
+            p.inter.push(c)
+            p.st = CsiParam
+            return None
+        }
+        return params(&p, c, false)
+    }
+    if st == CsiParam {
+        if c < 0x20 { return Some(Exec(c)) }
+        if is_priv(c) {
+            p.st = CsiIgnore
+            return None
+        }
+        return params(&p, c, false)
+    }
+    if st == CsiInter {
+        if c < 0x20 { return Some(Exec(c)) }
+        if is_inter(c) {
+            p.inter.push(c)
+            return None
+        }
+        if is_final(c) {
+            a = Csi(all_params(p), p.inter.copy(), c)
+            reset(&p, Ground)
+            return Some(a)
+        }
+        if c < 0x40 { p.st = CsiIgnore }
+        return None
+    }
+    if st == CsiIgnore {
+        if c < 0x20 { return Some(Exec(c)) }
+        if is_final(c) { reset(&p, Ground) }
+        return None
+    }
+    if st == OscString {
+        if c == 0x07 {
+            a = Osc(p.data.copy())
+            reset(&p, Ground)
+            return Some(a)
+        }
+        if c >= 0x20 { put(&p, c) }
+        return None
+    }
+    if st == DcsEntry {
+        if c < 0x20 { return None }
+        if is_priv(c) {
+            p.inter.push(c)
+            p.st = DcsParam
+            return None
+        }
+        return params(&p, c, true)
+    }
+    if st == DcsParam {
+        if c < 0x20 { return None }
+        if is_priv(c) {
+            p.st = DcsIgnore
+            return None
+        }
+        return params(&p, c, true)
+    }
+    if st == DcsInter {
+        if c < 0x20 { return None }
+        if is_inter(c) {
+            p.inter.push(c)
+            return None
+        }
+        if is_final(c) {
+            p.st = DcsPass
+            p.final = c
+            return None
+        }
+        if c < 0x40 { p.st = DcsIgnore }
+        return None
+    }
+    if st == DcsPass {
+        if c != 0x7F { put(&p, c) }
+        return None
+    }
+    // DcsIgnore、SosString：到 ESC（或 CAN / SUB）为止都丢掉
+    None
+}
+
+// 走一个字节：最多出一个动作（step）
+pub fn step(inout p: P, c: int) -> Act? {
+    if c == 0x18 || c == 0x1A {
+        reset(&p, Ground)
+        return Some(Exec(c))
+    }
+    if c == 0x1B {
+        a = finish(p)
+        reset(&p, Escape)
+        return a
+    }
+    body(&p, c)
+}
+
+// 一段字节的动作（run）；p 接着往下读，序列可以跨两段
+pub fn run(inout p: P, d: str) -> [Act] {
+    out: [Act] = []
+    for i in 0..len(d) {
+        match take step(&p, byte_at(d, i)) {
+            Some(a) => out.push(a)
+            None => {}
+        }
+    }
+    out
+}
+
+fn show_ints(xs: [int]) -> str {
+    out = "["
+    for i in 0..len(xs) {
+        if i > 0 { out += "," }
+        out += "#{xs[i]}"
+    }
+    out + "]"
+}
+
+fn show_data(s: str) -> str {
+    out = ""
+    for i in 0..len(s) {
+        c = byte_at(s, i)
+        out += if c >= 0x20 && c < 0x7F && c != 0x5C { from_byte(c) } else { "\\x" + hex2(c) }
+    }
+    out
+}
+
+fn hex2(c: int) -> str {
+    ds = "0123456789abcdef"
+    slice(ds, c / 16, c / 16 + 1) + slice(ds, c % 16, c % 16 + 1)
+}
+
+// 一个动作写成一行（测试和 lterm 的输出用）
+pub fn show(a: Act) -> str {
+    match a {
+        Print(c) => "print #{c}"
+        Exec(c) => "exec #{c}"
+        Esc(inter, f) => "esc #{show_ints(inter)} #{f}"
+        Csi(ps, inter, f) => "csi #{show_ints(ps)} #{show_ints(inter)} #{f}"
+        Osc(data) => "osc #{show_data(data)}"
+        Dcs(ps, inter, f, data) => "dcs #{show_ints(ps)} #{show_ints(inter)} #{f} #{show_data(data)}"
+    }
+}

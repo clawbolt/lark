@@ -1,0 +1,286 @@
+// Ed25519 签名（RFC 8032 第 5.1 节），以及 TLS 1.3 CertificateVerify 签的内容（RFC 8446 第 4.4.3 节）。
+// 先证明再写：对应 formal/Lark/Ed25519.lean（规格对上了 RFC 8032 第 7.1 节的 TEST 1、2、3、SHA(abc)）：
+//   padd ↔ padd（第 5.1.4 节的加法公式）、encode / decode ↔ encodePt / decodePt（decode_big_y：y ≥ p 时失败）、
+//   clamp ↔ clampE（clamp_ok）、sign / verify ↔ sign / verify（verify_len、verify_big_s：签名不是 64 字节或 S ≥ L 时验证不过）、
+//   cv_content ↔ cvContent（cv_inj）。
+// 和规格不同的地方（数学上一样，靠测试向量）：标量乘法用 TweetNaCl 的写法，从高位起、每一位前后用掩码交换（不按秘密的位分支），
+// 规格里是从低位起加倍-相加；模 L 用 TweetNaCl 的 mod_l。域运算用 tls/x25519 的 16 段表示。
+// 签了再验一定通过没有证明（要群律），常数时间没有验证过。实验性：没有经过审计
+import "std/digest"
+import "tls/x25519"
+
+pub type Pt {
+    pub x: [int]
+    pub y: [int]
+    pub z: [int]
+    pub t: [int]
+}
+
+// ---------- 常数（运行时由小的数算出来，不抄长串） ----------
+
+// 16 位一段的数
+fn fe_of(v: int) -> [int] {
+    out = x25519.fe(0)
+    out[0] = v & 0xffff
+    out[1] = (v >> 16) & 0xffff
+    out
+}
+
+// d = -121665 / 121666
+fn d_const() -> [int] {
+    x25519.fe_mul(x25519.fe_sub(x25519.fe(0), fe_of(121665)), x25519.inv(fe_of(121666)))
+}
+
+// a^e，e 是 32 字节小端（公开的指数，可以按位分支）
+fn fe_pow(a: [int], e: [u8]) -> [int] {
+    c = x25519.fe(1)
+    i = 255
+    for i >= 0 {
+        c = x25519.fe_sq(c)
+        if ((e[i / 8].to_int() >> (i & 7)) & 1) == 1 { c = x25519.fe_mul(c, a) }
+        i -= 1
+    }
+    c
+}
+
+// 2^252 - 2 = (p + 3) / 8 和 2^253 - 5 = (p - 1) / 4，32 字节小端
+fn exp_bytes(low: int, top: int) -> [u8] {
+    out: [u8] = [low.wrap_u8()]
+    for _i in 1..31 { out.push(0xff) }
+    out.push(top.wrap_u8())
+    out
+}
+
+// -1 的平方根 = 2^((p - 1) / 4)
+fn sqrt_m1() -> [int] { fe_pow(fe_of(2), exp_bytes(0xfb, 0x1f)) }
+
+fn fe_eq(a: [int], b: [int]) -> bool { x25519.pack(a) == x25519.pack(b) }
+fn parity(a: [int]) -> int { x25519.pack(a)[0].to_int() & 1 }
+
+pub fn zero_pt() -> Pt { Pt(x: x25519.fe(0), y: x25519.fe(1), z: x25519.fe(1), t: x25519.fe(0)) }
+
+// 基点：编码是 58 66 66 …（y = 4/5，x 是偶数）
+pub fn base() -> Pt {
+    enc: [u8] = [0x58]
+    for _i in 1..32 { enc.push(0x66) }
+    match take decode(enc) {
+        Ok(p) => p
+        Err(e) => panic(e)
+    }
+}
+
+// ---------- 点 ----------
+
+// 第 5.1.4 节：A = (Y1-X1)(Y2-X2)、B = (Y1+X1)(Y2+X2)、C = T1·2d·T2、D = Z1·2·Z2，E = B-A、F = D-C、G = D+C、H = B+A
+pub fn padd(p: Pt, q: Pt, d2: [int]) -> Pt {
+    a = x25519.fe_mul(x25519.fe_sub(p.y, p.x), x25519.fe_sub(q.y, q.x))
+    b = x25519.fe_mul(x25519.fe_add(p.y, p.x), x25519.fe_add(q.y, q.x))
+    c = x25519.fe_mul(x25519.fe_mul(p.t, d2), q.t)
+    zz = x25519.fe_mul(p.z, q.z)
+    dd = x25519.fe_add(zz, zz)
+    e = x25519.fe_sub(b, a)
+    f = x25519.fe_sub(dd, c)
+    g = x25519.fe_add(dd, c)
+    h = x25519.fe_add(b, a)
+    Pt(x: x25519.fe_mul(e, f), y: x25519.fe_mul(g, h), z: x25519.fe_mul(f, g), t: x25519.fe_mul(e, h))
+}
+
+fn cswap_pt(inout p: Pt, inout q: Pt, b: int) {
+    x25519.cswap(&p.x, &q.x, b)
+    x25519.cswap(&p.y, &q.y, b)
+    x25519.cswap(&p.z, &q.z, b)
+    x25519.cswap(&p.t, &q.t, b)
+}
+
+// [s]P，s 是 32 字节小端。从高位起：每一位前后按这一位交换 (acc, q)，保持 q = acc + P
+pub fn scalar_mult(s: [u8], p: Pt) -> Pt {
+    d2 = x25519.fe_add(d_const(), d_const())
+    acc = zero_pt()
+    q = p.copy()
+    i = 255
+    for i >= 0 {
+        bit = (s[i / 8].to_int() >> (i & 7)) & 1
+        cswap_pt(&acc, &q, bit)
+        q = padd(q, acc, d2)
+        acc = padd(acc, acc, d2)
+        cswap_pt(&acc, &q, bit)
+        i -= 1
+    }
+    acc
+}
+
+// 第 5.1.2 节：y 写成 32 字节小端，最高位放 x 的最低位
+pub fn encode(p: Pt) -> [u8] {
+    zi = x25519.inv(p.z)
+    x = x25519.fe_mul(p.x, zi)
+    out = x25519.pack(x25519.fe_mul(p.y, zi))
+    out[31] = (out[31].to_int() | (parity(x) << 7)).wrap_u8()
+    out
+}
+
+// 第 5.1.3 节：由 y 和 x 的最低位求 x。y ≥ p、没有平方根、x = 0 但最低位要 1，都是错误
+pub fn decode(s: [u8]) -> Pt! {
+    if len(s) != 32 { return Err("ed25519：点要 32 字节") }
+    sign = s[31].to_int() >> 7
+    y = x25519.unpack(s)
+    low = s.copy()
+    low[31] = (low[31].to_int() & 0x7f).wrap_u8()
+    if x25519.pack(y) != low { return Err("ed25519：y 不小于 p") }
+    one = x25519.fe(1)
+    yy = x25519.fe_sq(y)
+    x2 = x25519.fe_mul(x25519.fe_sub(yy, one), x25519.inv(x25519.fe_add(x25519.fe_mul(d_const(), yy), one)))
+    if fe_eq(x2, x25519.fe(0)) {
+        if sign == 1 { return Err("ed25519：x 是 0，最低位却是 1") }
+        return Ok(Pt(x: x25519.fe(0), y: y.copy(), z: one.copy(), t: x25519.fe(0)))
+    }
+    x = fe_pow(x2, exp_bytes(0xfe, 0x0f))
+    if !fe_eq(x25519.fe_sq(x), x2) { x = x25519.fe_mul(x, sqrt_m1()) }
+    if !fe_eq(x25519.fe_sq(x), x2) { return Err("ed25519：不在曲线上") }
+    if parity(x) != sign { x = x25519.fe_sub(x25519.fe(0), x) }
+    t = x25519.fe_mul(x, y)
+    Ok(Pt(x: x, y: y.copy(), z: one, t: t))
+}
+
+// 射影坐标下相等：X1·Z2 = X2·Z1 且 Y1·Z2 = Y2·Z1
+fn pt_eq(p: Pt, q: Pt) -> bool {
+    fe_eq(x25519.fe_mul(p.x, q.z), x25519.fe_mul(q.x, p.z)) && fe_eq(x25519.fe_mul(p.y, q.z), x25519.fe_mul(q.y, p.z))
+}
+
+// ---------- 模 L（L = 2^252 + 27742317777372353535851937790883648493） ----------
+
+fn l_bytes() -> [int] {
+    out: [int] = [0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14]
+    for _i in 16..31 { out.push(0) }
+    out.push(0x10)
+    out
+}
+
+// TweetNaCl 的 modL：x 是 64 个（可以是负数、可以大于 255 的）字节，返回 x mod L 的 32 字节小端
+fn mod_l(inout x: [int]) -> [u8] {
+    l = l_bytes()
+    i = 63
+    for i >= 32 {
+        c = 0
+        j = i - 32
+        for j < i - 12 {
+            x[j] += c - 16 * x[i] * l[j - (i - 32)]
+            c = (x[j] + 128) >> 8
+            x[j] -= c * 256
+            j += 1
+        }
+        x[j] += c
+        x[i] = 0
+        i -= 1
+    }
+    c = 0
+    for j in 0..32 {
+        x[j] += c - (x[31] >> 4) * l[j]
+        c = x[j] >> 8
+        x[j] = x[j] & 255
+    }
+    for j in 0..32 { x[j] -= c * l[j] }
+    out: [u8] = []
+    for k in 0..32 {
+        x[k + 1] += x[k] >> 8
+        out.push((x[k] & 255).wrap_u8())
+    }
+    out
+}
+
+fn reduce64(h: [u8]) -> [u8] {
+    x: [int] = []
+    for b in h { x.push(b.to_int()) }
+    mod_l(&x)
+}
+
+// (r + k·a) mod L，三个都是 32 字节小端
+fn mul_add(k: [u8], a: [u8], r: [u8]) -> [u8] {
+    x: [int] = []
+    for i in 0..64 { x.push(if i < 32 { r[i].to_int() } else { 0 }) }
+    for i in 0..32 {
+        for j in 0..32 { x[i + j] += k[i].to_int() * a[j].to_int() }
+    }
+    mod_l(&x)
+}
+
+// 32 字节小端的 s < L
+fn below_l(s: [u8]) -> bool {
+    l = l_bytes()
+    i = 31
+    for i >= 0 {
+        if s[i].to_int() < l[i] { return true }
+        if s[i].to_int() > l[i] { return false }
+        i -= 1
+    }
+    false
+}
+
+// ---------- 签名（第 5.1.5 到 5.1.7 节） ----------
+
+// 低 3 位清 0，第 255 位清 0，第 254 位置 1
+pub fn clamp(h: [u8]) -> [u8] {
+    a: [u8] = []
+    for i in 0..32 { a.push(h[i]) }
+    a[0] = (a[0].to_int() & 248).wrap_u8()
+    a[31] = ((a[31].to_int() & 127) | 64).wrap_u8()
+    a
+}
+
+fn cat(a: [u8], b: [u8]) -> [u8] {
+    out = a.copy()
+    for x in b { out.push(x) }
+    out
+}
+
+fn part(d: [u8], a: int, b: int) -> [u8] {
+    out: [u8] = []
+    for i in a..b { out.push(d[i]) }
+    out
+}
+
+pub fn public_key(sk: [u8]) -> [u8] {
+    if len(sk) != 32 { panic("ed25519：私钥要 32 字节") }
+    encode(scalar_mult(clamp(digest.sha512(sk)), base()))
+}
+
+pub fn sign(sk: [u8], msg: [u8]) -> [u8] {
+    if len(sk) != 32 { panic("ed25519：私钥要 32 字节") }
+    h = digest.sha512(sk)
+    a = clamp(h)
+    pk = encode(scalar_mult(a, base()))
+    r = reduce64(digest.sha512(cat(part(h, 32, 64), msg)))
+    big_r = encode(scalar_mult(r, base()))
+    k = reduce64(digest.sha512(cat(cat(big_r, pk), msg)))
+    cat(big_r, mul_add(k, a, r))
+}
+
+// 先查长度和 S < L，再解码 A、R，最后看 [S]B = R + [k]A
+pub fn verify(pk: [u8], msg: [u8], sig: [u8]) -> bool {
+    if len(sig) != 64 || len(pk) != 32 { return false }
+    s = part(sig, 32, 64)
+    if !below_l(s) { return false }
+    big_r = part(sig, 0, 32)
+    a_pt = match take decode(pk) {
+        Ok(p) => p
+        Err(_) => { return false }
+    }
+    r_pt = match take decode(big_r) {
+        Ok(p) => p
+        Err(_) => { return false }
+    }
+    k = reduce64(digest.sha512(cat(cat(big_r, pk), msg)))
+    d2 = x25519.fe_add(d_const(), d_const())
+    pt_eq(scalar_mult(s, base()), padd(r_pt, scalar_mult(k, a_pt), d2))
+}
+
+// ---------- TLS 1.3 CertificateVerify 签的内容：64 个空格 + 上下文 + 0 + 消息摘要 ----------
+
+pub fn cv_content(server: bool, th: [u8]) -> [u8] {
+    out: [u8] = []
+    for _i in 0..64 { out.push(32) }
+    ctx = if server { "TLS 1.3, server CertificateVerify" } else { "TLS 1.3, client CertificateVerify" }
+    for b in ctx.to_bytes() { out.push(b) }
+    out.push(0)
+    for b in th { out.push(b) }
+    out
+}

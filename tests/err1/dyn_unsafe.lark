@@ -1,0 +1,10 @@
+// 期望错误：接口 Same 不能用作 dyn：方法 same 的其它参数里用到了 Self
+interface Same {
+    fn same(a: Self, b: Self) -> bool
+}
+
+fn same(a: int, b: int) -> bool { a == b }
+
+fn main() {
+    xs: [dyn Same] = [1]
+}

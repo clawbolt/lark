@@ -1,0 +1,9 @@
+// 期望错误：闭包不能修改捕获的变量（xs.push 需要 &xs）
+fn times(n: int, f: fn(int)) {
+    for i in 0..n { f(i) }
+}
+
+fn main() {
+    xs: [int] = []
+    times(3, |i| xs.push(i))
+}

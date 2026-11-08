@@ -1,0 +1,4 @@
+// 期望错误：Fn 闭包不能捕获函数类型的参数 g
+fn wrap(g: fn(int) -> int) -> Fn(int) -> int { |x| g(x) + 1 }
+
+fn main() {}

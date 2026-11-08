@@ -1,0 +1,185 @@
+// 跳到定义（LSP 规范的 “textDocument/definition”）：llsp 自己扫描源文件，不经过编译器。
+// 先证明再写：对应 formal/Lark/LspDef.lean，函数和定义一一对应：
+//   is_id / id_len ↔ isId / idLen、word_start / word_end / word ↔ wordStart / wordEnd / word、
+//   pre / after_kw / decl_at ↔ pre / afterKw / declAt、decls ↔ decls、find ↔ find
+// 证明了：光标下的词包含光标、不超出文档（word_bounds），往右已经到头（word_end）；扫出来的每个声明在它的偏移上
+// 正好是这个名字，非空、都是标识符的字节、是完整的词（decls_word）；找到的定义满足同样的性质（find_word、find_line）。
+// 没证：`模块.名字` 时按 import 找文件（import 路径的最后一段是模块名；先找相对文件所在目录的，再找相对包根的）；
+// 标准库（std/…）、方法、枚举的变体、局部变量还不支持，找不到时回复 null。
+import "std/os"
+import "std/json"
+import "lsp/pos"
+import "lsp/docs"
+import "lsp/diag"
+
+// ---------- 标识符 ----------
+
+fn is_id(c: int) -> bool { (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || (c >= 48 && c <= 57) }
+
+// 从 at 起有几个标识符的字节（idLen）
+fn id_len(d: str, at: int) -> int {
+    k = at
+    for k < len(d) && is_id(byte_at(d, k)) { k += 1 }
+    k - at
+}
+
+fn clamp(o: int, n: int) -> int { if o < 0 { 0 } else if o > n { n } else { o } }
+
+pub fn word_end(d: str, o: int) -> int {
+    p = clamp(o, len(d))
+    p + id_len(d, p)
+}
+
+pub fn word_start(d: str, o: int) -> int {
+    k = clamp(o, len(d))
+    for k > 0 && is_id(byte_at(d, k - 1)) { k -= 1 }
+    k
+}
+
+pub fn word(d: str, o: int) -> str { slice(d, word_start(d, o), word_end(d, o)) }
+
+// ---------- 声明 ----------
+
+fn kws() -> [str] { ["fn ", "type ", "enum ", "const ", "interface "] }
+
+fn starts(d: str, at: int, p: str) -> bool { at + len(p) <= len(d) && slice(d, at, at + len(p)) == p }
+
+fn pre(d: str, at: int) -> int { if starts(d, at, "pub ") { 4 } else { 0 } }
+
+fn after_kw(d: str, at: int) -> int {
+    for k in kws() {
+        if starts(d, at, k) { return len(k) }
+    }
+    -1
+}
+
+pub type Decl {
+    pub name: str
+    pub at: int         // 名字在文档里的字节偏移
+}
+
+// 从行首 at 开始的声明（declAt）
+pub fn decl_at(d: str, at: int) -> Decl? {
+    p = at + pre(d, at)
+    k = after_kw(d, p)
+    if k < 0 { return None }
+    q = p + k
+    n = id_len(d, q)
+    if n == 0 { return None }
+    Some(Decl(name: slice(d, q, q + n), at: q))
+}
+
+// 文档里所有的声明，按位置排（decls）
+pub fn decls(d: str) -> [Decl] {
+    out: [Decl] = []
+    for o in 0..len(d) + 1 {
+        if o == 0 || byte_at(d, o - 1) == 10 {
+            match take decl_at(d, o) {
+                Some(x) => out.push(x)
+                None => {}
+            }
+        }
+    }
+    out
+}
+
+// 第一个叫 n 的声明的偏移；没有是 -1（find）
+pub fn find(d: str, n: str) -> int {
+    for x in decls(d) {
+        if x.name == n { return x.at }
+    }
+    -1
+}
+
+// ---------- 模块.名字（没证） ----------
+
+// 光标下的词前面是 “模块.” 时的模块名；不是时是 ""
+pub fn qualifier(d: str, o: int) -> str {
+    s = word_start(d, o)
+    if s < 1 || byte_at(d, s - 1) != '.' { return "" }
+    slice(d, word_start(d, s - 1), s - 1)
+}
+
+// 模块名是 m 的 import 的路径（import 路径的最后一段）；没有是 ""
+pub fn import_of(d: str, m: str) -> str {
+    start = 0
+    for i in 0..len(d) + 1 {
+        if i == len(d) || byte_at(d, i) == 10 {
+            if starts(d, start, "import \"") {
+                j = start + 8
+                for j < i && byte_at(d, j) != '"' { j += 1 }
+                p = slice(d, start + 8, j)
+                if os.base(p) == m { return p }
+            }
+            start = i + 1
+        }
+    }
+    ""
+}
+
+// import 的路径 → 文件：先找相对 file 所在目录的，再找相对包根的（和 compiler/main.lark 的 resolve_import 一样）
+pub fn resolve(file: str, imp: str) -> str {
+    near = os.join_path(os.dir(file), imp + ".lark")
+    if os.is_file(near) { return near }
+    here = os.join_path(diag.pkg_root(file), imp + ".lark")
+    if os.is_file(here) { here } else { "" }
+}
+
+// ---------- 回复 ----------
+
+fn pos_json(p: pos.Pos) -> json.Json {
+    json.object([("line", json.Num(p.line)), ("character", json.Num(p.ch))])
+}
+
+// Location：名字 [at, at + n) 的范围
+pub fn location(enc: pos.Enc, uri: str, d: str, at: int, n: int) -> json.Json {
+    xs = pos.doc(d)
+    r = json.object([("start", pos_json(pos.pos_of(enc, xs, at))), ("end", pos_json(pos.pos_of(enc, xs, at + n)))])
+    json.object([("uri", json.Str(uri)), ("range", r)])
+}
+
+// 文档现在的内容：打开着的用编辑器里的，否则读文件；都没有是 None
+fn text_of(files: [docs.Doc], uri: str, path: str) -> str? {
+    match take docs.get(files, uri) {
+        Some(x) => { return Some(x.text.copy()) }
+        None => {}
+    }
+    if path == "" { return None }
+    match take os.read(path) {
+        Ok(t) => Some(t)
+        Err(_) => None
+    }
+}
+
+// textDocument/definition 的结果：Location，找不到时是 null
+pub fn locate(enc: pos.Enc, files: [docs.Doc], params: json.Json) -> json.Json {
+    uri = json.path_str(params, "textDocument.uri") ?? ""
+    l = json.path_int(params, "position.line") ?? -1
+    c = json.path_int(params, "position.character") ?? -1
+    d = match take docs.get(files, uri) {
+        Some(x) => x.text.copy()
+        None => { return json.Null }
+    }
+    o = pos.off_of(enc, pos.doc(d), pos.Pos(line: l, ch: c))
+    name = word(d, o)
+    if name == "" { return json.Null }
+    q = qualifier(d, o)
+    if q == "" {
+        at = find(d, name)
+        if at < 0 { return json.Null }
+        return location(enc, uri, d, at, len(name))
+    }
+    path = diag.file_path(uri)
+    imp = import_of(d, q)
+    if path == "" || imp == "" { return json.Null }
+    f = resolve(path, imp)
+    if f == "" { return json.Null }
+    other = "file://" + f
+    t = match take text_of(files, other, f) {
+        Some(x) => x
+        None => { return json.Null }
+    }
+    at = find(t, name)
+    if at < 0 { return json.Null }
+    location(enc, other, t, at, len(name))
+}

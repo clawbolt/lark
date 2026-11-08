@@ -1,0 +1,56 @@
+== 字符串
+PONG
+OK
+"lark"
+OK
+"value with space"
+(nil)
+(integer) 1
+(integer) 42
+(error) ERR value is not an integer or out of range
+(integer) 9
+OK
+1) "1"
+2) "2"
+3) (nil)
+(nil)
+(integer) 2
+(error) ERR unknown command 'NOPE', with args beginning with: 'x' 'y' 
+(error) ERR wrong number of arguments for 'get' command
+== 过期
+OK
+(integer) <毫秒>
+(nil)
+(integer) 1
+(integer) 100
+== 列表和哈希
+(integer) 3
+(integer) 4
+1) "z"
+2) "a"
+3) "b"
+4) "c"
+(integer) 2
+1) "f1"
+2) "v1"
+3) "f2"
+4) "v2"
+(error) WRONGTYPE Operation against a key holding the wrong kind of value
+list
+1) "h"
+2) "l"
+== 从标准输入读（一行一条）
+PONG
+"a\tb"
+(integer) 5
+== 4 个客户端同时 INCR，各 100 次
+"400"
+== SHUTDOWN
+服务器退出码 0
+lredis：…
+== kill -TERM
+服务器退出码 0
+收到 SIGTERM，退出
+== kill -INT
+服务器退出码 0
+收到 SIGINT，退出

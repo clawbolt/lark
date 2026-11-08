@@ -1,0 +1,68 @@
+// 下标运算符重载（需要 lark1 及以后的版本）
+// x 是结构体或枚举时：x[i] 调用 fn index(x: T, i: K) -> V（得到一个新值），
+// x[i] = v 调用 fn set_index(inout x: T, i: K, take v: V)，x[i] += 1 先读后写。
+// std/map 定义了这两个函数，所以 Map 可以直接 m[k] / m[k] = v。
+// 编译：lark1 examples/subscript.lark -o out.c
+import "std/map"
+
+// 二维网格：g[(行, 列)]
+type Grid {
+    w: int
+    h: int
+    cells: [int]
+}
+
+fn grid(w: int, h: int) -> Grid {
+    cs: [int] = []
+    for _i in 0..w * h { cs.push(0) }
+    Grid(w: w, h: h, cells: cs)
+}
+
+fn index(g: Grid, p: (int, int)) -> int {
+    g.cells[p.0 * g.w + p.1]
+}
+
+fn set_index(inout g: Grid, p: (int, int), take v: int) {
+    g.cells[p.0 * g.w + p.1] = v
+}
+
+// 只读的下标：多项式第 i 项的系数，超出范围时为 0
+type Poly {
+    cs: [int]
+}
+
+fn index(p: Poly, i: int) -> int {
+    if i < len(p.cs) { p.cs[i] } else { 0 }
+}
+
+fn main() {
+    g = grid(3, 2)
+    g[(0, 1)] = 5
+    g[(1, 2)] = 7
+    g[(1, 2)] += 1
+    a = g[(0, 1)]
+    b = g[(1, 2)]
+    print("g[(0, 1)] = #{a}，g[(1, 2)] = #{b}")
+    print("网格：#{g.cells}")
+
+    p = Poly(cs: [1, 0, 3])
+    p2 = p[2]
+    p10 = p[10]
+    print("p[2] = #{p2}，p[10] = #{p10}")
+
+    ages: map.Map[str, int] = map.new()
+    ages["甲"] = 30
+    ages["乙"] = 25
+    ages["甲"] += 1
+    jia = ages["甲"]
+    print("甲 #{jia} 岁，键：#{ages.keys}")
+
+    // 值不是 int 时也一样：m[k] 是副本，改完再放回去
+    groups: map.Map[str, [str]] = map.new()
+    groups["水果"] = ["苹果"]
+    fs = groups["水果"]
+    fs.push("梨")
+    groups["水果"] = fs
+    fruit = groups["水果"]
+    print("水果：#{fruit}")
+}

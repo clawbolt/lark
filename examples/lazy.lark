@@ -1,0 +1,60 @@
+// std/iter 的适配器是惰性的（需要 lark1 及以后的版本）
+// map、filter、take_n 等只把来源包起来，取值时才一步步往前走，所以可以接在无限迭代器后面。
+// 适配器本身也是迭代器：可以一层层套，也可以直接 for in。来源是列表时直接传，不用先包。
+// 编译：lark1 examples/lazy.lark -o out.c
+import "std/iter"
+
+// 自己的迭代器也能接上适配器
+type Countdown {
+    n: int
+}
+
+fn next(inout cd: Countdown) -> int? {
+    if cd.n == 0 { return None }
+    cd.n -= 1
+    Some(cd.n + 1)
+}
+
+// 记下每次 next，看出惰性：只算用到的那几个
+type Noisy {
+    cur: int
+}
+
+fn next(inout s: Noisy) -> int? {
+    s.cur += 1
+    print("  （算出 #{s.cur}）")
+    Some(s.cur)
+}
+
+fn main() {
+    squares = iter.collect(iter.take_n(iter.map(iter.count_from(1), |n| n * n), 5))
+    print("前 5 个平方数：#{squares}")
+
+    odd = iter.filter(iter.count_from(1), |n| n % 2 == 1)
+    big = iter.take_while(iter.map(odd, |n| n * 10), |n| n < 80)
+    tens = iter.collect(big)
+    print("小于 80 的奇数乘 10：#{tens}")
+
+    print("只取 2 个：")
+    for x in iter.take_n(Noisy(cur: 0), 2) {
+        print("拿到 #{x}")
+    }
+
+    names = ["甲", "乙", "丙", "丁"]
+    for p in iter.enumerate(iter.skip_n(names, 1)) {
+        i, n = p
+        print("#{i}：#{n}")
+    }
+
+    limit = 3
+    words = iter.map(["a", "bb", "ccc", "dddd"], |w| len(w))
+    short = iter.filter(words, |k| k <= limit)
+    pairs = iter.collect(iter.zip(Countdown(n: 10), short))
+    print("配对：#{pairs}")
+
+    both = iter.collect(iter.chain(iter.range(1, 4), Countdown(n: 2)))
+    print("接起来：#{both}")
+
+    total = iter.fold(iter.map(iter.range(1, 11), |n| n * n), 0, |acc, n| acc + n)
+    print("1 到 10 的平方和：#{total}")
+}

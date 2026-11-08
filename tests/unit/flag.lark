@@ -1,0 +1,168 @@
+// std/flag 的边界：默认值、各种写法、-- 和 -、几个短开关写在一起、后面的覆盖前面的、每种错误的原文、用法说明
+import "std/flag"
+import "std/str"
+
+fn parser() -> flag.Parser {
+    p = flag.new("greet", "向某人问好")
+    p.add_bool("loud", "l", "全部大写")
+    p.add_bool("rev", "r", "倒过来")
+    p.add_str("name", "n", "世界", "要问候的人")
+    p.add_int("times", "", 1, "重复几次")
+    p
+}
+
+fn ok(xs: [str]) -> flag.Args {
+    match take parser().parse_from(xs) {
+        Ok(a) => a
+        Err(e) => panic(e)
+    }
+}
+
+fn err_of(xs: [str]) -> str {
+    match take parser().parse_from(xs) {
+        Ok(_) => "<成功>"
+        Err(e) => e
+    }
+}
+
+test "默认值和各种写法" {
+    none: [str] = []
+    a = ok(none)
+    assert(!a.get_bool("loud"))
+    assert_eq(a.get_str("name"), "世界")
+    assert_eq(a.get_int("times"), 1)
+    assert_eq(len(a.rest), 0)
+    b = ok(["--name=云雀", "--times", "3", "-l", "x", "-", "y"])
+    assert_eq(b.get_str("name"), "云雀")
+    assert_eq(b.get_int("times"), 3)
+    assert(b.get_bool("loud"))
+    // 单独的 - 是位置参数
+    assert(b.rest == ["x", "-", "y"])
+    // 后面的覆盖前面的
+    c = ok(["-n", "甲", "--name", "乙"])
+    assert_eq(c.get_str("name"), "乙")
+    // 几个开关写在一起；-- 之后都是位置参数
+    d = ok(["-rl", "--", "--loud", "-n"])
+    assert(d.get_bool("rev"))
+    assert(d.get_bool("loud"))
+    assert(d.rest == ["--loud", "-n"])
+    // a.dash：-- 后面第一个参数在 rest 里的下标；只有第一个 -- 算，后面的 -- 也是位置参数
+    assert_eq(d.dash, 0)
+    assert_eq(b.dash, -1)
+    h = ok(["x", "--", "y", "--"])
+    assert(h.rest == ["x", "y", "--"])
+    assert_eq(h.dash, 1)
+    t = ok(["x", "--"])
+    assert_eq(t.dash, 1)
+    assert_eq(len(t.rest), 1)
+    e = ok(["--loud=false", "--times=-5", "--name="])
+    assert(!e.get_bool("loud"))
+    assert_eq(e.get_int("times"), -5)
+    assert_eq(e.get_str("name"), "")
+    // 要值的短参数在一组的最后：取下一个参数；后面还有字母：剩下的就是值（-n云雀）
+    g = ok(["-ln", "云雀", "-rn乙", "x"])
+    assert(g.get_bool("loud"))
+    assert(g.get_bool("rev"))
+    assert_eq(g.get_str("name"), "乙")
+    assert(g.rest == ["x"])
+}
+
+test "错误" {
+    assert_eq(err_of(["--nope"]), "未知的参数 --nope")
+    assert_eq(err_of(["-z"]), "未知的参数 -z")
+    assert_eq(err_of(["-lz"]), "未知的参数 -z（在 -lz 里）")
+    assert_eq(err_of(["-ln"]), "参数 -n 缺少值")
+    assert_eq(err_of(["--times=1", "-lt"]), "未知的参数 -t（在 -lt 里）")
+    assert_eq(err_of(["--name"]), "参数 --name 缺少值")
+    assert_eq(err_of(["-n"]), "参数 -n 缺少值")
+    assert_eq(err_of(["--times", "三"]), "参数 --times 要一个整数，得到的是 \"三\"")
+    assert_eq(err_of(["--loud=yes"]), "参数 --loud 只能是 true 或 false，得到的是 \"yes\"")
+    assert_eq(err_of(["-h"]), "help")
+    assert_eq(err_of(["x", "--help"]), "help")
+    // 负数要写成 --times=-5：单独一个 -5 会被当成短参数
+    assert_eq(err_of(["-5"]), "未知的参数 -5")
+}
+
+fn sp(n: int) -> str { str.repeat(" ", n) }
+
+test "用法说明" {
+    want = "用法：greet [选项] [参数…]\n向某人问好\n\n选项：\n"
+    want += "  -l, --loud" + sp(10) + "全部大写\n"
+    want += "  -r, --rev" + sp(11) + "倒过来\n"
+    want += "  -n, --name <value>" + sp(2) + "要问候的人（默认 世界）\n"
+    want += "      --times <int>" + sp(3) + "重复几次（默认 1）\n"
+    want += "  -h, --help" + sp(10) + "显示这段说明"
+    assert_eq(parser().usage(), want)
+}
+
+// 像 lark 那样：全局一个 -v，两个命令各有自己的选项
+fn tool() -> flag.Parser {
+    p = flag.new("tool", "构建工具")
+    p.add_bool("verbose", "v", "多说点")
+    c = flag.new("build", "编译")
+    c.add_bool("release", "r", "发布版")
+    p.add_command(c)
+    c = flag.new("log", "列出提交")
+    c.add_int("max-count", "n", 0, "最多几个")
+    p.add_command(c)
+    p
+}
+
+fn sub(xs: [str]) -> flag.Args {
+    match take tool().parse_from(xs) {
+        Ok(a) => a
+        Err(e) => panic(e)
+    }
+}
+
+fn sub_err(xs: [str]) -> str {
+    match take tool().parse_from(xs) {
+        Ok(_) => "<成功>"
+        Err(e) => e
+    }
+}
+
+test "子命令" {
+    a = sub(["-v", "build", "-r", "x"])
+    assert_eq(a.command, "build")
+    assert(a.get_bool("verbose"))
+    assert(a.get_bool("release"))
+    assert(a.rest == ["x"])
+    // 全局选项也能写在命令后面；命令名之后的位置参数不再当命令
+    b = sub(["log", "-n", "3", "-v", "build"])
+    assert_eq(b.command, "log")
+    assert_eq(b.get_int("max-count"), 3)
+    assert(b.get_bool("verbose"))
+    assert(b.rest == ["build"])
+    assert_eq("#{b}", "Args(command: log, verbose=true, max-count=3, rest: [\"build\"])")
+    // lgit diff 版本 -- 路径：命令名不在 rest 里，dash 照样指着 -- 后面的第一个
+    c = sub(["log", "HEAD", "--", "a.txt", "-v"])
+    assert(c.rest == ["HEAD", "a.txt", "-v"])
+    assert_eq(c.dash, 1)
+    assert(!c.get_bool("verbose"))
+    assert_eq("#{c}", "Args(command: log, verbose=false, max-count=0, rest: [\"HEAD\", \"a.txt\", \"-v\"], dash: 1)")
+    assert_eq("#{tool()}", "Parser(tool, 1 个选项, 2 个命令)")
+    // 命令自己的选项只能写在命令后面
+    assert_eq(sub_err(["-r", "build"]), "未知的参数 -r")
+    assert_eq(sub_err(["log", "-r"]), "未知的参数 -r")
+    assert_eq(sub_err(["nope"]), "未知的命令 nope（可以用的有 build、log）")
+    assert_eq(sub_err(["-v"]), "缺少命令（可以用的有 build、log）")
+    assert_eq(sub_err(["-h"]), "help")
+    assert_eq(sub_err(["log", "--help"]), "help log")
+}
+
+test "子命令的用法说明" {
+    p = tool()
+    want = "用法：tool <命令> [选项] [参数…]\n构建工具\n\n命令：\n"
+    want += "  build" + sp(2) + "编译\n"
+    want += "  log" + sp(4) + "列出提交\n\n选项：\n"
+    want += "  -v, --verbose" + sp(2) + "多说点\n"
+    want += "  -h, --help" + sp(5) + "显示这段说明\n\n"
+    want += "每个命令的选项：tool <命令> -h"
+    assert_eq(p.usage(), want)
+    want = "用法：tool log [选项] [参数…]\n列出提交\n\n选项：\n"
+    want += "  -v, --verbose" + sp(10) + "多说点\n"
+    want += "  -n, --max-count <int>" + sp(2) + "最多几个（默认 0）\n"
+    want += "  -h, --help" + sp(13) + "显示这段说明"
+    assert_eq(p.usage_of("log"), want)
+}

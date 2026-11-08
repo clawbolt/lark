@@ -1,0 +1,8 @@
+// 期望错误：match 不支持 [int]，并提示 pop 返回的不是 T?
+fn main() {
+    xs = [[1], [2]]
+    match xs.pop() {
+        Some(x) => print("#{x}")
+        None => {}
+    }
+}

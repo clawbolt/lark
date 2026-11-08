@@ -1,0 +1,14 @@
+# Lark 的语言服务器 llsp：加到 ~/.config/helix/languages.toml，把 /path/to/lark 换成你的 Lark 仓库路径。
+
+[language-server.llsp]
+command = "/path/to/lark/apps/llsp/build/llsp"
+environment = { LARK_HOME = "/path/to/lark" }
+
+[[language]]
+name = "lark"
+scope = "source.lark"
+file-types = ["lark"]
+roots = ["lark.pkg"]
+comment-token = "//"
+indent = { tab-width = 4, unit = "    " }
+language-servers = ["llsp"]

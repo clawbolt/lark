@@ -1,0 +1,87 @@
+// ledit · 一行文字里的位置和显示宽度。位置都是字节下标，并且总在字符的边界上
+import "std/fmt"
+
+const TAB = 4   // 制表符显示成几个空格（不按制表位对齐）
+
+fn is_cont(b: int) -> bool { b >= 128 && b < 192 }
+
+// i 前面那个字符的开头（i 是边界，i > 0）
+pub fn prev_char(s: str, i: int) -> int {
+    j = i - 1
+    for j > 0 && is_cont(byte_at(s, j)) { j -= 1 }
+    if j < 0 { 0 } else { j }
+}
+
+// i 处这个字符的结尾（i < len(s)）
+pub fn next_char(s: str, i: int) -> int {
+    j = i + 1
+    for j < len(s) && is_cont(byte_at(s, j)) { j += 1 }
+    j
+}
+
+// 一个字符占几列：制表符 TAB 列，其它控制字符显示成 ^X 占两列，中日韩文字两列
+pub fn char_width(ch: str) -> int {
+    b = byte_at(ch, 0)
+    if b == '\t' { return TAB }
+    if b < 32 || b == 127 { return 2 }
+    fmt.width(ch)
+}
+
+// 字符在屏幕上的样子
+fn shown(ch: str) -> str {
+    b = byte_at(ch, 0)
+    if b == '\t' { return "    " }
+    if b < 32 { return "^" + from_byte(b + 64) }
+    if b == 127 { return "^?" }
+    ch
+}
+
+// s 的前 i 个字节占几列
+pub fn width_to(s: str, i: int) -> int {
+    w = 0
+    k = 0
+    for k < i {
+        n = next_char(s, k)
+        w += char_width(slice(s, k, n))
+        k = n
+    }
+    w
+}
+
+// 显示到第 w 列为止能放下的最长前缀（字节下标）：上下移动时让光标尽量停在同一列
+pub fn index_at_width(s: str, w: int) -> int {
+    cur = 0
+    k = 0
+    for k < len(s) {
+        n = next_char(s, k)
+        cw = char_width(slice(s, k, n))
+        if cur + cw > w { break }
+        cur += cw
+        k = n
+    }
+    k
+}
+
+// 从第 left 列开始、宽 cols 列的那一段，左右两边被切掉一半的宽字符用空格补上
+pub fn visible(s: str, left: int, cols: int) -> str {
+    out = ""
+    cur = 0
+    k = 0
+    right = left + cols
+    for k < len(s) && cur < right {
+        n = next_char(s, k)
+        ch = slice(s, k, n)
+        cw = char_width(ch)
+        if cur >= left && cur + cw <= right {
+            out += shown(ch)
+        } else if cur + cw > left {
+            // 只露出一部分
+            a = if cur < left { left } else { cur }
+            b = if cur + cw > right { right } else { cur + cw }
+            for _i in a..b { out += " " }
+        }
+        cur += cw
+        k = n
+    }
+    out
+}

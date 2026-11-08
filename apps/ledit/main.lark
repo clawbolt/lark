@@ -1,0 +1,136 @@
+// ledit：用 Lark 写的终端文本编辑器（像精简版的 nano）。
+// 构建：在 apps/ledit 里 lark build，得到 build/ledit
+//
+//   ledit 文件                      在终端里编辑；文件不存在时保存才创建
+//   ledit --keys 脚本 [--screen] 文件  不进终端，照着按键脚本编辑（写法见 ed/keys.lark），最后打印提示行；
+//                                  加 --screen 再打印最后一屏（测试用，屏幕大小用 --rows / --cols 改）
+//
+// 键：方向键、Home / End、PgUp / PgDn 移动；Enter、Backspace、Delete 编辑；
+//     Ctrl-S 保存，Ctrl-Q 退出（有改动时要按两次），Ctrl-Z 撤销，Ctrl-F 搜索
+//
+// 终端：std/term 切换原始模式（按一个键就能读到，没有按键时 0.1 秒返回一次），收到 SIGWINCH 时重新查窗口大小。
+// 退出和 panic 时 std/term 都会恢复终端。
+import "std/os"
+import "std/io"
+import "std/term"
+import "std/flag"
+import "ed/editor"
+import "ed/keys"
+
+fn main() {
+    p = flag.new("ledit", "终端里的文本编辑器")
+    p.add_str("keys", "", "", "不进终端：照着这个文件里的按键脚本编辑")
+    p.add_bool("screen", "", "--keys 结束时打印最后一屏")
+    p.add_int("rows", "", 12, "--keys 时屏幕的行数")
+    p.add_int("cols", "", 40, "--keys 时屏幕的列数")
+    a = p.parse_or_exit()
+    if len(a.rest) != 1 {
+        eprint("ledit：要一个文件名")
+        eprint(p.usage())
+        exit(2)
+    }
+    path = a.rest[0]
+    script = a.get_str("keys")
+    code = if script != "" {
+        run_script(path, script, a.get_bool("screen"), a.get_int("rows"), a.get_int("cols"))
+    } else {
+        run_tty(path)
+    }
+    exit(code)
+}
+
+fn run_script(path: str, script: str, show: bool, rows: int, cols: int) -> int {
+    ks = match take read_script(script) {
+        Ok(x) => x
+        Err(e) => {
+            eprint("ledit：#{e}")
+            return 2
+        }
+    }
+    ed = match take editor.open(path, rows - 2, cols) {
+        Ok(x) => x
+        Err(e) => {
+            eprint("ledit：#{e}")
+            return 2
+        }
+    }
+    for k in ks {
+        ed.handle(k)
+        if ed.quit { break }
+        ed.scroll()
+        // 和终端里一样每个键都画一帧（结果不用），这样渲染的代码也跑到了
+        _frame = editor.render(ed)
+    }
+    print(ed.msg)
+    if show {
+        for l in editor.screen(ed) { print("|" + l) }
+    }
+    0
+}
+
+fn read_script(p: str) -> [keys.Key]! { keys.parse_script(os.read(p)?) }
+
+fn run_tty(path: str) -> int {
+    if !term.is_tty(0) {
+        eprint("ledit：标准输入不是终端（不进终端时用 --keys 脚本）")
+        return 2
+    }
+    rows, cols = term.size() ?? (24, 80)
+    ed = match take editor.open(path, rows - 2, cols) {
+        Ok(x) => x
+        Err(e) => {
+            eprint("ledit：#{e}")
+            return 2
+        }
+    }
+    match term.enable_raw(100) {
+        Ok(_) => {}
+        Err(e) => {
+            eprint("ledit：#{e}")
+            return 2
+        }
+    }
+    w = io.stdout()
+    // 换到备用屏幕，退出时原来的内容回来
+    term.enter_alt_screen()
+    pending = ""
+    redraw = true
+    for !ed.quit {
+        if term.was_resized() {
+            r, c = term.size() ?? (ed.height + 2, ed.width)
+            if r - 2 != ed.height || c != ed.width { ed.resize(r - 2, c) }
+            redraw = true
+        }
+        if redraw {
+            ed.scroll()
+            _x = w.write(editor.render(ed))
+            _f = w.flush()
+            redraw = false
+        }
+        got = term.read(256) ?? ""
+        if got == "" {
+            // 0.1 秒没有新字节：还剩半截的序列就是单独按了 Esc
+            if pending != "" {
+                pending = ""
+                ed.handle(keys.Esc)
+                redraw = true
+            }
+            continue
+        }
+        pending += got
+        i = 0
+        for i < len(pending) {
+            k, n = keys.decode(pending, i)
+            if n == 0 { break }
+            ed.handle(k)
+            i += n
+            if ed.quit { break }
+        }
+        pending = slice(pending, i, len(pending))
+        redraw = true
+    }
+    _b = w.write(term.CLEAR + term.HOME)
+    _g = w.flush()
+    _r = term.restore()
+    0
+}

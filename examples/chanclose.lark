@@ -1,0 +1,57 @@
+// ch.close()：声明不会再有值了（需要 lark1 及以后的版本）。
+// 不 close 时，recv 要等除自己以外的持有者都放手才得到 None；main 自己还拿着一份副本时就永远等不到，程序挂住。
+// close 以后：队列里剩下的值照样取得出来，取完以后 recv 得到 None；可以重复 close；close 以后再 send 会 panic。
+// 编译：lark1 examples/chanclose.lark -o out.c
+
+type Prod {
+    id: int
+    n: int
+    out: Chan[int]
+}
+
+type Cons {
+    src: Chan[int]
+    done: Chan[int]
+}
+
+fn produce(take p: Prod) {
+    for i in 0..p.n { p.out.send(p.id * 100000 + i) }
+}
+
+fn consume(take c: Cons) {
+    count = 0
+    for {
+        r = c.src.recv()
+        match r {
+            Some(_) => { count += 1 }
+            None => break
+        }
+    }
+    c.done.send(count)
+}
+
+fn main() {
+    // 生产者、消费者：main 一直拿着 ch，生产者都结束以后 close，消费者才收得到 None
+    ch: Chan[int] = chan()
+    done: Chan[int] = chan()
+    scope {
+        spawn(consume, Cons(src: ch.copy(), done: done.copy()))
+        scope {
+            for p in 0..4 { spawn(produce, Prod(id: p, n: 5000, out: ch.copy())) }
+        }
+        ch.close()
+    }
+    print("收到 #{done.recv() ?? -1} 个")
+    // 同一个任务里：还有别的副本，close 以后先取出剩下的值，再得到 None
+    q: Chan[str] = chan()
+    q2 = q.copy()
+    q.send("甲")
+    q2.send("乙")
+    q.close()
+    q2.close()
+    a = q.recv()
+    b = q2.recv()
+    c = q.recv()
+    print("#{a} #{b} #{c}")
+    q.send("丙")
+}

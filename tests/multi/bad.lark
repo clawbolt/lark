@@ -1,0 +1,5 @@
+// 期望错误：出在第二个文件的第 4 行，报错里应带上 bad.lark
+fn greet(name: str) -> str {
+    s = "你好，#{name}"
+    s + 1
+}

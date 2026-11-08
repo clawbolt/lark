@@ -1,0 +1,56 @@
+// 用标准库统计词频：lark1 examples/wordcount.lark -o out.c
+import "std/map"
+import "std/str"
+
+type Point {
+    x: int
+    y: int
+}
+
+// 也可以把结构体编码成 int 当键（直接用结构体当键见 examples/eq.lark）
+fn key_of(p: Point) -> int { p.x * 1000 + p.y }
+
+fn main() {
+    text = "the cat and the dog  and the bird\n the end"
+    ws = str.words(text)
+    counts: map.Map[str, int] = map.new()
+    for w in ws {
+        n = counts.get(w) ?? 0
+        counts.insert(w, n + 1)
+    }
+    print("不同的词：#{len(counts)}")
+    for k in counts.keys {
+        print("#{k}: #{counts.get(k) ?? 0}")
+    }
+    has_cat = counts.contains_key("cat")
+    has_cow = counts.contains_key("cow")
+    print("有 cat：#{has_cat}，有 cow：#{has_cow}")
+
+    // 扩容：插入 100 个键
+    sq: map.Map[int, int] = map.new()
+    for i in 0..100 { sq.insert(i, i * i) }
+    print("99 的平方：#{sq.get(99) ?? -1}，共 #{len(sq)} 个")
+
+    // 值可以是任意类型
+    pts: map.Map[int, Point] = map.new()
+    p0 = Point(x: 1, y: 2)
+    k0 = key_of(p0)
+    pts.insert(k0, p0)          // 不能写 pts.insert(key_of(p0), p0)：p0 被移走的同时又被读取
+    match pts.get(1002) {
+        Some(p) => print("找到点 (#{p.x}, #{p.y})")
+        None => print("没有")
+    }
+
+    // 字符串函数
+    parts = str.split("a,b,,c", ",")
+    third_empty = parts[2] == ""
+    print("split：#{len(parts)} 段，第 3 段为空：#{third_empty}")
+    t = str.trim("  你好  ")
+    print("trim：[#{t}]")
+    sw = str.starts_with("lark1", "lark")
+    ew = str.ends_with("main.lark", ".lark")
+    print("starts_with：#{sw}，ends_with：#{ew}")
+    f1 = str.find("hello world", "world") ?? -1
+    f2 = str.find("hello", "xyz") ?? -1
+    print("find：#{f1}，#{f2}")
+}

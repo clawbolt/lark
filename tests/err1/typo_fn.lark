@@ -1,0 +1,4 @@
+// 期望错误：未定义的函数 pirnt，提示 print
+fn main() {
+    pirnt("你好")
+}

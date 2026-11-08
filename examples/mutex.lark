@@ -1,0 +1,55 @@
+// Mutex[T]：多个任务一起改的值（需要 lark1 及以后的版本）
+// mutex(v) 把 v 放进一个互斥量；复制它只是计数加一，拿到的是同一个互斥量，可以交给多个任务。
+// 只能在 lock m as x { … } 里碰里面的值：x 能改、能 &x 传下去，不能移走；块尾解锁。
+// 块里不能 return、?，也不能 break / continue 到块外（和 scope 一样，保证一定走到块尾）。
+
+type Stats {
+    hits: int
+    log: [str]
+}
+
+type Job {
+    id: int
+    count: Mutex[int]
+    stats: Mutex[Stats]
+}
+
+fn note(inout s: Stats, line: str) {
+    s.hits += 1
+    if len(s.log) < 3 { s.log.push(line) }
+}
+
+fn work(take job: Job) {
+    for _k in 0..1000 {
+        lock job.count as n { n += 1 }
+    }
+    // 锁着的时候也可以等待（这里睡 1 毫秒）：别的任务排队，轮到时在哪个系统线程上醒来都行
+    lock job.stats as s {
+        sleep_ms(1)
+        note(&s, "任务 #{job.id} 来过")
+    }
+}
+
+fn main() {
+    // 不用并发时也能用（就是一个普通的锁）
+    names = mutex(["a"])
+    lock names as xs { xs.push("b") }
+    size = lock names as xs { len(xs) }
+    print("names 有 #{size} 个")
+
+    count = mutex(0)
+    stats = mutex(Stats(hits: 0, log: []))
+    scope {
+        for i in 0..8 {
+            spawn(work, Job(id: i, count: count.copy(), stats: stats.copy()))
+        }
+    }
+    total = lock count as n { n }
+    print("8 个任务各加 1000 次：#{total}")
+    hits, kept = lock stats as s { (s.hits, len(s.log)) }
+    print("stats：#{hits} 次，留下 #{kept} 条记录")
+
+    // 块的值可以带出来，但只能是副本（str 本来就是复制的）；不能把里面的列表、结构体移走
+    first = lock stats as s { slice(s.log[0], 0, 6) }
+    print("第一条以「#{first}」开头")
+}

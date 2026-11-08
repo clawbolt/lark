@@ -1,0 +1,92 @@
+// 自定义迭代器（需要 lark1 及以后的版本）
+// for x in it：it 不是列表时，它的类型要有 fn next(inout it: T) -> E?。
+// 迭代器归循环所有（it 被移走），每轮调用 next：Some(v) 时 v 归循环变量所有（可以直接移走），None 时结束。
+// 编译：lark1 examples/iter.lark -o out.c
+
+// 从 n 倒数到 1
+type Countdown {
+    n: int
+}
+
+fn next(inout cd: Countdown) -> int? {
+    if cd.n == 0 { return None }
+    cd.n -= 1
+    Some(cd.n + 1)
+}
+
+// 斐波那契数列的前 left 项
+type Fib {
+    a: int
+    b: int
+    left: int
+}
+
+fn next(inout f: Fib) -> int? {
+    if f.left == 0 { return None }
+    f.left -= 1
+    x = f.a
+    f.a = f.b
+    f.b = x + f.b
+    Some(x)
+}
+
+// 按空格切出单词：每轮产生一个新的字符串
+type Words {
+    s: str
+    i: int
+}
+
+fn words(s: str) -> Words { Words(s: s, i: 0) }
+
+fn next(inout w: Words) -> str? {
+    n = len(w.s)
+    for w.i < n && byte_at(w.s, w.i) == ' ' { w.i += 1 }
+    if w.i >= n { return None }
+    start = w.i
+    for w.i < n && byte_at(w.s, w.i) != ' ' { w.i += 1 }
+    Some(slice(w.s, start, w.i))
+}
+
+// 边走边拆的链表：迭代器拥有剩下的部分
+enum Node {
+    Cons(v: int, rest: Node)
+    Nil
+}
+
+type Walk {
+    cur: Node
+}
+
+fn next(inout w: Walk) -> int? {
+    cur = replace(&w.cur, Nil)
+    match take cur {
+        Cons(v, rest) => {
+            w.cur = rest
+            Some(v)
+        }
+        Nil => None
+    }
+}
+
+fn main() {
+    for i in Countdown(n: 3) {
+        print("倒数 #{i}")
+    }
+    fibs: [int] = []
+    for x in Fib(a: 0, b: 1, left: 10) {
+        fibs.push(x)
+    }
+    print("斐波那契：#{fibs}")
+    kept: [str] = []
+    for w in words("  一只 小 云雀  飞过 天空 ") {
+        if w == "飞过" { break }
+        kept.push(w)      // w 归循环变量所有，可以直接移进列表
+    }
+    print("单词：#{kept}")
+    chain = Cons(1, Cons(2, Cons(3, Nil)))
+    total = 0
+    for v in Walk(cur: chain) {
+        total += v
+    }
+    print("链表求和：#{total}")
+}

@@ -1,0 +1,61 @@
+// 取消：在 select 里等、查、等到取消；先取消再 watch 也马上收到
+import "std/sync"
+
+type Job {
+    stop: sync.Cancel
+    out: Chan[str]
+}
+
+// 一直空转，直到取消；结束时报告转了没有
+fn spin(take j: Job) {
+    stop = j.stop.watch()
+    n = 0
+    going = true
+    for going {
+        select {
+            _v <- stop => { going = false }
+            after 1 => { n += 1 }
+        }
+    }
+    j.out.send(if n > 0 { "转过" } else { "没转" })
+}
+
+fn sleeper(take j: Job) {
+    j.stop.wait()
+    j.out.send("醒了")
+}
+
+test "取消正在等的任务" {
+    c = sync.new_cancel()
+    assert(!c.is_cancelled())
+    assert_eq("#{c}", "Cancel(没取消)")
+    out: Chan[str] = chan()
+    scope {
+        spawn(spin, Job(stop: c.copy(), out: out.copy()))
+        spawn(spin, Job(stop: c.copy(), out: out.copy()))
+        spawn(sleeper, Job(stop: c.copy(), out: out.copy()))
+        sleep_ms(10)
+        c.cancel()
+    }
+    // 三个任务都停了（scope 结束说明都跑完了），各自报告了一次
+    got = [out.recv() ?? "", out.recv() ?? "", out.recv() ?? ""]
+    assert_eq(len(got), 3)
+    n_spin = 0
+    for g in got {
+        if g == "转过" { n_spin += 1 }
+    }
+    assert_eq(n_spin, 2)
+    assert(c.is_cancelled())
+    assert_eq("#{c}", "Cancel(已取消)")
+}
+
+test "取消以后再 watch、再等" {
+    c = sync.new_cancel()
+    c.cancel()
+    c.cancel()
+    w = c.watch()
+    assert(w.recv() ?? false)
+    // 已经取消了：马上返回
+    c.wait()
+    assert(c.is_cancelled())
+}

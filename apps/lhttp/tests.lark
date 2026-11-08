@@ -1,0 +1,198 @@
+// lhttp 的单元测试：lark test（在 apps/lhttp 里运行）。直接调用解析和处理请求的函数，时间是固定的，不用网络
+import "std/str"
+import "std/os"
+import "std/http"
+
+// buf 里从 pos 开始第一次出现 pat 的位置，没有是 -1
+fn find_from(buf: str, pos: int, pat: str) -> int { str.find_from(buf, pat, pos) ?? -1 }
+import "http/files"
+
+const NOW = 784111777000        // 1994-11-06 08:49:37 UTC，RFC 里的例子
+
+fn req(s: str) -> http.Request {
+    r, _at, code = http.parse_request(s, 0)
+    match take r {
+        Some(x) => x
+        None => panic("没有解析出请求，状态码 #{code}")
+    }
+}
+
+// 回复的状态行
+fn status_line(resp: str) -> str {
+    e = find_from(resp, 0, "\r\n")
+    slice(resp, 0, e)
+}
+
+// 回复的正文
+fn body_of(resp: str) -> str {
+    e = find_from(resp, 0, "\r\n\r\n")
+    slice(resp, e + 4, len(resp))
+}
+
+fn get(path: str) -> str {
+    c = files.new_cache()
+    run(c, "tests/site", req("GET #{path} HTTP/1.1\r\nHost: x\r\n\r\n"), NOW)
+}
+
+// handler 的回复照 http.serve 的样子写成文字（HEAD 只写头部；不写 Connection）
+fn run(c: Mutex[files.Cache], root: str, r: http.Request, now: int) -> str {
+    resp = files.handle(c, root, r, now)
+    http.format_response(resp.status, resp.headers, resp.body, r.method == "HEAD", "", now)
+}
+
+test "解析：请求行、头部、查询串" {
+    r = req("GET /a%20b/c?x=1&y=2 HTTP/1.1\r\nHost: example.com\r\nUser-Agent:  curl/8  \r\n\r\n")
+    assert_eq(r.method, "GET")
+    assert_eq(r.path, "/a b/c")
+    assert_eq(r.query, "x=1&y=2")
+    assert_eq(r.version, "HTTP/1.1")
+    assert_eq(http.header(r, "host") ?? "", "example.com")
+    assert_eq(http.header(r, "user-agent") ?? "", "curl/8")
+    assert(http.header(r, "accept") == None)
+    // absolute-form 的目标只取路径
+    r2 = req("GET http://example.com/p?q HTTP/1.1\r\n\r\n")
+    assert_eq(r2.path, "/p")
+    assert_eq(r2.query, "q")
+}
+
+test "解析：不完整、流水线、请求体" {
+    // 头部还没收完
+    _r1, at1, _c1 = http.parse_request("GET / HTTP/1.1\r\nHost: x\r\n", 0)
+    assert_eq(at1, -1)
+    // 请求体还没收完
+    _r2, at2, _c2 = http.parse_request("POST /echo HTTP/1.1\r\nContent-Length: 5\r\n\r\nab", 0)
+    assert_eq(at2, -1)
+    // 两个请求连在一起：第一个解析完，下一个从它后面开始
+    two = "POST /echo HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\n\r\n"
+    r3, at3, _c3 = http.parse_request(two, 0)
+    match take r3 {
+        Some(x) => assert_eq(x.body, "hello")
+        None => assert(false)
+    }
+    r4, at4, _c4 = http.parse_request(two, at3)
+    match take r4 {
+        Some(x) => assert_eq(x.method, "GET")
+        None => assert(false)
+    }
+    assert_eq(at4, len(two))
+}
+
+test "解析：错误的请求" {
+    cases = [
+        ("GET /\r\n\r\n", 400),
+        ("GET / HTTP/2.0\r\n\r\n", 505),
+        ("GET / FOO\r\n\r\n", 400),
+        ("G(T / HTTP/1.1\r\n\r\n", 400),
+        ("GET nope HTTP/1.1\r\n\r\n", 400),
+        ("GET / HTTP/1.1\r\nno colon\r\n\r\n", 400),
+        ("GET /%zz HTTP/1.1\r\n\r\n", 400),
+        ("GET /%00 HTTP/1.1\r\n\r\n", 400),
+        ("POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n", 400),
+        ("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", 501),
+        ("POST / HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n", 413)
+    ]
+    for (s, want) in cases {
+        _r, at, code = http.parse_request(s, 0)
+        assert_eq(at, -2)
+        assert_eq(code, want)
+    }
+    // 头部太长：还没收完就知道了
+    _r, at, code = http.parse_request("GET / HTTP/1.1\r\nX: " + str.repeat("a", 20000), 0)
+    assert_eq(at, -2)
+    assert_eq(code, 431)
+}
+
+test "keep-alive" {
+    assert(http.is_keep_alive(req("GET / HTTP/1.1\r\n\r\n")))
+    assert(!http.is_keep_alive(req("GET / HTTP/1.1\r\nConnection: close\r\n\r\n")))
+    assert(!http.is_keep_alive(req("GET / HTTP/1.0\r\n\r\n")))
+    assert(http.is_keep_alive(req("GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n")))
+}
+
+test "回复：日期、格式" {
+    assert_eq(http.format_date(NOW), "Sun, 06 Nov 1994 08:49:37 GMT")
+    r = http.format_response(200, [("Content-Type", "text/plain")], "hi", false, "close", NOW)
+    assert_eq(r, "HTTP/1.1 200 OK\r\nDate: Sun, 06 Nov 1994 08:49:37 GMT\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi")
+    // HEAD：长度照写，正文不写
+    h = http.format_response(200, [], "hello", true, "", NOW)
+    assert(str.ends_with(h, "Content-Length: 5\r\n\r\n"))
+    assert_eq(http.escape_html("<a href=\"x\">&</a>"), "&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;")
+    assert_eq(http.escape_path("/sub/with space.txt"), "/sub/with%20space.txt")
+}
+
+test "处理：文件、目录、错误" {
+    r = get("/")
+    assert_eq(status_line(r), "HTTP/1.1 200 OK")
+    assert(str.contains(r, "Content-Type: text/html; charset=utf-8\r\n"))
+    assert(str.contains(body_of(r), "hello from lhttp"))
+    css = get("/sub/style.css")
+    assert(str.contains(css, "Content-Type: text/css; charset=utf-8\r\n"))
+    assert_eq(body_of(css), "body { color: red; }\n")
+    // 名字里有空格的文件
+    assert_eq(body_of(get("/sub/with%20space.txt")), "a b\n")
+    // 目录不以 / 结尾时跳转；没有 index.html 时列出目录
+    assert_eq(status_line(get("/sub")), "HTTP/1.1 301 Moved Permanently")
+    assert(str.contains(get("/sub"), "Location: /sub/\r\n"))
+    lst = body_of(get("/sub/"))
+    assert(str.contains(lst, "<a href=\"style.css\">style.css</a>"))
+    assert(str.contains(lst, "<a href=\"with%20space.txt\">with space.txt</a>"))
+    assert_eq(status_line(get("/nope")), "HTTP/1.1 404 Not Found")
+    assert_eq(status_line(get("/../tests.lark")), "HTTP/1.1 403 Forbidden")
+    assert_eq(status_line(get("/sub/%2e%2e/%2e%2e/tests.lark")), "HTTP/1.1 403 Forbidden")
+}
+
+test "处理：方法" {
+    c = files.new_cache()
+    h = run(c, "tests/site", req("HEAD / HTTP/1.1\r\n\r\n"), NOW)
+    assert_eq(status_line(h), "HTTP/1.1 200 OK")
+    assert_eq(body_of(h), "")
+    p = run(c, "tests/site", req("PUT / HTTP/1.1\r\n\r\n"), NOW)
+    assert_eq(status_line(p), "HTTP/1.1 405 Method Not Allowed")
+    assert(str.contains(p, "Allow: GET, HEAD\r\n"))
+    e = run(c, "tests/site", req("POST /echo HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\nabc"), NOW)
+    assert(str.contains(e, "Content-Type: text/plain\r\n"))
+    assert_eq(body_of(e), "abc")
+}
+
+test "处理：文件缓存" {
+    // 临时目录放在 build/ 下（不进版本库）
+    dir = "build/cache_test"
+    _m = os.mkdir_all(dir)
+    _w1 = os.write(dir + "/a.txt", "one")
+    c = files.new_cache()
+    g = req("GET /a.txt HTTP/1.1\r\n\r\n")
+    assert_eq(body_of(run(c, dir, g, NOW)), "one")
+    _w2 = os.write(dir + "/a.txt", "two")
+    // 1 秒之内用缓存里的
+    assert_eq(body_of(run(c, dir, g, NOW + 999)), "one")
+    // 过了 1 秒重新读；HEAD 也能用缓存，只是不写正文
+    assert_eq(body_of(run(c, dir, g, NOW + 1000)), "two")
+    h = run(c, dir, req("HEAD /a.txt HTTP/1.1\r\n\r\n"), NOW + 1000)
+    assert(str.contains(h, "Content-Length: 3\r\n"))
+    assert_eq(body_of(h), "")
+    // 删掉以后，缓存过期前还能拿到，过期后 404
+    _r = os.remove(dir + "/a.txt")
+    assert_eq(status_line(run(c, dir, g, NOW + 1500)), "HTTP/1.1 200 OK")
+    assert_eq(status_line(run(c, dir, g, NOW + 2000)), "HTTP/1.1 404 Not Found")
+}
+
+test "处理：Last-Modified 和 304" {
+    r = get("/sub/style.css")
+    k = "Last-Modified: "
+    a = find_from(r, 0, k)
+    assert(a >= 0)
+    lm = slice(r, a + len(k), find_from(r, a, "\r\n"))
+    c = files.new_cache()
+    // 浏览器把上次的 Last-Modified 原样发回来：没改过就回 304，不带正文
+    nm = run(c, "tests/site", req("GET /sub/style.css HTTP/1.1\r\nIf-Modified-Since: #{lm}\r\n\r\n"), NOW)
+    assert_eq(status_line(nm), "HTTP/1.1 304 Not Modified")
+    assert_eq(body_of(nm), "")
+    assert(!str.contains(nm, "Content-Length"))
+    // 第二次走缓存，也一样
+    nm2 = run(c, "tests/site", req("GET /sub/style.css HTTP/1.1\r\nIf-Modified-Since: #{lm}\r\n\r\n"), NOW + 1)
+    assert_eq(status_line(nm2), "HTTP/1.1 304 Not Modified")
+    // 日期对不上就照常回复
+    old = run(c, "tests/site", req("GET /sub/style.css HTTP/1.1\r\nIf-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT\r\n\r\n"), NOW + 2)
+    assert_eq(status_line(old), "HTTP/1.1 200 OK")
+    assert_eq(body_of(old), "body { color: red; }\n")
+}

@@ -1,0 +1,117 @@
+// scope 块和 lock 块里可以 return、?、break、continue（需要 lark1 及以后的版本）：
+// 跳出 scope 之前，先放掉手里的值，再等块里 spawn 的任务都结束；跳出 lock 块之前先解锁。
+// 编译：lark1 examples/scopejump.lark -o out.c
+
+fn work(take out: Chan[str]) {
+    sleep_ms(20)
+    out.send("任务做完了")
+}
+
+// ? 出错时直接返回：返回之前已经等 work 做完了
+fn parse_all(xs: [str], out: Chan[str]) -> int! {
+    total = 0
+    scope {
+        spawn(work, out.copy())
+        for s in xs { total += try_parse_int(s)? }
+    }
+    Ok(total)
+}
+
+// 在 lock 块里 return：返回之前解锁
+fn first_big(m: Mutex[[int]], lim: int) -> int {
+    lock m as xs {
+        for x in xs {
+            if x > lim { return x }
+        }
+    }
+    -1
+}
+
+type Cons {
+    src: Chan[int]
+    out: Chan[int]
+}
+
+fn consume(take c: Cons) {
+    n = 0
+    for {
+        r = c.src.recv()
+        match r {
+            Some(_) => { n += 1 }
+            None => break
+        }
+    }
+    c.out.send(n)
+}
+
+// 在 scope 中途 return：先放掉 ch，消费者才收得到 None；然后等它结束，它的计数已经送到 res 里了
+fn feed(n: int, stop: int, res: Chan[int]) -> int {
+    ch: Chan[int] = chan()
+    scope {
+        spawn(consume, Cons(src: ch.copy(), out: res.copy()))
+        for i in 0..n {
+            if i == stop { return i }
+            ch.send(i)
+        }
+    }
+    n
+}
+
+fn grow(inout xs: [int]) { xs.push(0) }
+
+fn make() -> [int]? { Some([1, 2]) }
+
+fn main() {
+    msgs: Chan[str] = chan()
+    match parse_all(["1", "x", "3"], msgs) {
+        Ok(sum) => print("和：#{sum}")
+        Err(e) => print("出错：#{e}")
+    }
+    print("任务的消息：#{msgs.recv() ?? "没有"}")
+
+    m = mutex([5, 20, 7, 30])
+    print("#{first_big(m, 10)} #{first_big(m, 100)}")
+    // break、continue 跳出 lock 块：先解锁（没解锁的话，下一轮同一个任务再锁会 panic）
+    n = 0
+    for i in 0..10 {
+        lock m as xs {
+            if i == 3 { break }
+            if i % 2 == 0 { continue }
+            xs.push(i)
+        }
+        n += 1
+    }
+    lock m as xs { print("n = #{n}，#{xs}") }
+
+    // break 跳出 scope：先等这一轮 spawn 的任务做完
+    done: Chan[str] = chan()
+    for k in 0..5 {
+        scope {
+            spawn(work, done.copy())
+            if k == 1 { break }
+        }
+    }
+    done.close()
+    got = 0
+    for {
+        r = done.recv()
+        match r {
+            Some(_) => { got += 1 }
+            None => break
+        }
+    }
+    print("break 之前等完了：收到 #{got} 条")
+
+    res: Chan[int] = chan()
+    s = feed(10, 3, res)
+    print("在第 #{s} 个 return，消费者收到 #{res.recv() ?? -1} 个")
+
+    // match take 拆出来的值归自己，可以改
+    match take make() {
+        Some(xs) => {
+            grow(&xs)
+            print("#{xs}")
+        }
+        None => {}
+    }
+}

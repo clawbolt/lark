@@ -1,0 +1,50 @@
+// 定时：只检查范围（机器忙的时候会晚），不检查确切的毫秒数
+import "std/timer"
+import "std/time"
+
+test "截止时间" {
+    d = timer.deadline(10_000)
+    assert(!d.is_expired())
+    left = d.left_ms()
+    assert(left > 9_000 && left <= 10_000)
+    assert(str_starts("#{d}", "Deadline(还剩 "))
+    gone = timer.deadline(0)
+    assert(gone.is_expired())
+    assert_eq(gone.left_ms(), 0)
+    assert_eq(timer.deadline(-5).left_ms(), 0)
+    // 在 select 里当总的超时：通道一直没有值，到点走 after
+    ch: Chan[int] = chan()
+    keep = ch.copy()
+    short = timer.deadline(20)
+    t0 = time.now()
+    r = select {
+        v <- ch => v
+        after short.left_ms() => -1
+        done => -2
+    }
+    assert_eq(r, -1)
+    assert(time.elapsed_ms(t0) >= 19)
+    assert(short.is_expired())
+    keep.close()
+}
+
+test "每隔一段时间" {
+    t = timer.every(30)
+    n = t.next_ms()
+    assert(n >= 0 && n <= 30)
+    assert_eq(t.count(), 0)
+    t0 = time.now()
+    t.wait()
+    t.wait()
+    // 两次对齐到第 1、2 个间隔：总共大约 60 毫秒，不是 60 加上每次的误差
+    ms = time.elapsed_ms(t0)
+    assert(ms >= 59)
+    assert(t.count() >= 2)
+    // 睡过了几个间隔：不补，下一次照样对齐
+    sleep_ms(70)
+    assert(t.count() >= 4)
+    assert(t.next_ms() <= 30)
+    assert(str_starts("#{t}", "Ticker(每 "))
+}
+
+fn str_starts(s: str, p: str) -> bool { len(s) >= len(p) && slice(s, 0, len(p)) == p }

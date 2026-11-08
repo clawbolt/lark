@@ -1,0 +1,77 @@
+// 存储的闭包 Fn(…) -> R（需要 lark1 及以后的版本）
+// fn(…) 参数只能借用闭包；Fn 值可以存进变量、字段、列表，可以返回，也可以交给别的线程。
+// 创建 Fn 闭包时，捕获的变量被复制进堆上的环境（只读）；复制 Fn 值只是计数加一。
+
+fn adder(n: int) -> Fn(int) -> int { |x| x + n }
+
+fn greeter(prefix: str) -> Fn(str) -> str { |name| prefix + "，" + name }
+
+// 普通的 fn 参数照样能接 Fn 值
+fn apply_all(xs: [int], f: fn(int) -> int) -> [int] {
+    out: [int] = []
+    for x in xs { out.push(f(x)) }
+    out
+}
+
+type Rule {
+    name: str
+    test: Fn(int) -> bool
+}
+
+fn classify(rules: [Rule], n: int) -> str {
+    for r in rules {
+        t = r.test.copy()
+        if t(n) { return r.name.copy() }
+    }
+    "其它"
+}
+
+type Task {
+    f: Fn(int) -> int
+    arg: int
+    out: Chan[int]
+}
+
+fn run_task(take t: Task) {
+    f = t.f.copy()
+    t.out.send(f(t.arg))
+}
+
+fn main() {
+    add5 = adder(5)
+    add10 = adder(10)
+    print("add5(1) = #{add5(1)}，add10(1) = #{add10(1)}")
+    hi = greeter("你好")
+    print(hi("Lark"))
+
+    fs: [Fn(int) -> int] = [adder(1), adder(100), |x| x * x]
+    for f in fs { print("#{f(7)}") }
+    ys = apply_all([1, 2, 3], add10)
+    print("apply_all 之后：#{ys[0]} #{ys[1]} #{ys[2]}")
+
+    limit = 10
+    rules = [
+        Rule(name: "负数", test: |n| n < 0),
+        Rule(name: "小", test: |n| n < limit),
+        Rule(name: "偶数", test: |n| n % 2 == 0)
+    ]
+    for n in [-3, 4, 12, 15] {
+        print("#{n}：#{classify(rules, n)}")
+    }
+
+    // Fn 值的环境是只读的、计数是原子的，所以可以交给别的线程
+    results: Chan[int] = chan()
+    scope {
+        spawn(run_task, Task(f: adder(1000), arg: 1, out: results.copy()))
+        spawn(run_task, Task(f: |x| x * 3, arg: 7, out: results.copy()))
+    }
+    total = 0
+    for {
+        r = results.recv()
+        match r {
+            Some(v) => { total += v }
+            None => break
+        }
+    }
+    print("线程算出的和：#{total}")
+}

@@ -1,0 +1,53 @@
+== ltar 打包，系统的 tar 解开
+一样
+== ltar 打包加 gzip，系统的 tar 解开
+gzip 校验通过
+一样
+== 系统的 tar 打包加 gzip，ltar 解开
+一样
+== ltar 打包，ltar 解开
+一样
+== 列出
+src/
+src/a.txt
+src/<长目录>/
+src/<长目录>/<长名字>
+src/link
+src/run.sh
+src/sub/
+src/sub/bin
+src/sub/empty
+== 列出 -v
+drwxr-xr-x        0 src/
+-rw-r--r--        6 src/a.txt
+drwxr-xr-x        0 src/<长目录>/
+-rw-r--r--        5 src/<长目录>/<长名字>
+lrwxrwxrwx        0 src/link -> a.txt
+-rwxr-xr-x       18 src/run.sh
+drwxr-xr-x        0 src/sub/
+-rw-r--r--       12 src/sub/bin
+-rw-r--r--        0 src/sub/empty
+== 列出的和系统的 tar 一样
+ltar 的包：一样
+系统的 tar 的包：一样
+== 出错
+ltar：无法读取文件 nope.tar
+退出码 1
+ltar：bad.tar：tar 第 0 个字节：头不完整（只剩 7 个字节）
+退出码 1
+ltar：没有给要打包的路径
+退出码 1
+ltar：要用 -f 给出包的文件名
+退出码 1
+== 不安全的名字
+ltar：跳过 ../src/a.txt：里面有 ..
+ltar：有 1 项没有解开（见上面）
+退出码 1
+ltar：跳过 w2/up/x：要经过符号链接
+ltar：有 1 项没有解开（见上面）
+退出码 1
+链接解开了，没有写到链接里面
+== 硬链接和修改时间
+硬链接：是同一个文件
+文件的修改时间：一样
+目录的修改时间：一样

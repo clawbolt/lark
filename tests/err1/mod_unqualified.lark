@@ -1,0 +1,6 @@
+// 期望错误：未定义的函数 open_door（模块里的名字要写成 secret.open_door）
+import "../mods/secret"
+
+fn main() {
+    print("#{open_door()}")
+}

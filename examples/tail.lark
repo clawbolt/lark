@@ -1,0 +1,62 @@
+// 尾调用（需要 lark1 及以后的版本）：函数在尾部调用自己时编译成跳回开头，不占栈。
+// 条件：每个参数都是 take，或者是 int / bool。尾部指函数体的值、if / match 各分支的值，以及 return f(…)。
+
+fn sum_to(n: int, acc: int) -> int {
+    if n == 0 { acc } else { sum_to(n - 1, acc + n) }
+}
+
+// take 参数：状态随调用一起移交，每一轮都是自己拥有的
+fn build(take xs: [int], n: int) -> [int] {
+    if n == 0 { return xs }
+    xs.push(n % 7)
+    build(xs, n - 1)
+}
+
+// 进程式的循环：状态就是参数（Erlang 的写法）
+enum Msg {
+    Add(n: int)
+    Get(reply: Chan[int])
+}
+
+type Counter {
+    inbox: Chan[Msg]
+    total: int
+}
+
+fn counter(take st: Counter) {
+    r = st.inbox.recv()
+    match r {
+        Some(m) => match m {
+            Add(n) => {
+                st.total += n
+                counter(st)
+            }
+            Get(reply) => {
+                reply.send(st.total)
+                counter(st)
+            }
+        }
+        None => print("counter 结束：没有人再给它发消息了")
+    }
+}
+
+fn main() {
+    print("sum_to(10000000) = #{sum_to(10000000, 0)}")
+    xs: [int] = []
+    ys = build(xs, 1000000)
+    print("build：#{len(ys)} 个元素")
+
+    scope {
+        inbox: Chan[Msg] = chan()
+        spawn(counter, Counter(inbox: inbox.copy(), total: 0))
+        for i in 1..1000001 { inbox.send(Add(i)) }
+        reply: Chan[int] = chan()
+        inbox.send(Get(reply.copy()))
+        got = reply.recv()
+        match got {
+            Some(t) => print("一百万条消息之后 total = #{t}")
+            None => print("没有回复")
+        }
+        // 块尾 inbox 被释放：counter 的 recv 返回 None，循环结束，scope 再等它退出
+    }
+}

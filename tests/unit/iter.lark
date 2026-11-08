@@ -1,0 +1,77 @@
+// std/iter 的边界：空的来源、n 为 0、无限的来源上提前停下、适配器的各种组合，以及列表和迭代器两种来源
+import "std/iter"
+
+test "空的来源和提前停下" {
+    e: [int] = []
+    assert_eq(len(iter.collect(iter.range(5, 5))), 0)
+    assert_eq(len(iter.collect(iter.range(5, 3))), 0)
+    assert(iter.collect(iter.range(-2, 1)) == [-2, -1, 0])
+    assert_eq(len(iter.take_n(iter.count_from(0), 0).collect()), 0)
+    assert(iter.take_n(iter.count_from(10), 3).collect() == [10, 11, 12])
+    assert(iter.take_n([1, 2], 5).collect() == [1, 2])
+    assert_eq(len(iter.skip_n([1, 2], 5).collect()), 0)
+    assert(iter.skip_n([1, 2, 3], 0).collect() == [1, 2, 3])
+    assert(!iter.any(e.copy(), |x| x > 0))
+    assert(iter.all(e.copy(), |x| x > 0))
+    assert_eq(iter.count(e.copy()), 0)
+    assert_eq(iter.fold(e.copy(), 42, |a, x| a + x), 42)
+    assert_eq(len(iter.map(e.copy(), |x| x + 1).collect()), 0)
+    assert_eq(iter.find(e, |x| x > 0) ?? -1, -1)
+    // find、any、all 找到答案就停，所以能用在无限的来源上
+    assert_eq(iter.find(iter.count_from(1), |x| x * x > 50) ?? -1, 8)
+    assert(iter.any(iter.count_from(1), |x| x == 1000))
+    assert(!iter.all(iter.count_from(1), |x| x < 10))
+}
+
+test "列表直接当来源" {
+    // 每个适配器都按第一个参数重载：列表的那个先包成 Each，结果和先 each 一样
+    assert(iter.map([1, 2, 3], |x| x * 10).collect() == [10, 20, 30])
+    assert(iter.map([1, 2, 3].each(), |x| x * 10).collect() == [10, 20, 30])
+    assert(iter.filter([5, 6, 7, 8], |x| x % 2 == 0).collect() == [6, 8])
+    assert(iter.take_while([1, 2, 9, 3], |x| x < 5).collect() == [1, 2])
+    ps = iter.enumerate(["x", "y"]).collect()
+    assert_eq(len(ps), 2)
+    assert_eq(ps[1].0, 1)
+    assert_eq(ps[1].1, "y")
+    assert_eq(iter.fold(["a", "b", "c"], "", |acc, s| acc + s), "abc")
+    // 方法语法：列表接着写下去
+    assert(["a", "bb", "ccc"].map(|s| len(s)).filter(|n| n != 2).collect() == [1, 3])
+    // zip、chain 的第一个来源可以是列表
+    z = iter.zip(["一", "二"], iter.count_from(1)).collect()
+    assert_eq(z[1].0, "二")
+    assert_eq(z[1].1, 2)
+    assert(iter.chain([1, 2], iter.range(5, 7)).collect() == [1, 2, 5, 6])
+    // 元素是 str：给出的是副本，原来的列表另有一份
+    ws = ["甲", "乙"]
+    up = ws.copy().map(|w| w + "!").collect()
+    assert(up == ["甲!", "乙!"])
+    assert(ws == ["甲", "乙"])
+}
+
+test "迭代器当来源" {
+    sq = iter.count_from(1).map(|n| n * n).take_n(5).collect()
+    assert(sq == [1, 4, 9, 16, 25])
+    assert_eq(len(iter.range(0, 3).take_n(0).collect()), 0)
+    // 跳过的比来源还多
+    assert_eq(len(iter.range(0, 3).skip_n(10).collect()), 0)
+    assert(iter.range(0, 5).skip_n(3).collect() == [3, 4])
+    assert(iter.count_from(0).take_while(|n| n < 4).collect() == [0, 1, 2, 3])
+    assert_eq(len(iter.range(0, 3).take_while(|n| n > 5).collect()), 0)
+    assert(iter.range(0, 10).filter(|n| n % 4 == 0).collect() == [0, 4, 8])
+    // zip：短的那个走完就结束
+    z = iter.zip(iter.range(0, 10), [1, 2, 3].each()).collect()
+    assert_eq(len(z), 3)
+    assert_eq(z[2].0, 2)
+    assert_eq(z[2].1, 3)
+    assert(iter.chain(iter.range(0, 2), iter.range(5, 7)).collect() == [0, 1, 5, 6])
+    assert_eq(len(iter.chain(iter.range(0, 0), iter.range(0, 0)).collect()), 0)
+    en = ["a", "b"].each().enumerate().collect()
+    assert_eq(en[1].0, 1)
+    assert_eq(en[1].1, "b")
+    // for in 直接用适配器；取值的函数也直接接在适配器后面
+    total = 0
+    for x in iter.range(1, 101).filter(|n| n % 2 == 1) { total += x }
+    assert_eq(total, 2500)
+    assert_eq(iter.range(1, 11).map(|n| n * n).fold(0, |acc, n| acc + n), 385)
+    assert_eq(iter.count_from(1).map(|n| n * 3).find(|n| n > 10) ?? -1, 12)
+}

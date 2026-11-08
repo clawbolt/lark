@@ -1,0 +1,7 @@
+和：3
+panic: 年龄不能是负数：-20
+  在 check_age（examples/trace.lark:5）
+  在 闭包（examples/trace.lark:17）
+  在 apply_all（examples/trace.lark:11）
+  在 main（examples/trace.lark:17）
+[退出码 101]

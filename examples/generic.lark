@@ -1,0 +1,63 @@
+// 泛型函数（需要 lark1 及以后的版本）
+// 调用时按实参推断类型参数，每组类型实参生成一份 C 函数（单态化），没有运行时开销。
+
+type Point {
+    x: int
+    y: int
+}
+
+fn last[T](xs: [T]) -> T? {
+    if len(xs) == 0 { return None }
+    xs[len(xs) - 1].copy()
+}
+
+fn contains[T](xs: [T], x: T) -> bool {
+    for y in xs {
+        if y == x { return true }
+    }
+    false
+}
+
+fn repeat[T](x: T, n: int) -> [T] {
+    out: [T] = []
+    for _i in 0..n { out.push(x.copy()) }
+    out
+}
+
+// 拿走列表，倒序后交还
+fn reversed[T](take xs: [T]) -> [T] {
+    out: [T] = []
+    for len(xs) > 0 { out.push(xs.pop()) }
+    out
+}
+
+// 泛型函数里调用别的泛型函数
+fn last_or[T](xs: [T], d: T) -> T {
+    match last(xs) {
+        Some(v) => v.copy()
+        None => d.copy()
+    }
+}
+
+fn main() {
+    nums = [3, 1, 4]
+    words = ["甲", "乙", "丙"]
+    four = contains(nums, 4)
+    ding = words.contains("丁")
+    print("含 4：#{four}，含 丁：#{ding}")
+    print("最后一个数：#{last(nums) ?? -1}")
+    match last(words) {
+        Some(w) => print("最后一个字：#{w}")
+        None => print("没有字")
+    }
+    empty: [int] = []
+    print("空列表：#{last(empty) ?? -1}，默认值：#{last_or(empty, 7)}")
+    print(join(repeat("啊", 3), ""))
+    pts = [Point(x: 1, y: 2), Point(x: 5, y: 6)]
+    match last(pts) {
+        Some(p) => print("最后一个点：(#{p.x}, #{p.y})")
+        None => print("没有点")
+    }
+    r = reversed(words)
+    print(join(r, " "))
+}

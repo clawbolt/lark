@@ -1,0 +1,4 @@
+# llua：用 Lark 写的 Lua 5.4 子集解释器，输出和真 Lua 一致
+name = llua
+version = 0.1.0
+c_src = native/num.c

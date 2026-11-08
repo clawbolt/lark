@@ -1,0 +1,6 @@
+通过  str：cut、split_n、repeat、pad
+通过  fmt.byte_size
+通过  json：路径和构造
+通过  time：读时长
+通过  time：时差
+5 项测试：5 项通过，0 项失败

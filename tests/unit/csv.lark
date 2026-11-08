@@ -1,0 +1,82 @@
+// std/csv 的测试：RFC 4180 的引号规则、换行写法、写回去再读回来，以及几种错误
+import "std/csv"
+
+fn rows(s: str) -> [[str]] {
+    match take csv.parse(s) {
+        Ok(r) => r
+        Err(e) => panic(e)
+    }
+}
+
+fn err_of(s: str) -> str {
+    match take csv.parse(s) {
+        Ok(_) => "<成功>"
+        Err(e) => e
+    }
+}
+
+// 每行用 | 连起来，行之间用 /
+fn show(rs: [[str]]) -> str {
+    parts: [str] = []
+    for r in rs { parts.push(join(r, "|")) }
+    join(parts, "/")
+}
+
+test "读：普通字段和引号" {
+    assert_eq(show(rows("a,b,c\n1,2,3\n")), "a|b|c/1|2|3")
+    assert_eq(show(rows("a,b\r\n1,2")), "a|b/1|2")
+    assert_eq(show(rows("\"x,y\",\"say \"\"hi\"\"\",z")), "x,y|say \"hi\"|z")
+    assert_eq(show(rows("\"多\n行\",2\n3,4\n")), "多\n行|2/3|4")
+    assert_eq(show(rows("a,,c\n,\n")), "a||c/|")
+    assert_eq(show(rows("\"\",x")), "|x")
+    assert_eq(len(rows("")), 0)
+    assert_eq(len(rows("\n\n")), 2)
+    assert_eq(show(rows("a,\"b\"\r\nc,d\r\n")), "a|b/c|d")
+    // 各行的列数可以不一样
+    assert_eq(show(rows("a\nb,c,d\n")), "a/b|c|d")
+}
+
+test "读：别的分隔符和表头" {
+    t = match take csv.parse_sep("name\tage\n云雀\t3\n", '\t') {
+        Ok(r) => r
+        Err(e) => panic(e)
+    }
+    assert_eq(show(t), "name|age/云雀|3")
+    assert_eq(csv.find_column(t[0], "age") ?? -1, 1)
+    assert_eq(csv.find_column(t[0], "nope") ?? -1, -1)
+}
+
+test "写回去" {
+    data = [["id", "note"], ["1", "a,b"], ["2", "引号\"在这"], ["3", "两\n行"], ["4", ""]]
+    text = csv.format(data)
+    assert_eq(text, "id,note\n1,\"a,b\"\n2,\"引号\"\"在这\"\n3,\"两\n行\"\n4,\n")
+    assert_eq(show(rows(text)), show(data))
+    assert_eq(csv.format_row(["a", "b c", "d;e"]), "a,b c,d;e")
+    assert_eq(csv.format_row_sep(["a", "d;e"], ';'), "a;\"d;e\"")
+}
+
+test "错误" {
+    assert_eq(err_of("a,b\n\"oops"), "CSV 第 2 行：引号没有结束")
+    assert_eq(err_of("a\nb\"c\n"), "CSV 第 2 行：没有用引号括起来的字段里不能有引号")
+    assert_eq(err_of("\"x\"y,z"), "CSV 第 1 行：结束的引号后面应该是分隔符或换行")
+    assert_eq(err_of("\"a\nb\nc\"d"), "CSV 第 3 行：结束的引号后面应该是分隔符或换行")
+}
+
+test "写：别的分隔符和单个字段" {
+    assert_eq(csv.format_sep([["a", "b;c"], ["1"]], ';'), "a;\"b;c\"\n1\n")
+    assert_eq(csv.format_field("x,y", ','), "\"x,y\"")
+    assert_eq(csv.format_field("x;y", ','), "x;y")
+    assert_eq(csv.format_field("说\"话", ';'), "\"说\"\"话\"")
+}
+
+test "零列的行" {
+    // CSV 表示不了零列的行：写成空行，读回来是一个空字段
+    empty: [str] = []
+    assert_eq(csv.format([empty.copy()]), "\n")
+    assert(rows(csv.format([empty.copy()])) == [[""]])
+    assert_eq(csv.format([["a"], empty, ["b"]]), "a\n\nb\n")
+    assert(rows("a\n\nb\n") == [["a"], [""], ["b"]])
+    none: [[str]] = []
+    assert_eq(csv.format(none), "")
+    assert_eq(len(rows("")), 0)
+}

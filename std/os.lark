@@ -1,0 +1,480 @@
+// Lark 标准库 · 文件、目录、环境变量和子进程（用 Lark 自己写，底下是 try_* 等内置函数）
+// 用法：import "std/os"
+//
+//   text = os.read("a.txt")?                  // str!
+//   os.write("b.txt", text)?                  // ()!；os.append 追加到末尾
+//   if os.is_file(p) { … }                    // os.exists、os.is_dir
+//   info = os.stat(p)?                        // info.size、info.mtime_ms、info.is_dir、info.mode（权限，0o755 这样）
+//   os.chmod(p, 0o755)?                       // 改权限；os.lstat(p)? 看符号链接本身（info.is_symlink）
+//   os.symlink("a.txt", "b")?、os.read_link("b")?   // 新建符号链接 / 读出链接里写的路径
+//   os.hard_link("a.txt", "c")?、os.set_mtime(p, info.mtime_ms)?  // 硬链接 / 改修改时间（毫秒）
+//   for name in os.read_dir(".")? { … }           // 目录里的名字，按字节序排好，不含 . 和 ..
+//   os.mkdir_all("out/a/b")?                  // 连同上级目录一起创建；os.mkdir 只建一层
+//   os.remove(p)?、os.remove_all(dir)?、os.rename(a, b)?
+//   home = os.env("HOME")                     // str?；os.env("LANG") ?? "C"
+//   out = os.shell_output("ls")?                   // 命令的标准输出；退出码不为 0 时是错误
+//   code = os.shell("make")                     // 退出码
+//   p = os.join_path("out", "a.txt")、os.base(p)、os.dir(p)、os.ext(p)、os.stem(p)、os.with_ext(p, ".md")
+//   os.clean("a/./b/../c")、os.rel("a/b", "a/c")（str?）、os.is_abs(p)   // 只按字面算，不访问文件系统
+//   for f in os.glob("src/**/*.lark")? { … }  // os.glob_match("*.txt", name)；os.walk(dir)? 是所有文件
+//   os.temp_dir()                             // $TMPDIR，没有时 /tmp；os.exe_path()? 是当前程序的绝对路径
+//   os.at_exit(|| restore())                  // 进程退出时（正常结束、exit、panic）要做的事
+//
+// 出错信息的格式是 “动作 路径：系统给的原因”，原因由系统给出（可能是英文）。
+// 路径用 / 分隔；文件名里有换行时 os.read_dir 会把它切开。
+import "sort"
+import "str"
+import "fmt"
+
+extern "c" {
+    fn lark_exe_path() -> str
+    fn lark_at_exit(f: Fn() -> ())
+    fn lark_stat_info(path: str, follow: c_int) -> str
+    fn lark_chmod(path: str, mode: int) -> c_int
+    fn lark_read_link(path: str) -> str
+    fn lark_symlink(target: str, link: str) -> c_int
+    fn lark_hard_link(existing: str, new_path: str) -> c_int
+    fn lark_set_mtime(path: str, ms: int) -> c_int
+    fn strerror(e: c_int) -> str
+}
+
+// ---------- 文件 ----------
+
+pub fn read(path: str) -> str! { try_read_file(path) }
+
+pub fn write(path: str, text: str) -> ()! {
+    _r = try_write_file(path, text)?
+}
+
+pub fn append(path: str, text: str) -> ()! {
+    _r = try_append_file(path, text)?
+}
+
+// exists、is_file、is_dir 只回答是或不是：查不了（没有权限、链接成环等）也是 false，和 Python 的 os.path.exists 一样。
+// 要分清“不存在”和“出错了”时用 stat / lstat，它们返回错误
+pub fn exists(path: str) -> bool { file_kind(path) != 0 }
+
+pub fn is_file(path: str) -> bool { file_kind(path) == 1 }
+
+pub fn is_dir(path: str) -> bool { file_kind(path) == 2 }
+
+// 文件的信息
+pub type FileInfo {
+    pub is_file: bool       // 普通文件
+    pub is_dir: bool
+    pub is_symlink: bool    // 符号链接：只有 lstat 会得到 true（stat 按它指向的东西算）
+    pub size: int           // 字节数
+    pub mtime_ms: int       // 最后修改的时间，从 1970 年起的毫秒数
+    pub mode: int           // 权限位，0o7777 以内：0o644、0o755，再加上 setuid 等（0o4000、0o2000、0o1000）
+}
+
+// 符号链接按它指向的东西算（Go 的 os.Stat、Rust 的 fs::metadata）。路径不存在、没有权限时是错误
+pub fn stat(path: str) -> FileInfo! { stat_info(path, 1) }
+
+// 看符号链接本身，不跟过去（Go 的 os.Lstat、Rust 的 fs::symlink_metadata）。不是链接时和 stat 一样
+pub fn lstat(path: str) -> FileInfo! { stat_info(path, 0) }
+
+fn stat_info(path: str, follow: int) -> FileInfo! {
+    raw = lark_stat_info(path, follow)
+    if byte_at(raw, 0) == '-' { return Err("无法读取文件信息 #{path}：#{errno_text(raw)}") }
+    // "+种类 大小 修改时间 权限"，由运行时写出，格式总是对的
+    f = str.split(slice(raw, 1, len(raw)), " ")
+    kind = try_parse_int(f[0]) ?? 0
+    Ok(FileInfo(is_file: kind == 1, is_dir: kind == 2, is_symlink: kind == 3, size: try_parse_int(f[1]) ?? 0,
+        mtime_ms: try_parse_int(f[2]) ?? 0, mode: try_parse_int(f[3]) ?? 0))
+}
+
+// 改权限位（0o7777 以内），不改文件的种类。符号链接改的是它指向的文件
+pub fn chmod(path: str, mode: int) -> ()! {
+    e = lark_chmod(path, mode)
+    if e != 0 { return Err("无法修改权限 #{path}：#{strerror(e)}") }
+    Ok()
+}
+
+// 新建符号链接 link，里面写的是 target（原样保存；target 可以是相对路径，也可以还不存在）。link 已经存在时是错误
+pub fn symlink(target: str, link: str) -> ()! {
+    e = lark_symlink(target, link)
+    if e != 0 { return Err("无法新建符号链接 #{link}：#{strerror(e)}") }
+    Ok()
+}
+
+// 新建硬链接 new_path：和 existing 是同一个文件（改一个另一个也变，删掉一个另一个还在）。
+// existing 不能是目录；new_path 已经存在、两个路径不在同一个文件系统上时是错误
+pub fn hard_link(existing: str, new_path: str) -> ()! {
+    e = lark_hard_link(existing, new_path)
+    if e != 0 { return Err("无法新建硬链接 #{new_path}：#{strerror(e)}") }
+    Ok()
+}
+
+// 改最后修改的时间，ms 和 FileInfo.mtime_ms 一样是从 1970 年起的毫秒数；访问时间不变。
+// 符号链接改的是它指向的文件。解开归档、复制文件以后用它恢复原来的时间
+pub fn set_mtime(path: str, ms: int) -> ()! {
+    e = lark_set_mtime(path, ms)
+    if e != 0 { return Err("无法修改时间 #{path}：#{strerror(e)}") }
+    Ok()
+}
+
+// 符号链接里写的路径（原样，不解析成绝对路径）；path 不是符号链接时是错误
+pub fn read_link(path: str) -> str! {
+    raw = lark_read_link(path)
+    if byte_at(raw, 0) == '-' { return Err("无法读取符号链接 #{path}：#{errno_text(raw)}") }
+    Ok(slice(raw, 1, len(raw)))
+}
+
+// 运行时返回的 "-errno" 换成系统给的原因
+fn errno_text(raw: str) -> str { strerror(try_parse_int(slice(raw, 1, len(raw))) ?? 0) }
+
+pub fn rename(from: str, to: str) -> ()! {
+    _r = try_rename(from, to)?
+}
+
+// 删除文件或空目录
+pub fn remove(path: str) -> ()! {
+    _r = try_remove(path)?
+}
+
+// 删除文件，或者连同里面的东西一起删除目录；路径不存在时什么都不做。
+// 符号链接只删链接本身，不进它指向的目录（和 Go 的 os.RemoveAll 一样）
+pub fn remove_all(path: str) -> ()! {
+    info = match take lstat(path) {
+        Ok(i) => i
+        Err(_) => return Ok()
+    }
+    if info.is_dir {
+        names = read_dir(path)?
+        for n in names {
+            remove_all(join_path(path, n))?
+        }
+    }
+    remove(path)
+}
+
+// ---------- 目录 ----------
+
+pub fn read_dir(path: str) -> [str]! {
+    raw = try_list_dir(path)?
+    names: [str] = []
+    start = 0
+    for i in 0..len(raw) {
+        if byte_at(raw, i) == '\n' {
+            names.push(slice(raw, start, i))
+            start = i + 1
+        }
+    }
+    sort.sort(&names)
+    Ok(names)
+}
+
+pub fn mkdir(path: str) -> ()! {
+    _r = try_mkdir(path)?
+}
+
+// 依次创建每一级还不存在的目录；已经是目录时什么都不做
+pub fn mkdir_all(path: str) -> ()! {
+    if is_dir(path) { return Ok() }
+    up = dir(path)
+    if up != path && up != "." && up != "/" {
+        mkdir_all(up)?
+    }
+    if is_dir(path) { return Ok() }
+    mkdir(path)
+}
+
+pub fn cwd() -> str! { try_cwd() }
+
+// ---------- 路径 ----------
+
+// 用 / 连接两段；b 以 / 开头（绝对路径）时就是 b
+pub fn join_path(a: str, b: str) -> str {
+    if a == "" || (len(b) > 0 && byte_at(b, 0) == '/') { return b }
+    if byte_at(a, len(a) - 1) == '/' { a + b } else { a + "/" + b }
+}
+
+// 去掉末尾的 /（根目录 / 除外）
+fn strip_slash(p: str) -> str {
+    j = len(p)
+    for j > 1 && byte_at(p, j - 1) == '/' { j -= 1 }
+    slice(p, 0, j)
+}
+
+fn last_slash(p: str) -> int {
+    k = len(p) - 1
+    for k >= 0 && byte_at(p, k) != '/' { k -= 1 }
+    k
+}
+
+// 最后一段：base("a/b.txt") 是 "b.txt"，base("a/b/") 是 "b"
+pub fn base(path: str) -> str {
+    p = strip_slash(path)
+    if p == "/" { return p }
+    slice(p, last_slash(p) + 1, len(p))
+}
+
+// 去掉最后一段：dir("a/b.txt") 是 "a"，dir("b.txt") 是 "."，dir("/b") 是 "/"
+pub fn dir(path: str) -> str {
+    p = strip_slash(path)
+    k = last_slash(p)
+    if k < 0 { return "." }
+    if k == 0 { return "/" }
+    strip_slash(slice(p, 0, k))
+}
+
+// 扩展名（含 .）：ext("a/b.tar.gz") 是 ".gz"；没有扩展名、或者是 .bashrc 这样的隐藏文件时是 ""
+pub fn ext(path: str) -> str {
+    b = base(path)
+    k = len(b) - 1
+    for k > 0 && byte_at(b, k) != '.' { k -= 1 }
+    if k <= 0 { "" } else { slice(b, k, len(b)) }
+}
+
+// 去掉扩展名的最后一段：stem("a/b.tar.gz") 是 "b.tar"
+pub fn stem(path: str) -> str {
+    b = base(path)
+    slice(b, 0, len(b) - len(ext(path)))
+}
+
+// 换掉扩展名（e 带 .，给 "" 就是去掉）：with_ext("a/b.txt", ".md") 是 "a/b.md"
+pub fn with_ext(path: str, e: str) -> str {
+    p = strip_slash(path)
+    slice(p, 0, len(p) - len(ext(p))) + e
+}
+
+pub fn is_abs(path: str) -> bool { len(path) > 0 && byte_at(path, 0) == '/' }
+
+// 只按字面整理路径，不访问文件系统：合并多个 /，去掉 . 段，a/.. 互相抵消，末尾不带 /，结果为空时是 "."。
+// 开头多出来的 .. 在相对路径里保留，在绝对路径里丢掉（/.. 就是 /）。
+// clean("a//b/./c/../d/") 是 "a/b/d"，clean("../a/..") 是 ".."，clean("/../x") 是 "/x"。
+// 有符号链接时 a/.. 不一定回到原处，要准确的结果请先解析链接
+pub fn clean(path: str) -> str {
+    abs = is_abs(path)
+    parts: [str] = []
+    pieces = str.split(path, "/")
+    for seg in pieces {
+        if seg == "" || seg == "." { continue }
+        if seg != ".." {
+            parts.push(seg.copy())
+        } else if len(parts) > 0 && parts[len(parts) - 1] != ".." {
+            _up = parts.pop()
+        } else if !abs {
+            parts.push("..")
+        }
+    }
+    out = join(parts, "/")
+    if abs { "/" + out } else if out == "" { "." } else { out }
+}
+
+// 整理过的路径拆成段："/" 和 "." 是空列表
+fn segs(path: str) -> [str] {
+    c = clean(path)
+    out: [str] = []
+    if c == "." || c == "/" { return out }
+    str.split(str.trim_prefix(c, "/"), "/")
+}
+
+// 从 from 走到 to 的相对路径（只按字面算，同 clean）：rel("a/b", "a/c/d") 是 "../c/d"，rel("a", "a") 是 "."。
+// 一个是绝对路径、一个是相对路径，或者 from 里有走不回去的 .. 时是 None
+pub fn rel(from: str, to: str) -> str? {
+    if is_abs(from) != is_abs(to) { return None }
+    a = segs(from)
+    b = segs(to)
+    k = 0
+    for k < len(a) && k < len(b) && a[k] == b[k] { k += 1 }
+    out: [str] = []
+    for i in k..len(a) {
+        if a[i] == ".." { return None }
+        out.push("..")
+    }
+    for i in k..len(b) { out.push(b[i].copy()) }
+    if len(out) == 0 { Some(".") } else { Some(join(out, "/")) }
+}
+
+// ---------- 通配符 ----------
+
+// 名字是否符合通配模式：* 是任意多个字节，? 是一个字节，[abc]、[a-z]、[!a-z]（或 [^a-z]）是字符集，\ 让下一个字节按原样比较；
+// * ? 和字符集都不匹配 /。没有配对 ] 的 [ 按普通字节算
+pub fn glob_match(pat: str, name: str) -> bool {
+    p = 0
+    n = 0
+    star = -1   // 最近一个 * 后面的位置
+    mark = 0    // 那个 * 已经吃到 name 的哪里
+    for n < len(name) {
+        c = byte_at(name, n)
+        q = if p < len(pat) && byte_at(pat, p) != '*' { one(pat, p, c) } else { -1 }
+        if p < len(pat) && byte_at(pat, p) == '*' {
+            p += 1
+            star = p
+            mark = n
+        } else if q >= 0 {
+            p = q
+            n += 1
+        } else if star >= 0 && byte_at(name, mark) != '/' {
+            // 回到最近的 *，让它多吃一个字节再试
+            mark += 1
+            n = mark
+            p = star
+        } else {
+            return false
+        }
+    }
+    for p < len(pat) && byte_at(pat, p) == '*' { p += 1 }
+    p == len(pat)
+}
+
+// 模式第 p 处的一项能否匹配字节 c：能时返回下一项的位置，不能时 -1
+fn one(pat: str, p: int, c: int) -> int {
+    b = byte_at(pat, p)
+    if b == '?' { return if c != '/' { p + 1 } else { -1 } }
+    if b == '\\' && p + 1 < len(pat) { return if byte_at(pat, p + 1) == c { p + 2 } else { -1 } }
+    if b == '[' {
+        e = class_end(pat, p)
+        if e > 0 { return if c != '/' && in_class(pat, p + 1, e, c) { e + 1 } else { -1 } }
+    }
+    if b == c { p + 1 } else { -1 }
+}
+
+// 第 p 处的 [ 配对的 ] 在哪里（紧跟在 [ 或 [! 后面的 ] 是普通字节）；没有时 -1
+fn class_end(pat: str, p: int) -> int {
+    i = p + 1
+    if i < len(pat) && (byte_at(pat, i) == '!' || byte_at(pat, i) == '^') { i += 1 }
+    if i < len(pat) && byte_at(pat, i) == ']' { i += 1 }
+    for i < len(pat) && byte_at(pat, i) != ']' { i += 1 }
+    if i < len(pat) { i } else { -1 }
+}
+
+// 字节 c 在不在 pat[a, e) 写的字符集里
+fn in_class(pat: str, a: int, e: int, c: int) -> bool {
+    neg = byte_at(pat, a) == '!' || byte_at(pat, a) == '^'
+    i = if neg { a + 1 } else { a }
+    hit = false
+    for i < e {
+        lo = byte_at(pat, i)
+        if i + 2 < e && byte_at(pat, i + 1) == '-' {
+            if c >= lo && c <= byte_at(pat, i + 2) { hit = true }
+            i += 3
+        } else {
+            if c == lo { hit = true }
+            i += 1
+        }
+    }
+    hit != neg
+}
+
+fn has_meta(s: str) -> bool {
+    for i in 0..len(s) {
+        b = byte_at(s, i)
+        if b == '*' || b == '?' || b == '[' || b == '\\' { return true }
+    }
+    false
+}
+
+// 按通配模式找文件和目录，结果按字节序排好：glob("src/*.lark")、glob("tests/**/*.out")。
+// 每一段用 glob_match 比较；整段是 ** 时表示任意多层目录（包括零层）。以 . 开头的名字只有模式那一段也以 . 开头时才匹配。
+// 没有匹配时是空列表；读不了目录时是错误。** 不跟符号链接走（和 bash 的 globstar 一样），链接成环也不会走不完；
+// 模式以 ** 结尾时下面的文件和目录都算（"src/**" 是 src 和它下面的全部）
+pub fn glob(pattern: str) -> [str]! {
+    ps: [str] = []
+    pieces = str.split(pattern, "/")
+    for seg in pieces {
+        if seg != "" && seg != "." { ps.push(seg.copy()) }
+    }
+    out: [str] = []
+    if len(ps) == 0 { return Ok(out) }
+    start = if is_abs(pattern) { "/" } else { "" }
+    expand(start, ps, 0, &out)?
+    sort.sort(&out)
+    Ok(out)
+}
+
+// d 是已经对上前 k 段的路径（"" 表示当前目录）
+fn expand(d: str, ps: [str], k: int, inout out: [str]) -> ()! {
+    if k == len(ps) {
+        if d != "" { out.push(d.copy()) }
+        return Ok()
+    }
+    seg = ps[k]
+    last = k + 1 == len(ps)
+    if !has_meta(seg) {
+        p = join_path(d, seg)
+        if is_dir(p) || (last && exists(p)) { expand(p, ps, k + 1, &out)? }
+        return Ok()
+    }
+    here = if d == "" { "." } else { d.copy() }
+    if !is_dir(here) { return Ok() }
+    names = read_dir(here)?
+    if seg == "**" {
+        expand(d, ps, k + 1, &out)?
+        for n in names {
+            if byte_at(n, 0) == '.' { continue }
+            p = join_path(d, n)
+            fi = lstat(p)?
+            if fi.is_dir { expand(p, ps, k, &out)? } else if last { out.push(p) }
+        }
+        return Ok()
+    }
+    for n in names {
+        if byte_at(n, 0) == '.' && byte_at(seg, 0) != '.' { continue }
+        if glob_match(seg, n) {
+            p = join_path(d, n)
+            if last || is_dir(p) { expand(p, ps, k + 1, &out)? }
+        }
+    }
+    Ok()
+}
+
+// 目录下所有的文件（不含目录本身），一层层走下去，路径都以 root 开头；同一层按字节序，先走完一个子目录再走下一个。
+// 以 . 开头的也算。不跟符号链接走（和 Go 的 filepath.WalkDir 一样）：链接本身算一项，所以链接成环也不会走不完。
+// 读不了的目录、查不了信息的条目（没有权限等）是错误，不会当成文件或者跳过
+pub fn walk(root: str) -> [str]! {
+    out: [str] = []
+    walk_into(root, &out)?
+    Ok(out)
+}
+
+fn walk_into(d: str, inout out: [str]) -> ()! {
+    names = read_dir(d)?
+    for n in names {
+        p = join_path(d, n)
+        fi = lstat(p)?
+        if fi.is_dir { walk_into(p, &out)? } else { out.push(p) }
+    }
+    Ok()
+}
+
+// 进程退出时要做的事：main 正常结束、exit(n)、panic 时都会跑，按登记的逆序各跑一次（底下是 C 的 atexit）。
+// 用来恢复终端、删掉临时文件这类“怎么退出都要做”的清理；只管当前块的清理用 defer。
+// f 里再 exit 或 panic 时剩下的不再跑。f 拿到的是闭包创建时捕获的副本（和别的 Fn 一样），要看最新的状态请捕获 Mutex
+pub fn at_exit(f: Fn() -> ()) { lark_at_exit(f) }
+
+// 当前程序的绝对路径（解析过符号链接），比如找和程序放在一起的数据文件：os.join_path(os.dir(os.exe_path()?), "data")
+pub fn exe_path() -> str! {
+    p = lark_exe_path()
+    if p == "" { return Err("查不到当前程序的路径") }
+    Ok(p)
+}
+
+// 放临时文件的目录：$TMPDIR（去掉末尾的 /），没有时是 /tmp
+pub fn temp_dir() -> str {
+    t = env("TMPDIR") ?? ""
+    if t == "" { "/tmp" } else { strip_slash(t) }
+}
+
+// ---------- 环境与进程 ----------
+
+pub fn env(name: str) -> str? {
+    match try_getenv(name) {
+        Ok(v) => Some(v.copy())
+        Err(_) => None
+    }
+}
+
+// 用 sh 运行命令，返回标准输出；标准错误照常显示。命令经过 sh（可以写管道、重定向），参数要自己转义（proc.quote）；
+// 不需要 shell 时用 std/proc：参数直接交给程序
+pub fn shell_output(cmd: str) -> str! { try_capture(cmd) }
+
+// 用 sh 运行命令，返回退出码（被信号终止时为 128 + 信号编号）
+pub fn shell(cmd: str) -> int { run_cmd(cmd) }
+
+// "#{info}"：FileInfo(is_file: true, is_dir: false, is_symlink: false, size: 12, mtime_ms: 1793001120000, mode: 0o644)，和构造它的写法一样
+pub fn show(i: FileInfo) -> str {
+    "FileInfo(is_file: #{i.is_file}, is_dir: #{i.is_dir}, is_symlink: #{i.is_symlink}, size: #{i.size}, mtime_ms: #{i.mtime_ms}, mode: 0o#{fmt.radix(i.mode, 8)})"
+}

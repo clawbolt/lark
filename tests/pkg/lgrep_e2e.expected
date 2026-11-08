@@ -1,0 +1,26 @@
+ok   plain
+ok   number
+ok   ignore_case
+ok   invert_count
+ok   classes
+ok   alt
+ok   stdin
+ok   stdin_dash
+ok   recursive
+ok   files_only
+ok   color
+ok   exit_match
+ok   exit_none
+ok   exit_badpat
+ok   exit_missing
+ok   exit_dir
+ok   exit_badflag
+ok   grep -n fn [a-z_]+\(
+ok   grep -c ^pub fn
+ok   grep -n TODO|FIXME|XXX
+ok   grep -c [0-9]+\.[0-9]+
+ok   grep -ic err
+ok   grep -vc ^ *$
+ok   grep -l lk_[a-z]+_lock
+ok   grep -n "[^"]*\\n"
+ok   grep -c e$

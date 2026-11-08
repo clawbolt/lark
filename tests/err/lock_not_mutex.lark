@@ -1,0 +1,5 @@
+// 期望错误：lock 需要 Mutex[T]
+fn main() {
+    xs = [1, 2]
+    lock xs as v { print("#{len(v)}") }
+}

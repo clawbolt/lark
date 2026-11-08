@@ -1,0 +1,99 @@
+// 一次完整的握手：服务器算出 CertificateVerify 和 Finished，客户端核对后交给状态机（tls/client）。
+// 先证明再写：对应 formal/Lark/Session.lean，函数和定义一一对应：
+//   View、th1 / th_cert / th_cv / th2、c_hs / s_hs / c_ap / s_ap、keys_of（keyOf / ivOf）、
+//   cv_msg / cv_ok / sfin_msg / cfin_msg、server_flight、client_events、server_accepts。
+// 证明了：两边共享秘密一样、签了再验通过时，客户端走到 Connected、服务器接受客户端的 Finished、两边的应用密钥一样
+// （honest、honest_data）；按格式写的 CertificateVerify 签名验证得过客户端就认（cvOk_cvMsg）；
+// CertificateVerify 验证不过或服务器的 Finished 对不上时走不到 Connected（bad_cv、bad_fin）。
+// CertificateVerify 是 Ed25519 签名（0x0807，RFC 8446 第 4.4.3 节）。客户端的公钥现在是事先知道的（钉住的公钥），
+// 从证书里取公钥、验证证书链是阶段 4b。消息都是完整的握手消息（含 4 字节的头）。实验性：没有经过审计
+import "std/digest"
+import "tls/client"
+import "tls/ed25519"
+import "tls/record"
+import "tls/schedule"
+
+pub const ED25519_SCHEME = 0x0807
+
+// 一方看到的握手消息，加上它自己用 X25519 算出来的共享秘密
+pub type View {
+    pub ch: [u8]
+    pub sh: [u8]
+    pub ee: [u8]
+    pub cert: [u8]
+    pub cv: [u8]
+    pub sfin: [u8]
+    pub shared: [u8]
+}
+
+fn hash_of(parts: [[u8]]) -> [u8] {
+    all: [u8] = []
+    for p in parts {
+        for x in p { all.push(x) }
+    }
+    digest.sha256(all)
+}
+
+pub fn th1(v: View) -> [u8] { hash_of([v.ch.copy(), v.sh.copy()]) }
+// CertificateVerify 覆盖到 Certificate
+pub fn th_cert(v: View) -> [u8] { hash_of([v.ch.copy(), v.sh.copy(), v.ee.copy(), v.cert.copy()]) }
+// 服务器的 Finished 覆盖到 CertificateVerify
+pub fn th_cv(v: View) -> [u8] { hash_of([v.ch.copy(), v.sh.copy(), v.ee.copy(), v.cert.copy(), v.cv.copy()]) }
+// 客户端的 Finished 和应用流量密钥覆盖到服务器的 Finished
+pub fn th2(v: View) -> [u8] {
+    hash_of([v.ch.copy(), v.sh.copy(), v.ee.copy(), v.cert.copy(), v.cv.copy(), v.sfin.copy()])
+}
+
+pub fn c_hs(v: View) -> [u8] { schedule.secret(schedule.handshake(v.shared), "c hs traffic", th1(v)) }
+pub fn s_hs(v: View) -> [u8] { schedule.secret(schedule.handshake(v.shared), "s hs traffic", th1(v)) }
+pub fn c_ap(v: View) -> [u8] { schedule.secret(schedule.master(schedule.handshake(v.shared)), "c ap traffic", th2(v)) }
+pub fn s_ap(v: View) -> [u8] { schedule.secret(schedule.master(schedule.handshake(v.shared)), "s ap traffic", th2(v)) }
+
+// ChaCha20-Poly1305：32 字节密钥、12 字节 IV
+pub fn keys_of(s: [u8]) -> schedule.Keys { schedule.traffic(s, 32) }
+
+// CertificateVerify（类型 15）：0x0807 + 签名（2 字节长度），签的是 cv_content（到 Certificate 为止的摘要）
+pub fn cv_msg(sk: [u8], v: View) -> [u8] {
+    body: [u8] = []
+    record.push_be(&body, 2, ED25519_SCHEME)
+    for x in record.frame(2, ed25519.sign(sk, ed25519.cv_content(true, th_cert(v)))) { body.push(x) }
+    record.hs_msg(15, body)
+}
+
+// 客户端核对 CertificateVerify：类型 15、后面没有多的、算法是 0x0807、签名验证得过（cvOk）
+pub fn cv_ok(pk: [u8], v: View) -> bool {
+    m = match take record.hs_parse(v.cv, 0) {
+        Ok(m) => m
+        Err(_) => { return false }
+    }
+    if m.kind != 15 || m.next != len(v.cv) || len(m.body) < 2 { return false }
+    if record.read_be(m.body, 0, 2) != ED25519_SCHEME { return false }
+    sig = match take record.unframe(2, m.body, 2) {
+        Ok(p) => p
+        Err(_) => { return false }
+    }
+    if sig.next != len(m.body) { return false }
+    ed25519.verify(pk, ed25519.cv_content(true, th_cert(v)), sig.body)
+}
+pub fn sfin_msg(v: View) -> [u8] { record.hs_msg(20, schedule.finished(s_hs(v), th_cv(v))) }
+pub fn cfin_msg(v: View) -> [u8] { record.hs_msg(20, schedule.finished(c_hs(v), th2(v))) }
+
+// 服务器：前四条消息和共享秘密已经有了，用 Ed25519 私钥 sk 算出 CertificateVerify 和 Finished
+pub fn server_flight(sk: [u8], ch: [u8], sh: [u8], ee: [u8], cert: [u8], shared: [u8]) -> View {
+    v = View(ch: ch.copy(), sh: sh.copy(), ee: ee.copy(), cert: cert.copy(), cv: [], sfin: [], shared: shared.copy())
+    cvm = cv_msg(sk, v)
+    v.cv = cvm
+    fin = sfin_msg(v)
+    v.sfin = fin
+    v
+}
+
+// 客户端：用服务器的 Ed25519 公钥 pk 核对 CertificateVerify，再核对服务器的 Finished（常数时间比较），得到给状态机的事件
+pub fn client_events(pk: [u8], v: View) -> [client.Ev] {
+    cv = if cv_ok(pk, v) { client.CV } else { client.Other }
+    fin = if digest.equal(v.sfin, sfin_msg(v)) { client.Fin } else { client.Other }
+    [client.SendCH, client.SH, client.EE, client.Cert, cv, fin]
+}
+
+// 服务器核对客户端的 Finished
+pub fn server_accepts(v: View, cfin: [u8]) -> bool { digest.equal(cfin, cfin_msg(v)) }

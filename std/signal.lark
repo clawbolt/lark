@@ -1,0 +1,67 @@
+// Lark 标准库 · 信号（用 Lark 自己写，底下是运行时里的 self-pipe）
+// 用法：import "std/signal"
+//
+//   sigs = signal.notify([signal.INT, signal.TERM])?   // 先登记：这两个信号不再直接结束程序
+//   n = sigs.wait()?                                   // 等到其中一个来，返回它的编号
+//   print("收到 #{signal.name(n)}")                    // "SIGINT"、"SIGTERM"
+//
+// 服务的写法：在说“准备好了”之前 notify，然后在 scope 里 spawn 一个任务等，等到以后写日志、做收尾、exit(0)。
+// 规则和 Go 的 signal.Notify 一样：登记以后的信号只送到 wait 这里，直到程序结束。没人在 wait 时来的信号先存着，
+// 下一次 wait 马上返回；同一个信号来几次就返回几次。任务在 wait 里挂起，由事件循环叫醒，不占系统线程。
+// 只支持 HUP、INT、QUIT、TERM（编号在 macOS 和 Linux 上相同）；SIGKILL、SIGSTOP 拦不住，SIGSEGV 这类由运行时自己处理（打印调用栈）。
+
+extern "c" {
+    fn lark_signal_watch(sig: c_int) -> c_int
+    fn strerror(e: c_int) -> str
+}
+
+pub const HUP = 1
+pub const INT = 2
+pub const QUIT = 3
+pub const TERM = 15
+
+// 登记过的一组信号；用 wait 等
+pub type Signals {
+    fd: int
+    sigs: [int]
+}
+
+// 从现在起 sigs 里的信号不再按默认的方式结束程序，而是存起来等 wait 来取（Go 的 signal.Notify）。
+// 要在会收到信号之前调用：服务在告诉别人“准备好了”之前登记。sigs 里有不支持的编号时 panic（调用方写错了）
+pub fn notify(sigs: [int]) -> Signals! {
+    if len(sigs) == 0 { panic("signal.notify：没有给要接收的信号") }
+    fd = -1
+    for s in sigs {
+        if s != HUP && s != INT && s != QUIT && s != TERM { panic("signal.notify：不支持信号 #{s}（只有 HUP、INT、QUIT、TERM）") }
+        r = lark_signal_watch(s)
+        if r < 0 { return Err("无法接收信号 #{name(s)}：#{strerror(0 - r)}") }
+        fd = r
+    }
+    Ok(Signals(fd: fd, sigs: sigs.copy()))
+}
+
+// 等到 s 里的一个信号来，返回它的编号。别的 notify 登记过、但不在 s 里的信号丢掉，接着等
+pub fn wait(s: Signals) -> int! {
+    got = -1
+    for got < 0 {
+        b = try_fd_read(s.fd, 1)?
+        if b == "" { return Err("无法接收信号：管道被关闭了") }
+        n = byte_at(b, 0)
+        for x in s.sigs {
+            if x == n { got = n }
+        }
+    }
+    Ok(got)
+}
+
+// "#{s}"：Signals(SIGINT, SIGTERM)
+pub fn show(s: Signals) -> str {
+    ns: [str] = []
+    for x in s.sigs { ns.push(name(x)) }
+    "Signals(" + join(ns, ", ") + ")"
+}
+
+// 信号的名字："SIGINT"；不认识的写成 "信号 N"
+pub fn name(sig: int) -> str {
+    if sig == HUP { "SIGHUP" } else if sig == INT { "SIGINT" } else if sig == QUIT { "SIGQUIT" } else if sig == TERM { "SIGTERM" } else { "信号 #{sig}" }
+}

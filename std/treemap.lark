@@ -1,0 +1,270 @@
+// Lark 标准库 · 有序表 TreeMap[K, V]（AVL 树，用 Lark 自己写；先证明再写，见 formal/Lark/TreeMap.lean）
+// 用法：import "std/treemap"
+//
+//   m: treemap.TreeMap[str, int] = treemap.new()
+//   m.insert("b", 2)               // 已有这个键时换成新值（键保留原来的）
+//   n = m.get("b") ?? 0            // V?：值的副本
+//   m.remove("b")                  // V?：原来的值
+//   for (k, v) in m { … }          // 借用 m，按键从小到大，每轮复制一对键值
+//   m.first_key_value()            // (K, V)?：最小的键和它的值；last_key_value 是最大的
+//   m.at(i)                        // (K, V)?：按键排第 i 的一对（0 起）
+//
+// 键要满足 Ord（int / float / str / 定义了 fn cmp 的类型）；两个键谁也不比谁小就是同一个键。
+// insert、get、remove、at 都是 O(log n)；for in 每轮 O(log n)，to_list 一共 O(n)。
+// 和哈希表 std/map 的区别：按键的大小遍历（不是插入顺序），可以按名次取，不需要 hash。
+//
+// 每个节点存子树的高度和大小。节点叫 Tip / Bin，照 Haskell 的 Data.Map。下面的函数和
+// formal/Lark/TreeMap.lean 一一对应：make_node = mk，rebalance = bal，rotate_right / rotate_left = rotR / rotL，
+// insert_node = ins，find_node = get，split_min = sm，remove_node = del，at_node = at?。证明了：
+// 任何时候左右子树高度差不超过 1、中序按键严格递增；insert 之后 get k 是新值、别的键不变；
+// remove 之后 get k 是 None、别的键不变；at i 是中序的第 i 项。
+
+enum Tree[K, V] {
+    Tip
+    Bin(l: Tree[K, V], k: K, v: V, r: Tree[K, V], h: int, s: int)   // h：高度，s：节点个数
+}
+
+pub type TreeMap[K, V] {
+    root: Tree[K, V]
+}
+
+// 空表
+pub fn new[K, V]() -> TreeMap[K, V] {
+    t: Tree[K, V] = Tip
+    TreeMap(root: t)
+}
+
+// 放进 k → v；已有这个键时换成新值（键保留原来的）。O(log n)
+pub fn insert[K: Ord, V](inout m: TreeMap[K, V], take k: K, take v: V) {
+    t = take_root(&m)
+    m.root = insert_node(t, k, v)
+}
+
+// k 对应的值的副本，没有这个键时返回 None。O(log n)
+pub fn get[K: Ord, V](m: TreeMap[K, V], k: K) -> V? { find_node(m.root, k) }
+
+// 有没有 k 这个键。O(log n)
+pub fn contains_key[K: Ord, V](m: TreeMap[K, V], k: K) -> bool {
+    match find_node(m.root, k) {
+        Some(_) => true
+        None => false
+    }
+}
+
+// 删掉 k，返回它原来的值（没有这个键时返回 None，表不变）。O(log n)
+pub fn remove[K: Ord, V](inout m: TreeMap[K, V], k: K) -> V? {
+    out: V? = None
+    t = take_root(&m)
+    m.root = remove_node(t, k, &out)
+    out
+}
+
+// 删掉所有键
+pub fn clear[K, V](inout m: TreeMap[K, V]) {
+    t: Tree[K, V] = Tip
+    m.root = t
+}
+
+// 是不是空表
+pub fn is_empty[K, V](m: TreeMap[K, V]) -> bool { size(m.root) == 0 }
+
+// len(m)：键的个数
+pub fn iter_len[K, V](m: TreeMap[K, V]) -> int { size(m.root) }
+
+// 按键排第 i 的一对的副本（0 起）；i < 0 或 i >= len(m) 时返回 None。O(log n)
+pub fn at[K, V](m: TreeMap[K, V], i: int) -> (K, V)? { at_node(m.root, i) }
+
+// for (k, v) in m 用：和 at 一样，越界时 panic（和列表下标一样）
+pub fn iter_at[K, V](m: TreeMap[K, V], i: int) -> (K, V) {
+    match take at_node(m.root, i) {
+        Some(p) => p
+        None => panic("treemap.iter_at：下标 #{i} 超出范围（共 #{size(m.root)} 项）")
+    }
+}
+
+// 最小的键和它的值（副本），空表时返回 None
+pub fn first_key_value[K, V](m: TreeMap[K, V]) -> (K, V)? { at_node(m.root, 0) }
+
+// 最大的键和它的值（副本），空表时返回 None
+pub fn last_key_value[K, V](m: TreeMap[K, V]) -> (K, V)? { at_node(m.root, size(m.root) - 1) }
+
+// 按键从小到大的所有键值对（复制一份）
+pub fn to_list[K, V](m: TreeMap[K, V]) -> [(K, V)] {
+    out: [(K, V)] = []
+    collect_node(m.root, &out)
+    out
+}
+
+// "#{m}"：{"a": 1, "b": 2}，按键从小到大；键和值的写法和列表里的元素一样（字符串加引号）
+pub fn show[K, V](m: TreeMap[K, V]) -> str {
+    parts: [str] = []
+    for (k, v) in to_list(m) { parts.push("#{elem(k)}: #{elem(v)}") }
+    "{" + join(parts, ", ") + "}"
+}
+
+// 一个值放在容器里时的写法（和 std/map 一样）
+fn elem[T](x: T) -> str {
+    s = "#{[x.copy()]}"
+    slice(s, 1, len(s) - 1)
+}
+
+// ---------- 树（和 formal/Lark/TreeMap.lean 一一对应） ----------
+
+fn take_root[K, V](inout m: TreeMap[K, V]) -> Tree[K, V] {
+    e: Tree[K, V] = Tip
+    replace(&m.root, e)
+}
+
+fn height[K, V](t: Tree[K, V]) -> int {
+    match t {
+        Tip => 0
+        Bin(_, _, _, _, h, _) => h
+    }
+}
+
+fn size[K, V](t: Tree[K, V]) -> int {
+    match t {
+        Tip => 0
+        Bin(_, _, _, _, _, s) => s
+    }
+}
+
+// 接成一个节点，算好高度和大小
+fn make_node[K, V](take l: Tree[K, V], take k: K, take v: V, take r: Tree[K, V]) -> Tree[K, V] {
+    hl = height(l)
+    hr = height(r)
+    h = if hl > hr { hl + 1 } else { hr + 1 }
+    s = size(l) + size(r) + 1
+    Bin(l, k, v, r, h, s)
+}
+
+// 左边比右边高 2：左孩子的左边不比右边矮时单旋，否则双旋
+fn rotate_right[K, V](take l: Tree[K, V], take k: K, take v: V, take r: Tree[K, V]) -> Tree[K, V] {
+    match take l {
+        Bin(ll, lk, lv, lr, _, _) => {
+            if height(lr) <= height(ll) { return make_node(ll, lk, lv, make_node(lr, k, v, r)) }
+            match take lr {
+                Bin(lrl, lrk, lrv, lrr, _, _) => make_node(make_node(ll, lk, lv, lrl), lrk, lrv, make_node(lrr, k, v, r))
+                Tip => {
+                    e: Tree[K, V] = Tip
+                    make_node(make_node(ll, lk, lv, e), k, v, r)
+                }
+            }
+        }
+        Tip => {
+            e: Tree[K, V] = Tip
+            make_node(e, k, v, r)
+        }
+    }
+}
+
+// 右边比左边高 2，和 rotate_right 对称
+fn rotate_left[K, V](take l: Tree[K, V], take k: K, take v: V, take r: Tree[K, V]) -> Tree[K, V] {
+    match take r {
+        Bin(rl, rk, rv, rr, _, _) => {
+            if height(rl) <= height(rr) { return make_node(make_node(l, k, v, rl), rk, rv, rr) }
+            match take rl {
+                Bin(rll, rlk, rlv, rlr, _, _) => make_node(make_node(l, k, v, rll), rlk, rlv, make_node(rlr, rk, rv, rr))
+                Tip => {
+                    e: Tree[K, V] = Tip
+                    make_node(l, k, v, make_node(e, rk, rv, rr))
+                }
+            }
+        }
+        Tip => {
+            e: Tree[K, V] = Tip
+            make_node(l, k, v, e)
+        }
+    }
+}
+
+// 两边高度差不超过 2 时接起来并恢复平衡
+fn rebalance[K, V](take l: Tree[K, V], take k: K, take v: V, take r: Tree[K, V]) -> Tree[K, V] {
+    hl = height(l)
+    hr = height(r)
+    if hr + 1 < hl { return rotate_right(l, k, v, r) }
+    if hl + 1 < hr { return rotate_left(l, k, v, r) }
+    make_node(l, k, v, r)
+}
+
+fn insert_node[K: Ord, V](take t: Tree[K, V], take k: K, take v: V) -> Tree[K, V] {
+    match take t {
+        Tip => {
+            a: Tree[K, V] = Tip
+            b: Tree[K, V] = Tip
+            Bin(a, k, v, b, 1, 1)
+        }
+        Bin(l, a, b, r, h, s) => {
+            if k < a { return rebalance(insert_node(l, k, v), a, b, r) }
+            if a < k { return rebalance(l, a, b, insert_node(r, k, v)) }
+            Bin(l, a, v, r, h, s)
+        }
+    }
+}
+
+fn find_node[K: Ord, V](t: Tree[K, V], x: K) -> V? {
+    match t {
+        Tip => None
+        Bin(l, a, b, r, _, _) => {
+            if x < a { return find_node(l, x) }
+            if a < x { return find_node(r, x) }
+            Some(b.copy())
+        }
+    }
+}
+
+// 取出 Bin(l, a, b, r) 里最小的一项：返回它和剩下的树
+fn split_min[K, V](take l: Tree[K, V], take a: K, take b: V, take r: Tree[K, V]) -> (K, V, Tree[K, V]) {
+    match take l {
+        Tip => (a, b, r)
+        Bin(ll, la, lb, lr, _, _) => {
+            k, v, rest = split_min(ll, la, lb, lr)
+            (k, v, rebalance(rest, a, b, r))
+        }
+    }
+}
+
+fn remove_node[K: Ord, V](take t: Tree[K, V], x: K, inout out: V?) -> Tree[K, V] {
+    match take t {
+        Tip => {
+            e: Tree[K, V] = Tip
+            e
+        }
+        Bin(l, a, b, r, _, _) => {
+            if x < a { return rebalance(remove_node(l, x, &out), a, b, r) }
+            if a < x { return rebalance(l, a, b, remove_node(r, x, &out)) }
+            out = Some(b)
+            match take r {
+                Tip => l
+                Bin(rl, ra, rb, rr, _, _) => {
+                    k, v, rest = split_min(rl, ra, rb, rr)
+                    rebalance(l, k, v, rest)
+                }
+            }
+        }
+    }
+}
+
+// 中序第 i 项的副本（用子树大小往下找）
+fn at_node[K, V](t: Tree[K, V], i: int) -> (K, V)? {
+    match t {
+        Tip => None
+        Bin(l, a, b, r, _, _) => {
+            n = size(l)
+            if i < n { return at_node(l, i) }
+            if i == n { return Some((a.copy(), b.copy())) }
+            at_node(r, i - n - 1)
+        }
+    }
+}
+
+fn collect_node[K, V](t: Tree[K, V], inout out: [(K, V)]) {
+    match t {
+        Tip => {}
+        Bin(l, a, b, r, _, _) => {
+            collect_node(l, &out)
+            out.push((a.copy(), b.copy()))
+            collect_node(r, &out)
+        }
+    }
+}

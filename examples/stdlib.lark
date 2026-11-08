@@ -1,0 +1,64 @@
+// std/set、std/sort 和 std/str 新增的函数（需要 lark1 及以后的版本）
+// 编译：lark1 examples/stdlib.lark -o out.c
+import "std/set"
+import "std/sort"
+import "std/str"
+
+type Person {
+    name: str
+    age: int
+}
+
+fn main() {
+    a = set.of([1, 2, 3, 4])
+    b = set.of([3, 4, 5])
+    u = set.union(a, b)
+    i = set.intersection(a, b)
+    d = set.difference(a, b)
+    print("并集 #{u.to_list()}，交集 #{i.to_list()}，差集 #{d.to_list()}")
+
+    seen: set.Set[str] = set.new()
+    ws = str.words("to be or not to be")
+    dup: [str] = []
+    for w in ws {
+        if seen.contains(w) {
+            dup.push(w.copy())
+        } else {
+            seen.insert(w.copy())
+        }
+    }
+    print("出现过的词：#{seen.to_list()}，重复的：#{dup}")
+    removed = seen.remove("or")
+    print("删掉 or：#{removed}，还剩 #{len(seen)} 个")
+
+    xs = [5, 3, 8, 1, 9, 2]
+    sort.sort(&xs)
+    print("排序：#{xs}")
+    back = sort.reversed(xs.copy())
+    print("倒序：#{back}")
+    fruits = sort.sorted(["pear", "apple", "fig"])
+    print("字符串排序：#{fruits}")
+    people = [
+        Person(name: "甲", age: 30),
+        Person(name: "乙", age: 25),
+        Person(name: "丙", age: 30),
+        Person(name: "丁", age: 20)
+    ]
+    by_age = sort.sorted_by(people, |p, q| p.age - q.age)
+    names: [str] = []
+    for p in by_age { names.push(p.name.copy()) }
+    print("按年龄（稳定）：#{names}")
+    lo = sort.min_of(xs)
+    hi = sort.max_of(xs)
+    ok = sort.is_sorted(xs)
+    print("最小 #{lo}，最大 #{hi}，有序：#{ok}")
+
+    print(str.repeat("ab", 3))
+    print(str.replace_all("a-b-c", "-", " + "))
+    print(str.to_upper("Lark 语言"))
+    print(str.pad_start("7", 3, "0"))
+    c = str.contains("hello", "ell")
+    print("包含 ell：#{c}")
+    ls = str.lines("第一行\n第二行\n")
+    print("行：#{ls}")
+}

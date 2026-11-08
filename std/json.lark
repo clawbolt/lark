@@ -1,0 +1,535 @@
+// Lark 标准库 · JSON（用 Lark 自己写）
+// 用法：import "std/json"
+//
+//   j = json.parse("{\"name\": \"云雀\", \"tags\": [1, 2]}")?    // Json!，出错时信息里带位置
+//   name = json.get(j, "name")                // Json?（值的副本）；json.at(arr, 0) 按下标取
+//   n = json.as_int(v)                        // int?（只认 Num）；json.as_float(v) 认 Num 和 Float
+//   json.count(j)、json.keys(j)               // 数组的元素个数或对象的键数；对象的所有键
+//   print(json.format(j))                     // 紧凑的一行；json.format_pretty(j) 是缩进两格的多行
+//   json.path(j, "user.tags.0")               // Json?：按路径一层层取；json.path_str / path_int / path_float / path_bool 再按类型读
+//   o = json.object([("n", json.Num(1))])     // 构造对象；json.insert(&o, "k", v) 设置键
+//   print("#{j}")                             // 插值时同 format
+//
+// 数组和对象最多套 512 层（输入可能来自外面，再深就报错而不是栈溢出）；单独的半个代理对（如 \ud83d）算错误。
+// 整数是 Num（int，不丢精度），带小数点或指数的数是 Float；Num(1) 和 Float(1.0) 不相等。字符串里的 \uXXXX（包括代理对）会转成 UTF-8；
+// 输出 Float 时用能原样读回的最短写法，inf 和 nan 写成 null。输出时只转义 " \ 和控制字符，其它字符原样输出。对象按出现顺序保存键；重复的键 get 取最后一个。
+
+pub enum Json {
+    Null
+    Bool(b: bool)
+    Num(n: int)         // 整数
+    Float(x: float)     // 带小数点或指数的数，以及超出 int 范围的整数
+    Str(s: str)
+    Arr(items: [Json])
+    Obj(keys: [str], vals: [Json])
+}
+
+// ---------- 读取 ----------
+
+pub fn get(j: Json, key: str) -> Json? {
+    match j {
+        Obj(ks, vals) => {
+            k = len(ks) - 1
+            for k >= 0 {
+                if ks[k] == key { return Some(vals[k].copy()) }
+                k -= 1
+            }
+            None
+        }
+        _ => None
+    }
+}
+
+pub fn at(j: Json, i: int) -> Json? {
+    match j {
+        Arr(items) => if i >= 0 && i < len(items) { Some(items[i].copy()) } else { None }
+        _ => None
+    }
+}
+
+pub fn as_int(j: Json) -> int? {
+    match j {
+        Num(n) => Some(n)
+        _ => None
+    }
+}
+
+// Num 和 Float 都可以读成 float
+pub fn as_float(j: Json) -> float? {
+    match j {
+        Num(n) => Some(to_float(n))
+        Float(x) => Some(x)
+        _ => None
+    }
+}
+
+pub fn as_bool(j: Json) -> bool? {
+    match j {
+        Bool(b) => Some(b)
+        _ => None
+    }
+}
+
+pub fn as_str(j: Json) -> str? {
+    match j {
+        Str(s) => Some(s.copy())
+        _ => None
+    }
+}
+
+// 数组的元素个数或对象的键数；其它为 0
+pub fn count(j: Json) -> int {
+    match j {
+        Arr(items) => len(items)
+        Obj(ks, _) => len(ks)
+        _ => 0
+    }
+}
+
+pub fn keys(j: Json) -> [str] {
+    match j {
+        Obj(ks, _) => ks.copy()
+        _ => []
+    }
+}
+
+pub fn show(j: Json) -> str { format(j) }
+
+// 按路径一层层往里取：段之间用 . 隔开，对象里按键找，数组里按下标找（从 0 开始）。
+// json.path(j, "user.tags.0") 相当于 get(j, "user") → get(…, "tags") → at(…, 0)；"" 是 j 自己。
+// 键里有 . 时用 get 一层层取
+pub fn path(j: Json, p: str) -> Json? {
+    if p == "" { return Some(j.copy()) }
+    walk_path(j, p, 0)
+}
+
+// 按 p[start..] 一段段往下走，中间借着看，只在走到头时复制一次
+fn walk_path(j: Json, p: str, start: int) -> Json? {
+    e = start
+    for e < len(p) && byte_at(p, e) != '.' { e += 1 }
+    seg = slice(p, start, e)
+    last = e == len(p)
+    match j {
+        Obj(ks, vals) => {
+            // 重复的键取最后一个，和 get 一样
+            k = len(ks) - 1
+            for k >= 0 && ks[k] != seg { k -= 1 }
+            if k < 0 { return None }
+            if last { Some(vals[k].copy()) } else { walk_path(vals[k], p, e + 1) }
+        }
+        Arr(items) => {
+            i = try_parse_int(seg) ?? -1
+            if i < 0 || i >= len(items) { return None }
+            if last { Some(items[i].copy()) } else { walk_path(items[i], p, e + 1) }
+        }
+        _ => None
+    }
+}
+
+// 按路径取，再按类型读；路径不存在或者类型不对时是 None
+pub fn path_str(j: Json, p: str) -> str? {
+    match take path(j, p) {
+        Some(v) => as_str(v)
+        None => None
+    }
+}
+
+pub fn path_int(j: Json, p: str) -> int? {
+    match take path(j, p) {
+        Some(v) => as_int(v)
+        None => None
+    }
+}
+
+pub fn path_float(j: Json, p: str) -> float? {
+    match take path(j, p) {
+        Some(v) => as_float(v)
+        None => None
+    }
+}
+
+pub fn path_bool(j: Json, p: str) -> bool? {
+    match take path(j, p) {
+        Some(v) => as_bool(v)
+        None => None
+    }
+}
+
+// ---------- 构造 ----------
+
+// 由键值对组成对象：json.object([("name", json.Str("云雀")), ("n", json.Num(3))])
+pub fn object(pairs: [(str, Json)]) -> Json {
+    ks: [str] = []
+    vals: [Json] = []
+    for kv in pairs {
+        k, v = kv.copy()
+        ks.push(k)
+        vals.push(v)
+    }
+    Obj(ks, vals)
+}
+
+// 在对象里设置键（已经有时改掉最后那个的值，没有时加在后面）；j 不是对象时变成只有这个键的对象
+pub fn insert(inout j: Json, key: str, take v: Json) {
+    k = key_index(j, key)
+    match take replace(&j, Null) {
+        Obj(ks, vs) => {
+            if k >= 0 {
+                vs[k] = v
+            } else {
+                ks.push(key.copy())
+                vs.push(v)
+            }
+            j = Obj(ks, vs)
+        }
+        _ => { j = Obj([key.copy()], [v]) }
+    }
+}
+
+// 对象里最后一个叫 key 的键的位置；没有或者不是对象时 -1
+fn key_index(j: Json, key: str) -> int {
+    match j {
+        Obj(ks, _) => {
+            k = len(ks) - 1
+            for k >= 0 && ks[k] != key { k -= 1 }
+            k
+        }
+        _ => -1
+    }
+}
+
+// ---------- 解析 ----------
+
+type Reader {
+    s: str
+    i: int
+    depth: int      // 现在在几层数组 / 对象里面
+}
+
+pub fn parse(s: str) -> Json! {
+    r = Reader(s: s, i: 0, depth: 0)
+    v = read_value(&r)?
+    skip_ws(&r)
+    if r.i < len(r.s) { return Err(err_at(r, "值后面还有多余的内容")) }
+    Ok(v)
+}
+
+fn err_at(r: Reader, msg: str) -> str {
+    // 按行列报告位置（列按字节数）
+    line = 1
+    col = 1
+    for k in 0..r.i {
+        if byte_at(r.s, k) == '\n' {
+            line += 1
+            col = 1
+        } else {
+            col += 1
+        }
+    }
+    "JSON 第 #{line} 行第 #{col} 列：#{msg}"
+}
+
+fn skip_ws(inout r: Reader) {
+    for r.i < len(r.s) && is_ws(byte_at(r.s, r.i)) { r.i += 1 }
+}
+
+fn is_ws(b: int) -> bool { b == ' ' || b == '\t' || b == '\n' || b == '\r' }
+
+fn peek(r: Reader) -> int { if r.i < len(r.s) { byte_at(r.s, r.i) } else { -1 } }
+
+// 数组和对象最多套这么多层：再深就报错，而不是一直递归到栈溢出（输入可能来自外面）
+const MAX_DEPTH = 512
+
+fn read_value(inout r: Reader) -> Json! {
+    skip_ws(&r)
+    b = peek(r)
+    if b == -1 { return Err(err_at(r, "意外的结尾，需要一个值")) }
+    if b == '{' || b == '[' {
+        if r.depth >= MAX_DEPTH { return Err(err_at(r, "嵌套太深（最多 #{MAX_DEPTH} 层）")) }
+        r.depth += 1
+        v = if b == '{' { read_obj(&r)? } else { read_arr(&r)? }
+        r.depth -= 1
+        return Ok(v)
+    }
+    if b == '"' {
+        s = read_str(&r)?
+        return Ok(Str(s))
+    }
+    if b == '-' || (b >= '0' && b <= '9') { return read_num(&r) }
+    if word(r, "true") {
+        r.i += 4
+        return Ok(Bool(true))
+    }
+    if word(r, "false") {
+        r.i += 5
+        return Ok(Bool(false))
+    }
+    if word(r, "null") {
+        r.i += 4
+        return Ok(Null)
+    }
+    Err(err_at(r, "无法识别的字符 #{from_byte(b)}"))
+}
+
+fn word(r: Reader, w: str) -> bool {
+    r.i + len(w) <= len(r.s) && slice(r.s, r.i, r.i + len(w)) == w
+}
+
+// 数：-?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?。没有小数和指数、又在 int 范围里的是 Num，
+// 其它的是 Float（超出 int 范围的整数也读成 Float）
+fn read_num(inout r: Reader) -> Json! {
+    start = r.i
+    neg = peek(r) == '-'
+    if neg { r.i += 1 }
+    ds = r.i
+    skip_digits(&r)
+    if r.i == ds { return Err(err_at(r, "- 后面需要数字")) }
+    if r.i - ds > 1 && byte_at(r.s, ds) == '0' { return Err(err_at(r, "数不能以 0 开头")) }
+    de = r.i
+    is_float = false
+    if peek(r) == '.' {
+        r.i += 1
+        fs = r.i
+        skip_digits(&r)
+        if r.i == fs { return Err(err_at(r, "小数点后面需要数字")) }
+        is_float = true
+    }
+    if peek(r) == 'e' || peek(r) == 'E' {
+        r.i += 1
+        if peek(r) == '+' || peek(r) == '-' { r.i += 1 }
+        es = r.i
+        skip_digits(&r)
+        if r.i == es { return Err(err_at(r, "指数需要数字")) }
+        is_float = true
+    }
+    if !is_float {
+        match int_of(slice(r.s, ds, de), neg) {
+            Some(n) => return Ok(Num(n))
+            None => {}
+        }
+    }
+    x = parse_float(slice(r.s, start, r.i))
+    if x - x != 0.0 {
+        r.i = start
+        return Err(err_at(r, "数超出 float 的范围"))
+    }
+    Ok(Float(x))
+}
+
+fn skip_digits(inout r: Reader) {
+    for r.i < len(r.s) && byte_at(r.s, r.i) >= '0' && byte_at(r.s, r.i) <= '9' { r.i += 1 }
+}
+
+// 一串数字（格式已检查过）转成 int；超出范围时为 None。用负数累计，最小的 int 也能读
+fn int_of(s: str, neg: bool) -> int? {
+    n = 0
+    for k in 0..len(s) {
+        d = byte_at(s, k) - '0'
+        if n < (-9223372036854775807 - 1 + d) / 10 { return None }
+        n = n * 10 - d
+    }
+    if neg { return Some(n) }
+    if n == -9223372036854775807 - 1 { return None }
+    Some(-n)
+}
+
+fn read_str(inout r: Reader) -> str! {
+    r.i += 1     // 开头的 "
+    out = ""
+    seg = r.i    // 还没拷进 out 的一段的开头
+    for true {
+        if r.i >= len(r.s) { return Err(err_at(r, "字符串没有结束")) }
+        b = byte_at(r.s, r.i)
+        if b == '"' {
+            out += slice(r.s, seg, r.i)
+            r.i += 1
+            return Ok(out)
+        }
+        if b < 32 { return Err(err_at(r, "字符串里不能直接出现控制字符")) }
+        if b == '\\' {
+            out += slice(r.s, seg, r.i)
+            r.i += 1
+            if r.i >= len(r.s) { return Err(err_at(r, "字符串没有结束")) }
+            e = byte_at(r.s, r.i)
+            r.i += 1
+            if e == 'u' {
+                cp = read_hex4(&r)?
+                // 代理对：😀 这样的两个合成一个字符；单独的一半不是合法的字符，转不成 UTF-8，算错误
+                if cp >= 56320 && cp <= 57343 { return Err(err_at(r, "代理对缺少前一半")) }
+                if cp >= 55296 && cp <= 56319 {
+                    if !word(r, "\\u") { return Err(err_at(r, "代理对缺少后一半")) }
+                    r.i += 2
+                    lo = read_hex4(&r)?
+                    if lo < 56320 || lo > 57343 { return Err(err_at(r, "代理对的后一半无效")) }
+                    cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+                }
+                out += utf8(cp)
+            } else {
+                esc = unescape(e)
+                if esc == "" { return Err(err_at(r, "无效的转义 \\#{from_byte(e)}")) }
+                out += esc
+            }
+            seg = r.i
+        } else {
+            r.i += 1
+        }
+    }
+    Err(err_at(r, "字符串没有结束"))
+}
+
+fn unescape(e: int) -> str {
+    if e == '"' { "\"" } else if e == '\\' { "\\" } else if e == '/' { "/" } else if e == 'n' { "\n" } else if e == 't' { "\t" } else if e == 'r' { "\r" } else if e == 'b' { from_byte(8) } else if e == 'f' { from_byte(12) } else { "" }
+}
+
+fn read_hex4(inout r: Reader) -> int! {
+    if r.i + 4 > len(r.s) { return Err(err_at(r, "\\u 后面需要 4 个十六进制数字")) }
+    v = 0
+    for _k in 0..4 {
+        h = hex_val(byte_at(r.s, r.i))
+        if h < 0 { return Err(err_at(r, "\\u 后面需要 4 个十六进制数字")) }
+        v = v * 16 + h
+        r.i += 1
+    }
+    Ok(v)
+}
+
+fn hex_val(b: int) -> int {
+    if b >= '0' && b <= '9' { b - '0' } else if b >= 'a' && b <= 'f' { b - 'a' + 10 } else if b >= 'A' && b <= 'F' { b - 'A' + 10 } else { -1 }
+}
+
+// 码点转 UTF-8
+fn utf8(cp: int) -> str {
+    if cp < 128 {
+        from_byte(cp)
+    } else if cp < 2048 {
+        from_byte(192 + cp / 64) + from_byte(128 + cp % 64)
+    } else if cp < 65536 {
+        from_byte(224 + cp / 4096) + from_byte(128 + cp / 64 % 64) + from_byte(128 + cp % 64)
+    } else {
+        from_byte(240 + cp / 262144) + from_byte(128 + cp / 4096 % 64) + from_byte(128 + cp / 64 % 64) + from_byte(128 + cp % 64)
+    }
+}
+
+fn read_arr(inout r: Reader) -> Json! {
+    r.i += 1
+    items: [Json] = []
+    skip_ws(&r)
+    if peek(r) == ']' {
+        r.i += 1
+        return Ok(Arr(items))
+    }
+    for true {
+        v = read_value(&r)?
+        items.push(v)
+        skip_ws(&r)
+        b = peek(r)
+        if b == ']' {
+            r.i += 1
+            return Ok(Arr(items))
+        }
+        if b != ',' { return Err(err_at(r, "数组里需要 , 或 ]")) }
+        r.i += 1
+    }
+    Err(err_at(r, "数组没有结束"))
+}
+
+fn read_obj(inout r: Reader) -> Json! {
+    r.i += 1
+    ks: [str] = []
+    vals: [Json] = []
+    skip_ws(&r)
+    if peek(r) == '}' {
+        r.i += 1
+        return Ok(Obj(ks, vals))
+    }
+    for true {
+        skip_ws(&r)
+        if peek(r) != '"' { return Err(err_at(r, "对象的键必须是字符串")) }
+        k = read_str(&r)?
+        skip_ws(&r)
+        if peek(r) != ':' { return Err(err_at(r, "键后面需要 :")) }
+        r.i += 1
+        v = read_value(&r)?
+        ks.push(k)
+        vals.push(v)
+        skip_ws(&r)
+        b = peek(r)
+        if b == '}' {
+            r.i += 1
+            return Ok(Obj(ks, vals))
+        }
+        if b != ',' { return Err(err_at(r, "对象里需要 , 或 }")) }
+        r.i += 1
+    }
+    Err(err_at(r, "对象没有结束"))
+}
+
+// ---------- 输出 ----------
+
+pub fn format(j: Json) -> str {
+    match j {
+        Null => "null"
+        Bool(b) => if b { "true" } else { "false" }
+        Num(n) => int_str(n)
+        // JSON 里没有 inf 和 nan，和 JavaScript 一样写成 null
+        Float(x) => if x - x == 0.0 { float_str(x) } else { "null" }
+        Str(s) => quote(s)
+        Arr(items) => {
+            ps: [str] = []
+            for x in items { ps.push(format(x)) }
+            "[" + join(ps, ",") + "]"
+        }
+        Obj(ks, vals) => {
+            ps: [str] = []
+            for k in 0..len(ks) { ps.push(quote(ks[k]) + ":" + format(vals[k])) }
+            "{" + join(ps, ",") + "}"
+        }
+    }
+}
+
+// 缩进两格；空数组、空对象写成 [] 和 {}
+pub fn format_pretty(j: Json) -> str { pretty_at(j, 0) }
+
+fn indent(n: int) -> str {
+    out = ""
+    for _k in 0..n { out += "  " }
+    out
+}
+
+fn pretty_at(j: Json, lv: int) -> str {
+    match j {
+        Arr(items) => {
+            if len(items) == 0 { return "[]" }
+            ps: [str] = []
+            for x in items { ps.push(indent(lv + 1) + pretty_at(x, lv + 1)) }
+            "[\n" + join(ps, ",\n") + "\n" + indent(lv) + "]"
+        }
+        Obj(ks, vals) => {
+            if len(ks) == 0 { return "{}" }
+            ps: [str] = []
+            for k in 0..len(ks) { ps.push(indent(lv + 1) + quote(ks[k]) + ": " + pretty_at(vals[k], lv + 1)) }
+            "{\n" + join(ps, ",\n") + "\n" + indent(lv) + "}"
+        }
+        _ => format(j)
+    }
+}
+
+pub fn quote(s: str) -> str {
+    out = "\""
+    seg = 0
+    for k in 0..len(s) {
+        b = byte_at(s, k)
+        esc = if b == '"' { "\\\"" } else if b == '\\' { "\\\\" } else if b == '\n' { "\\n" } else if b == '\t' { "\\t" } else if b == '\r' { "\\r" } else if b < 32 { "\\u00" + hex2(b) } else { "" }
+        if esc != "" {
+            out += slice(s, seg, k)
+            out += esc
+            seg = k + 1
+        }
+    }
+    out + slice(s, seg, len(s)) + "\""
+}
+
+fn hex2(b: int) -> str {
+    ds = "0123456789abcdef"
+    slice(ds, b / 16, b / 16 + 1) + slice(ds, b % 16, b % 16 + 1)
+}

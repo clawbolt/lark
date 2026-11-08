@@ -1,0 +1,25 @@
+// 修改文档（textDocument/didChange 的增量同步）：把 [s, e) 换成新的文字。
+// 先证明再写：对应 formal/Lark/Lsp.lean 的第 3 部分：edit ↔ edit、change ↔ change。
+// 证明了：长度 = 原来的长度 - (e - s) + 新文字的长度（edit_len、change_len）；空修改不变（edit_noop）；整个替换就是新文字（edit_all）。
+// 下标超出时和模型的 take / drop 一样截到两端。
+import "lsp/pos"
+
+fn clamp(x: int, n: int) -> int {
+    if x < 0 { 0 } else if x > n { n } else { x }
+}
+
+// take s ++ t ++ drop e
+pub fn edit(d: str, s: int, e: int, t: str) -> str {
+    n = len(d)
+    slice(d, 0, clamp(s, n)) + t + slice(d, clamp(e, n), n)
+}
+
+// 范围的两头换成偏移，反过来的范围也按从小到大处理
+pub fn change(enc: pos.Enc, d: str, a: pos.Pos, b: pos.Pos, t: str) -> str {
+    xs = pos.doc(d)
+    oa = pos.off_of(enc, xs, a)
+    ob = pos.off_of(enc, xs, b)
+    lo = if oa < ob { oa } else { ob }
+    hi = if oa < ob { ob } else { oa }
+    edit(d, lo, hi, t)
+}

@@ -1,0 +1,61 @@
+// 可选类型 T? 与两阶段借用（需要 lark1 及以后的版本；stage0 不支持）
+
+type User {
+    name: str
+    email: str?
+}
+
+// 返回 int?：return i 会自动包成 Some(i)
+fn find(users: [User], name: str) -> int? {
+    for i in 0..len(users) {
+        if users[i].name == name { return i }
+    }
+    None
+}
+
+fn email_of(u: User) -> str {
+    u.email ?? "（未填写）"
+}
+
+fn describe(x: int?) -> str {
+    match x {
+        Some(n) => "有值 #{n}"
+        None => "没有值"
+    }
+}
+
+fn append(inout xs: [int], n: int) {
+    xs.push(n)
+}
+
+fn main() {
+    users: [User] = []
+    users.push(User(name: "小林", email: "lin@example.com"))
+    users.push(User(name: "阿青", email: None))
+    for u in users {
+        print("#{u.name}：#{email_of(u)}")
+    }
+    print(describe(find(users, "阿青")))
+    print(describe(find(users, "小王")))
+    print(describe(42))
+    pos = find(users, "小林") ?? -1
+    print("小林的位置：#{pos}")
+
+    // 两阶段借用：其它参数先求值，再以 &xs 传入
+    xs = [1, 2, 3]
+    append(&xs, len(xs))
+    xs.push(xs[0] + xs[1])
+    print("xs 长度 #{len(xs)}")
+
+    // 给已有的 T? 变量赋一个 T：自动包成 Some
+    note: str? = None
+    if len(xs) > 2 { note = "xs 超过 2 个元素" }
+    print(note ?? "无备注")
+
+    // match take：拿走可选值里的结构体
+    maybe: User? = User(name: "临时", email: None)
+    match take maybe {
+        Some(u) => print("拿到 #{u.name}")
+        None => print("空")
+    }
+}

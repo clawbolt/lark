@@ -1,0 +1,30 @@
+// for 里解构元组（需要 lark1 及以后的版本）
+// for (a, b) in xs 把每个元素（元组）拆成几个新变量，_ 表示不要这一项；也能和序号一起用：for i, (a, b) in xs。
+// 拆出来的名字和 for x in xs 的 x 一样是只读的：指向元素内部，不复制；要修改请先 .copy()。
+// 编译：lark1 examples/fortuple.lark -o out.c
+import "std/iter"
+
+fn main() {
+    scores = [("小明", 90), ("小红", 85), ("小刚", 72)]
+    total = 0
+    for (name, s) in scores {
+        print("#{name}：#{s}")
+        total += s
+    }
+    print("总分 #{total}")
+
+    for i, (name, _) in scores {
+        print("第 #{i + 1} 个：#{name}")
+    }
+
+    // 迭代器给出的元组也能拆
+    words = ["一", "二", "三"]
+    for (n, w) in iter.range(1, 10).zip(words.each()) {
+        print("#{n} → #{w}")
+    }
+
+    points = [(0, 0, "原点"), (3, 4, "A")]
+    for (x, y, label) in points {
+        print("#{label}：x² + y² = #{x * x + y * y}")
+    }
+}

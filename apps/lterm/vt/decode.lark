@@ -1,0 +1,91 @@
+// UTF-8 的流式解码：解析器给出的 Print 是一个字节一个字节的，这里拼成字符。程序的输出是一段一段读到的，
+// 一个多字节字符可能被切在两段之间，所以没凑齐的字符先存着（pend）。坏的字节照标准库（std/utf8.lark）的规矩：
+// 不合法的地方每次一个字节，码点 U+FFFD。
+// 先证明再写：对应 formal/Lark/VtUtf8.lean，函数和定义一一对应：
+//   valid_len ↔ Utf8.validLen（从开头起的合法字符占几个字节）、code ↔ Utf8.codeAt、prefix_ok ↔ prefixOk、
+//   settle ↔ settle、feed ↔ feed 的一步、flush ↔ flush
+// 证明了：交出去的字节拼起来再接上存着的，正好是喂进去的全部（settle_join、feed_join）；
+// 存着的要么空、要么是某个合法字符的真前缀、最多 3 个字节（feed_pend、pend_short）；
+// 交出去的每段不空、最多 4 个字节（feed_ne）；码点都合法（decode_valid），屏幕拿到的不会出错。
+// 没证：和 std/utf8 的 code_points 对所有输入都一样（tests.lark 里随机对照）。
+
+pub type Dec {
+    pub pend: str    // 没凑齐的字节：空的，或者某个合法字符的真前缀（最多 3 个字节）
+}
+
+pub fn new() -> Dec { Dec(pend: "") }
+
+fn cont(b: int) -> bool { b >= 0x80 && b <= 0xBF }
+
+// 多字节字符的第二个字节：E0、ED、F0、F4 的范围更窄
+fn second(b0: int, b1: int) -> bool {
+    cont(b1) && (b0 != 0xE0 || b1 >= 0xA0) && (b0 != 0xED || b1 <= 0x9F) && (b0 != 0xF0 || b1 >= 0x90) && (b0 != 0xF4 || b1 <= 0x8F)
+}
+
+// 从开头起的合法字符占几个字节；不合法（形状不对、被截断、过长编码、代理区、超过 U+10FFFF）时是 0（Utf8.validLen）
+pub fn valid_len(s: str) -> int {
+    if len(s) == 0 { return 0 }
+    b0 = byte_at(s, 0)
+    if b0 < 0x80 { return 1 }
+    k = if b0 >= 0xC2 && b0 <= 0xDF { 2 } else if b0 >= 0xE0 && b0 <= 0xEF { 3 } else if b0 >= 0xF0 && b0 <= 0xF4 { 4 } else { 0 }
+    if k == 0 || len(s) < k { return 0 }
+    if !second(b0, byte_at(s, 1)) { return 0 }
+    for j in 2..k {
+        if !cont(byte_at(s, j)) { return 0 }
+    }
+    k
+}
+
+// 开头那个字符的码点：不合法时是 U+FFFD（Utf8.codeAt）
+pub fn code(s: str) -> int {
+    k = valid_len(s)
+    if k == 1 { return byte_at(s, 0) }
+    if k == 2 { return byte_at(s, 0) % 32 * 64 + byte_at(s, 1) % 64 }
+    if k == 3 { return byte_at(s, 0) % 16 * 4096 + byte_at(s, 1) % 64 * 64 + byte_at(s, 2) % 64 }
+    if k == 4 { return byte_at(s, 0) % 8 * 262144 + byte_at(s, 1) % 64 * 4096 + byte_at(s, 2) % 64 * 64 + byte_at(s, 3) % 64 }
+    0xFFFD
+}
+
+// 是某个合法字符的真前缀：再来几个字节还可能凑成合法字符（prefixOk）
+pub fn prefix_ok(s: str) -> bool {
+    n = len(s)
+    if n == 0 || n > 3 { return false }
+    b0 = byte_at(s, 0)
+    if n == 1 { return b0 >= 0xC2 && b0 <= 0xF4 }
+    if n == 2 { return b0 >= 0xE0 && b0 <= 0xF4 && second(b0, byte_at(s, 1)) }
+    b0 >= 0xF0 && b0 <= 0xF4 && second(b0, byte_at(s, 1)) && cont(byte_at(s, 2))
+}
+
+// settle：正好是一个完整的合法字符就交出去；还可能凑成合法字符就接着存；都不是就交出第一个字节（U+FFFD），剩下的再走一遍。
+// 模型里是对剩下的递归，这里是循环：k 是剩下的从哪里开始
+fn settle(s: str) -> ([str], str) {
+    out: [str] = []
+    k = 0
+    for k < len(s) {
+        t = slice(s, k, len(s))
+        if valid_len(t) == len(t) {
+            out.push(t)
+            return (out, "")
+        }
+        if prefix_ok(t) { return (out, t) }
+        out.push(slice(s, k, k + 1))
+        k += 1
+    }
+    (out, "")
+}
+
+// 喂一个字节（feed 的一步）：交出去的字符（每个是它的字节）
+pub fn feed(inout d: Dec, b: int) -> [str] {
+    s = d.pend + from_byte(b)
+    out, rest = settle(s)
+    d.pend = rest
+    out
+}
+
+// 不会再有字节了，或者被控制字符、转义序列打断：存着的每个字节各算一个 U+FFFD（flush）
+pub fn flush(inout d: Dec) -> [str] {
+    out: [str] = []
+    for i in 0..len(d.pend) { out.push(slice(d.pend, i, i + 1)) }
+    d.pend = ""
+    out
+}

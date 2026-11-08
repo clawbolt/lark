@@ -1,0 +1,6 @@
+// 期望错误：lock 块里的值是借用的，不能移走（只能带出副本）
+fn take_all(m: Mutex[[str]]) -> [str] {
+    lock m as xs { xs }
+}
+
+fn main() {}

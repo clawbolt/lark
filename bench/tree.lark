@@ -1,0 +1,29 @@
+// 基准：递归的表达式树（构造、求值、释放）。递归的枚举本来就要放在堆上，这里量的是这部分的基线
+enum Ex {
+    Lit(int)
+    Add(Ex, Ex)
+    Mul(Ex, Ex)
+}
+
+// 偶数层分两支，奇数层乘 2：节点数大约是 2 的 d/2 次方
+fn build(d: int, k: int) -> Ex {
+    if d == 0 { return Lit(k % 10) }
+    if d % 2 == 0 { Add(build(d - 1, k + 1), build(d - 1, k + 2)) } else { Mul(build(d - 1, k), Lit(2)) }
+}
+
+fn eval(e: Ex) -> int {
+    match e {
+        Lit(n) => n
+        Add(a, b) => eval(a) + eval(b)
+        Mul(a, b) => eval(a) * eval(b)
+    }
+}
+
+fn main() {
+    total = 0
+    for _ in 0..40 {
+        e = build(30, 0)
+        total += eval(e)
+    }
+    print("#{total}")
+}

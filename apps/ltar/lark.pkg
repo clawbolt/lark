@@ -1,0 +1,3 @@
+# ltar：用 Lark 写的 tar，读写 tar 和 tar.gz，和系统的 tar 互相认得（标准库阶段 1 的验收程序）
+name = ltar
+version = 0.1.0

@@ -1,0 +1,60 @@
+// 文档大纲（LSP 规范的 “textDocument/documentSymbol”）：阶段 5 扫出来的声明，每个标上种类。
+// 先证明再写：对应 formal/Lark/LspSym.lean，函数和定义一一对应：kind_of ↔ kindOf、symbols ↔ symbols
+// 种类是 LSP 的 SymbolKind：fn → Function（12）、type → Struct（23）、enum → Enum（10）、const → Constant（14）、interface → Interface（11）。
+// 证明了：大纲去掉种类以后正好是 decls、顺序一样（symbols_decls）；每一项在它的偏移上正好是这个名字、是完整的词（symbols_word）；
+// 范围在文档里面（symbols_in）。
+// 没证：大纲只有一层（方法、枚举的变体、字段以后再加）；范围只是名字，不是整个声明。
+import "std/json"
+import "lsp/pos"
+import "lsp/docs"
+import "lsp/defn"
+
+pub type Sym {
+    pub name: str
+    pub at: int         // 名字在文档里的字节偏移
+    pub kind: int       // SymbolKind
+}
+
+fn starts(d: str, at: int, p: str) -> bool { at + len(p) <= len(d) && slice(d, at, at + len(p)) == p }
+
+// 行首 ls（`pub ` 之后）的关键字对应的 SymbolKind；没有关键字时是 0（kindOf）
+pub fn kind_of(d: str, ls: int) -> int {
+    p = if starts(d, ls, "pub ") { ls + 4 } else { ls }
+    if starts(d, p, "fn ") { 12 } else if starts(d, p, "type ") { 23 } else if starts(d, p, "enum ") { 10 } else if starts(d, p, "const ") { 14 } else if starts(d, p, "interface ") { 11 } else { 0 }
+}
+
+// at 所在的行的开头
+fn line_start(d: str, at: int) -> int {
+    k = at
+    for k > 0 && byte_at(d, k - 1) != 10 { k -= 1 }
+    k
+}
+
+// 大纲（symbols）：声明的名字和关键字在同一行（LspDef.find_line），所以往回找到的行首就是声明开始的地方
+pub fn symbols(d: str) -> [Sym] {
+    out: [Sym] = []
+    for x in defn.decls(d) {
+        out.push(Sym(name: x.name.copy(), at: x.at, kind: kind_of(d, line_start(d, x.at))))
+    }
+    out
+}
+
+fn pos_json(p: pos.Pos) -> json.Json {
+    json.object([("line", json.Num(p.line)), ("character", json.Num(p.ch))])
+}
+
+// textDocument/documentSymbol 的结果：DocumentSymbol 的列表；文档没打开时是 null
+pub fn outline(enc: pos.Enc, files: [docs.Doc], params: json.Json) -> json.Json {
+    uri = json.path_str(params, "textDocument.uri") ?? ""
+    d = match take docs.get(files, uri) {
+        Some(x) => x.text.copy()
+        None => { return json.Null }
+    }
+    xs = pos.doc(d)
+    out: [json.Json] = []
+    for s in symbols(d) {
+        r = json.object([("start", pos_json(pos.pos_of(enc, xs, s.at))), ("end", pos_json(pos.pos_of(enc, xs, s.at + len(s.name))))])
+        out.push(json.object([("name", json.Str(s.name.copy())), ("kind", json.Num(s.kind)), ("range", r.copy()), ("selectionRange", r)]))
+    }
+    json.Arr(out)
+}

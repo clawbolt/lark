@@ -1,0 +1,59 @@
+// std/math 的边界：最小 / 最大的 int、0 和负数、nan 和 inf
+import "std/math"
+
+test "整数" {
+    assert_eq(math.abs(math.MIN + 1), math.MAX)
+    assert_eq(math.min(-1, 1), -1)
+    assert_eq(math.max(-1, 1), 1)
+    assert_eq(math.clamp(5, 0, 3), 3)
+    assert_eq(math.clamp(-5, 0, 3), 0)
+    assert_eq(math.clamp(2, 0, 3), 2)
+    assert_eq(math.pow(2, 0), 1)
+    assert_eq(math.pow(0, 0), 1)
+    assert_eq(math.pow(0, 5), 0)
+    assert_eq(math.pow(-3, 3), -27)
+    assert_eq(math.pow(2, 62), 4611686018427387904)
+    // 最后一步之后不再平方，所以 (-2)^63 刚好是最小的 int，不会溢出
+    assert_eq(math.pow(-2, 63), math.MIN)
+    assert_eq(math.gcd(0, 0), 0)
+    assert_eq(math.gcd(0, 7), 7)
+    assert_eq(math.gcd(-12, 18), 6)
+    assert_eq(math.lcm(-4, 6), 12)
+    assert_eq(math.lcm(0, 6), 0)
+    assert_eq(math.isqrt(0), 0)
+    assert_eq(math.isqrt(15), 3)
+    assert_eq(math.isqrt(16), 4)
+    assert_eq(math.isqrt(math.MAX), 3037000499)
+    assert_eq(math.floor_div(-7, 2), -4)
+    assert_eq(math.floor_div(7, -2), -4)
+    assert_eq(math.floor_div(-8, 2), -4)
+    assert_eq(math.floor_mod(-7, 2), 1)
+    assert_eq(math.floor_mod(7, -2), -1)
+    assert_eq(math.floor_mod(-8, 2), 0)
+    none: [int] = []
+    assert_eq(math.sum(none), 0)
+    assert_eq(math.sum([1, -2, 3]), 2)
+}
+
+test "浮点" {
+    assert(math.abs(-0.5) == 0.5)
+    assert(math.min(1.5, -1.5) == -1.5)
+    assert(math.clamp(9.0, 0.0, 1.0) == 1.0)
+    assert(math.sign(-0.1) == -1.0)
+    assert(math.sign(math.NAN) == 0.0)
+    assert(math.is_nan(math.NAN))
+    assert(!math.is_nan(math.INF))
+    assert(math.is_inf(-math.INF))
+    assert(!math.is_inf(1000000.0))
+    assert(math.is_finite(0.0))
+    assert(!math.is_finite(math.NAN))
+    assert(!math.is_finite(math.INF))
+    assert(math.approx(float_pow(2.0, 0.5), 1.4142135623730951, 0.000000000000001))
+    assert(math.approx(0.1 + 0.2, 0.3, 0.000000000001))
+    assert(!math.approx(1.0, 1.1, 0.001))
+    // 两个都很小时直接和 eps 比
+    assert(math.approx(0.0, 0.00000000000000000001, 0.000000000001))
+    assert(math.sum([0.5, 0.25]) == 0.75)
+    nf: [float] = []
+    assert(math.sum(nf) == 0.0)
+}

@@ -1,0 +1,386 @@
+// ledit · 编辑器的状态和按键处理。不碰终端：输入是按键，输出是要显示的内容（screen 是纯文字，render 加上终端的控制序列），
+// 所以单元测试和 --keys 脚本模式都直接用它
+import "std/fmt"
+import "std/os"
+import "std/str"
+import "keys"
+import "text"
+import "buffer"
+
+// 撤销栈里的一项：倒着做一遍 ops 就回到修改前，光标回到 (row, col)
+type Undo {
+    ops: [buffer.Edit]
+    row: int
+    col: int
+    typing: bool        // 连续打字：接着打的字并进这一项，一次撤销一整段
+    end_row: int        // 打字时光标停在哪里；下一个字正好接在这里才并
+    end_col: int
+}
+
+pub type Editor {
+    pub lines: [str]
+    pub row: int        // 光标：第几行、行里第几个字节
+    pub col: int
+    want: int           // 上下移动时想停在的显示列
+    pub top: int        // 屏幕最上面是第几行、最左边是第几列
+    pub left: int
+    pub height: int     // 文字区有几行（屏幕减去状态栏和提示行）
+    pub width: int
+    pub path: str
+    pub msg: str        // 提示行
+    pub quit: bool
+    final_nl: bool      // 文件原来以换行结尾（保存时照样）
+    undo: [Undo]
+    clean: int          // 上次保存时撤销栈有多深；深度一样就是没改过
+    warned: bool        // 有改动时按过一次 Ctrl-Q
+    searching: bool
+    query: str
+    from_row: int       // 开始搜索时的光标，按 Esc 回到这里
+    from_col: int
+}
+
+pub fn new(path: str, content: str, height: int, width: int) -> Editor {
+    ls = str.split(content, "\n")
+    // 空文件（包括新文件）保存时也以换行结尾
+    final_nl = len(content) == 0 || byte_at(content, len(content) - 1) == '\n'
+    if len(content) == 0 { ls = [""] }
+    if final_nl { _last = ls.pop() }
+    if len(ls) == 0 { ls.push("") }
+    Editor(lines: ls, row: 0, col: 0, want: 0, top: 0, left: 0, height: height, width: width, path: path, msg: "",
+        quit: false, final_nl: final_nl, undo: [], clean: 0, warned: false, searching: false, query: "", from_row: 0,
+        from_col: 0)
+}
+
+// 打开文件；不存在时是一个空的新文件（保存时才创建）
+pub fn open(path: str, height: int, width: int) -> Editor! {
+    if !os.exists(path) {
+        ed = new(path, "", height, width)
+        ed.msg = "新文件 #{path}"
+        return Ok(ed)
+    }
+    content = os.read(path)?
+    ed = new(path, content, height, width)
+    ed.msg = "Ctrl-S 保存  Ctrl-Q 退出  Ctrl-Z 撤销  Ctrl-F 搜索"
+    Ok(ed)
+}
+
+pub fn dirty(ed: Editor) -> bool { len(ed.undo) != ed.clean }
+
+pub fn text_of(ed: Editor) -> str {
+    body = join(ed.lines, "\n")
+    if ed.final_nl { body + "\n" } else { body }
+}
+
+pub fn save(inout ed: Editor) -> ()! {
+    os.write(ed.path, text_of(ed))?
+    ed.clean = len(ed.undo)
+    // 保存以后再打的字另起一项，不然撤销会越过保存点
+    end_typing(&ed)
+    ed.msg = "已保存 #{ed.path}（#{len(ed.lines)} 行）"
+}
+
+// ---------- 按键 ----------
+
+pub fn handle(inout ed: Editor, k: keys.Key) {
+    if ed.searching {
+        search_key(&ed, k)
+        return
+    }
+    quit_key = false
+    typing = false
+    match k {
+        keys.Ch(s) => {
+            type_text(&ed, s)
+            typing = true
+        }
+        keys.Tab => type_text(&ed, "\t")
+        keys.Enter => newline(&ed)
+        keys.Backspace => backspace(&ed)
+        keys.Delete => delete(&ed)
+        keys.Left => left(&ed)
+        keys.Right => right(&ed)
+        keys.Up => vertical(&ed, -1)
+        keys.Down => vertical(&ed, 1)
+        keys.Home => {
+            ed.col = 0
+            set_want(&ed)
+        }
+        keys.End => {
+            ed.col = len(ed.lines[ed.row])
+            set_want(&ed)
+        }
+        keys.PageUp => vertical(&ed, -ed.height)
+        keys.PageDown => vertical(&ed, ed.height)
+        keys.Esc => {}
+        keys.Ctrl(c) => {
+            if c == 'q' {
+                quit_key = true
+                quit(&ed)
+            } else if c == 's' {
+                match save(&ed) {
+                    Ok => {}
+                    Err(e) => { ed.msg = "保存失败：#{e}" }
+                }
+            } else if c == 'z' {
+                undo_last(&ed)
+            } else if c == 'f' {
+                start_search(&ed)
+            } else {
+                ed.msg = "Ctrl-#{from_byte(c - 32)} 没有用处"
+            }
+        }
+    }
+    if !typing { end_typing(&ed) }
+    if !quit_key { ed.warned = false }
+}
+
+fn quit(inout ed: Editor) {
+    if dirty(ed) && !ed.warned {
+        ed.msg = "有改动没保存：再按一次 Ctrl-Q 不保存退出，Ctrl-S 保存"
+        ed.warned = true
+        return
+    }
+    ed.quit = true
+}
+
+fn set_want(inout ed: Editor) { ed.want = text.width_to(ed.lines[ed.row], ed.col) }
+
+fn left(inout ed: Editor) {
+    if ed.col > 0 {
+        ed.col = text.prev_char(ed.lines[ed.row], ed.col)
+    } else if ed.row > 0 {
+        ed.row -= 1
+        ed.col = len(ed.lines[ed.row])
+    }
+    set_want(&ed)
+}
+
+fn right(inout ed: Editor) {
+    if ed.col < len(ed.lines[ed.row]) {
+        ed.col = text.next_char(ed.lines[ed.row], ed.col)
+    } else if ed.row + 1 < len(ed.lines) {
+        ed.row += 1
+        ed.col = 0
+    }
+    set_want(&ed)
+}
+
+// 上下移动 d 行（翻页时是一屏），列尽量保持在 want
+fn vertical(inout ed: Editor, d: int) {
+    r = ed.row + d
+    if r < 0 { r = 0 }
+    if r >= len(ed.lines) { r = len(ed.lines) - 1 }
+    ed.row = r
+    ed.col = text.index_at_width(ed.lines[r], ed.want)
+}
+
+// 做一次修改并记进撤销栈，然后把光标放到 (row, col)。typing 时和上一项连续打的字并在一起
+fn edit(inout ed: Editor, e: buffer.Edit, typing: bool, row: int, col: int) {
+    inv = buffer.apply(&ed.lines, e)
+    n = len(ed.undo)
+    joins = typing && n > 0 && n > ed.clean && ed.undo[n - 1].typing && ed.undo[n - 1].end_row == ed.row &&
+        ed.undo[n - 1].end_col == ed.col
+    if joins {
+        ed.undo[n - 1].ops.push(inv)
+        ed.undo[n - 1].end_row = row
+        ed.undo[n - 1].end_col = col
+    } else {
+        ops: [buffer.Edit] = [inv]
+        ed.undo.push(Undo(ops: ops, row: ed.row, col: ed.col, typing: typing, end_row: row, end_col: col))
+    }
+    ed.row = row
+    ed.col = col
+    set_want(&ed)
+    ed.msg = ""
+}
+
+fn end_typing(inout ed: Editor) {
+    n = len(ed.undo)
+    if n > 0 { ed.undo[n - 1].typing = false }
+}
+
+fn type_text(inout ed: Editor, s: str) {
+    edit(&ed, buffer.Ins(ed.row, ed.col, s), true, ed.row, ed.col + len(s))
+}
+
+fn newline(inout ed: Editor) {
+    edit(&ed, buffer.Split(ed.row, ed.col), false, ed.row + 1, 0)
+}
+
+fn backspace(inout ed: Editor) {
+    r = ed.row
+    c = ed.col
+    if c > 0 {
+        line = ed.lines[r]
+        p = text.prev_char(line, c)
+        edit(&ed, buffer.Del(r, p, slice(line, p, c)), false, r, p)
+    } else if r > 0 {
+        pl = len(ed.lines[r - 1])
+        edit(&ed, buffer.Join(r - 1, pl), false, r - 1, pl)
+    }
+}
+
+fn delete(inout ed: Editor) {
+    r = ed.row
+    c = ed.col
+    line = ed.lines[r]
+    if c < len(line) {
+        n = text.next_char(line, c)
+        edit(&ed, buffer.Del(r, c, slice(line, c, n)), false, r, c)
+    } else if r + 1 < len(ed.lines) {
+        edit(&ed, buffer.Join(r, c), false, r, c)
+    }
+}
+
+fn undo_last(inout ed: Editor) {
+    last = ed.undo.try_pop()
+    match last {
+        Some(u) => {
+            i = len(u.ops) - 1
+            for i >= 0 {
+                _redo = buffer.apply(&ed.lines, u.ops[i])
+                i -= 1
+            }
+            ed.row = u.row
+            ed.col = u.col
+            set_want(&ed)
+            ed.msg = if dirty(ed) { "撤销了一步" } else { "撤销了一步，和保存时一样了" }
+        }
+        None => { ed.msg = "没有可以撤销的了" }
+    }
+}
+
+// ---------- 搜索 ----------
+// Ctrl-F 以后打的字是要找的内容，边打边跳到第一处；Ctrl-F 或 ↓ 找下一处，Enter 停在这里，Esc 回到原来的位置
+
+fn start_search(inout ed: Editor) {
+    ed.searching = true
+    ed.query = ""
+    ed.from_row = ed.row
+    ed.from_col = ed.col
+}
+
+fn search_key(inout ed: Editor, k: keys.Key) {
+    match k {
+        keys.Esc => {
+            ed.searching = false
+            ed.row = ed.from_row
+            ed.col = ed.from_col
+            set_want(&ed)
+            ed.msg = ""
+        }
+        keys.Enter => {
+            ed.searching = false
+            ed.msg = ""
+        }
+        keys.Backspace => {
+            if len(ed.query) > 0 { ed.query = slice(ed.query, 0, text.prev_char(ed.query, len(ed.query))) }
+            r = ed.from_row
+            c = ed.from_col
+            find(&ed, r, c)
+        }
+        keys.Ch(s) => {
+            ed.query += s
+            r = ed.from_row
+            c = ed.from_col
+            find(&ed, r, c)
+        }
+        keys.Down => find_next(&ed)
+        keys.Ctrl(c) => { if c == 'f' { find_next(&ed) } }
+        _ => {}
+    }
+}
+
+fn find_next(inout ed: Editor) {
+    r = ed.row
+    c = ed.col
+    if c < len(ed.lines[r]) { c = text.next_char(ed.lines[r], c) } else { c += 1 }
+    find(&ed, r, c)
+}
+
+// 从 (row, col) 往后找 query，到结尾再从头找；找到时把光标放在那里
+fn find(inout ed: Editor, row: int, col: int) {
+    if ed.query == "" {
+        ed.msg = ""
+        return
+    }
+    n = len(ed.lines)
+    // 先找第 row 行 col 以后，再找后面的行，绕回开头，最后回到第 row 行的 col 以前
+    for k in 0..n + 1 {
+        r = (row + k) % n
+        from = if k == 0 { col } else { 0 }
+        at = str.find_from(ed.lines[r], ed.query, from) ?? -1
+        if k == n && at >= col { at = -1 }
+        if at >= 0 {
+            ed.row = r
+            ed.col = at
+            set_want(&ed)
+            ed.msg = if k == n || r < row { "到结尾了，从头找到第 #{r + 1} 行" } else { "" }
+            return
+        }
+    }
+    ed.msg = "没找到：#{ed.query}"
+}
+
+// ---------- 显示 ----------
+
+// 窗口大小变了。Editor 有不是 pub 的字段，模块外面连 pub 字段也不能改，所以要这样一个函数
+pub fn resize(inout ed: Editor, height: int, width: int) {
+    ed.height = height
+    ed.width = width
+}
+
+// 滚动到光标看得见的地方
+pub fn scroll(inout ed: Editor) {
+    if ed.row < ed.top { ed.top = ed.row }
+    if ed.row >= ed.top + ed.height { ed.top = ed.row - ed.height + 1 }
+    dc = text.width_to(ed.lines[ed.row], ed.col)
+    if dc < ed.left { ed.left = dc }
+    if dc >= ed.left + ed.width { ed.left = dc - ed.width + 1 }
+}
+
+// 屏幕上的每一行（不含控制序列）：height 行文字（文件之后的行是 ~），一行状态栏，一行提示
+pub fn screen(ed: Editor) -> [str] {
+    out: [str] = []
+    for y in 0..ed.height {
+        r = ed.top + y
+        if r < len(ed.lines) {
+            out.push(text.visible(ed.lines[r], ed.left, ed.width))
+        } else {
+            out.push("~")
+        }
+    }
+    name = if ed.path == "" { "[未命名]" } else { ed.path }
+    mark = if dirty(ed) { " [+]" } else { "" }
+    lhs = " #{name}#{mark}  #{len(ed.lines)} 行"
+    rhs = "#{ed.row + 1}:#{text.width_to(ed.lines[ed.row], ed.col) + 1} "
+    gap = ed.width - fmt.width(lhs) - fmt.width(rhs)
+    bar = if gap >= 1 { lhs + str.repeat(" ", gap) + rhs } else { text.visible(lhs + " " + rhs, 0, ed.width) }
+    out.push(bar)
+    prompt = if ed.searching { "搜索（Enter 停下，Esc 取消，Ctrl-F 下一处）：#{ed.query}" } else { ed.msg }
+    out.push(text.visible(prompt, 0, ed.width))
+    out
+}
+
+fn esc() -> str { "\e" }
+
+// 一整帧：隐藏光标、回到左上角、逐行画（每行后面清到行尾）、状态栏反色，最后把光标放好再显示出来
+pub fn render(ed: Editor) -> str {
+    e = esc()
+    lines = screen(ed)
+    out = e + "[?25l" + e + "[H"
+    for i in 0..len(lines) {
+        if i == ed.height { out += e + "[7m" + lines[i] + e + "[m" } else { out += lines[i] + e + "[K" }
+        if i + 1 < len(lines) { out += "\r\n" }
+    }
+    cy = 0
+    cx = 0
+    if ed.searching {
+        cy = ed.height + 2
+        cx = fmt.width(lines[ed.height + 1]) + 1
+    } else {
+        cy = ed.row - ed.top + 1
+        cx = text.width_to(ed.lines[ed.row], ed.col) - ed.left + 1
+    }
+    out + e + "[#{cy};#{cx}H" + e + "[?25h"
+}

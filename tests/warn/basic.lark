@@ -1,0 +1,27 @@
+// 期望警告：没用到的变量、永远不会执行的代码、没用到的 import；参数和以 _ 开头的名字不警告
+import "std/math"
+import "std/str"
+
+fn first(xs: [int], unused_param: int) -> int {
+    for x in xs {
+        return x
+        print("不会执行")
+    }
+    -1
+}
+
+fn main() {
+    total = 0
+    extra = 5
+    _skip = 7
+    for i in 0..3 { total += 1 }
+    for _ in 0..2 { total += 1 }
+    _ = first([1, 2], 0)
+    _ = str.trim(" a ")
+    r = try_parse_int("x")
+    match r {
+        Ok(n) => print("#{n}")
+        Err(e) => print("不是数")
+    }
+    print("#{total}")
+}

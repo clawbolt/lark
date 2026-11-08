@@ -1,0 +1,9 @@
+// 期望错误：shared 的内容是只读的
+type Box {
+    v: int
+}
+
+fn main() {
+    b = share(Box(v: 1))
+    b.v = 2
+}

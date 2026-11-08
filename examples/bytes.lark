@@ -1,0 +1,54 @@
+// 字节 u8 和字节缓冲 [u8]（需要 lark1 及以后的版本）
+// u8 是 0..255 的整数：可以比较、做 & | ^ !，不能直接做算术（先 .to_int()）。
+// 需要 u8 的地方可以直接写整数或字符字面量，超出 0..255 时编译报错。
+
+fn hex(b: u8) -> str {
+    digits = "0123456789abcdef"
+    n = b.to_int()
+    slice(digits, n / 16, n / 16 + 1) + slice(digits, n % 16, n % 16 + 1)
+}
+
+fn checksum(bs: [u8]) -> u8 {
+    x: u8 = 0
+    for b in bs { x ^= b }
+    x
+}
+
+fn main() {
+    a: u8 = 200
+    b: u8 = 'A'
+    print("a = #{a}，b = #{b}，a > b：#{a > b}")
+    print("按位：#{a & 0x0F}，#{a | 1}，#{a ^ 0xFF}，#{!a}")
+
+    // 转换：to_u8 超出范围时 panic，wrap_u8 只取低 8 位，try_u8 得到 u8?
+    sum = a.to_int() + b.to_int()
+    print("相加先转成 int：#{sum}，回绕成 u8：#{sum.wrap_u8()}")
+    n = 66
+    big = 300
+    print("to_u8：#{n.to_u8()}，try_u8：#{big.try_u8()} #{n.try_u8()}")
+
+    // str 和 [u8] 互相转换：都是原样的字节（UTF-8 的中文一个字 3 个字节）
+    s = "Lark 云雀"
+    bs = s.to_bytes()
+    print("#{len(bs)} 个字节：#{bs}")
+    hexes: [str] = []
+    for x in bs { hexes.push(hex(x)) }
+    print(join(hexes, " "))
+    two = "La".to_bytes() == ['L', 'a']
+    print("转回来相等：#{from_bytes(bs) == s}，前两个字节：#{two}")
+
+    // 字节缓冲就是 [u8]：push、reserve、下标、for 都能用
+    src = "hello"
+    buf: [u8] = []
+    buf.reserve(8)
+    for ch in src.to_bytes() { buf.push(ch & 0xDF) }
+    buf.push('!')
+    print("#{from_bytes(buf)}，校验和 #{checksum(buf)}")
+    buf[0] = 'J'
+    first = match buf[0] {
+        72 => "H"
+        74 => "J"
+        _ => "别的"
+    }
+    print("改了第一个字节：#{from_bytes(buf)}，开头是 #{first}")
+}

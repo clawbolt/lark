@@ -1,0 +1,97 @@
+// DER 编码（X.690）的长度和元素（一个字节的标签 + 长度 + 内容），证书用到的只有这些。
+// 先证明再写：对应 formal/Lark/Der.lean，函数和定义一一对应：
+//   enc_len / dec_len ↔ encLen / decLen（decLen_encLen、decLen_some：同一个长度只有一种写法，不是最短的就拒绝）
+//   tlv / parse_tlv ↔ tlv / parseTlv（parseTlv_tlv、parseTlv_some：写出来再读回来不变；读成功时输入正好是 写出来的 + 剩下的）
+//   all ↔ tlvs（一段内容里接连的元素，读到用完为止）
+// 和模型一样：先照格式读出长度，再用 enc_len 写回去和输入逐字节比。长度最多 3 个字节（小于 2^24）。
+// 模型里用 “剩下的” 列表，这里用下标 at / next。实验性：没有经过审计
+import "tls/record"
+
+pub const SEQUENCE = 0x30
+pub const OID = 6
+pub const BIT_STRING = 3
+
+fn sub(d: [u8], a: int, b: int) -> [u8] {
+    out: [u8] = []
+    out.reserve(b - a)
+    for i in a..b { out.push(d[i]) }
+    out
+}
+
+// 最短的写法：小于 128 一个字节；否则 0x81 / 0x82 / 0x83 后面跟 1 / 2 / 3 个字节（大端）
+pub fn enc_len(n: int) -> [u8] {
+    if n < 0 || n >= (1 << 24) { panic("der：长度 #{n} 放不进 3 个字节") }
+    out: [u8] = []
+    if n < 128 {
+        out.push(n.wrap_u8())
+    } else if n < 256 {
+        out.push(0x81)
+        record.push_be(&out, 1, n)
+    } else if n < 65536 {
+        out.push(0x82)
+        record.push_be(&out, 2, n)
+    } else {
+        out.push(0x83)
+        record.push_be(&out, 3, n)
+    }
+    out
+}
+
+pub type Len {
+    pub n: int
+    pub next: int    // 内容从这里开始
+}
+
+// 从 d[at] 读长度（decLenRaw），再写回去和输入比（decLen）
+pub fn dec_len(d: [u8], at: int) -> Len! {
+    if at >= len(d) { return Err("der：缺长度") }
+    b = d[at].to_int()
+    k = 0
+    n = b
+    if b >= 128 {
+        if b < 0x81 || b > 0x83 { return Err("der：长度的第一个字节是 #{b}，只支持小于 128 和 0x81 到 0x83") }
+        k = b - 0x80
+        if len(d) - at - 1 < k { return Err("der：长度要 #{k} 个字节，只剩 #{len(d) - at - 1} 个") }
+        n = record.read_be(d, at + 1, k)
+    }
+    w = enc_len(n)
+    if len(w) != k + 1 { return Err("der：长度 #{n} 不是最短的写法") }
+    for i in 0..len(w) {
+        if w[i] != d[at + i] { return Err("der：长度 #{n} 不是最短的写法") }
+    }
+    Ok(Len(n: n, next: at + 1 + k))
+}
+
+// 标签 + 长度 + 内容
+pub fn tlv(tag: int, v: [u8]) -> [u8] {
+    out: [u8] = [tag.wrap_u8()]
+    for x in enc_len(len(v)) { out.push(x) }
+    for x in v { out.push(x) }
+    out
+}
+
+pub type Tlv {
+    pub tag: int
+    pub body: [u8]   // 内容
+    pub next: int    // 后面的数据从这里开始
+}
+
+// 从 d[at] 读一个元素：没有标签、长度读不出来、说的长度比剩下的多，都是错误（parseTlv 是 none）
+pub fn parse_tlv(d: [u8], at: int) -> Tlv! {
+    if at >= len(d) { return Err("der：缺标签") }
+    l = dec_len(d, at + 1)?
+    if len(d) - l.next < l.n { return Err("der：长度是 #{l.n}，只剩 #{len(d) - l.next} 字节") }
+    Ok(Tlv(tag: d[at].to_int(), body: sub(d, l.next, l.next + l.n), next: l.next + l.n))
+}
+
+// d 里接连的元素，一直读到 d 用完（tlvs）
+pub fn all(d: [u8]) -> [Tlv]! {
+    out: [Tlv] = []
+    at = 0
+    for at < len(d) {
+        e = parse_tlv(d, at)?
+        at = e.next
+        out.push(e)
+    }
+    Ok(out)
+}

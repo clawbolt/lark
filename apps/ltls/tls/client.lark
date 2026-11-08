@@ -1,0 +1,68 @@
+// TLS 1.3 客户端的握手状态机（RFC 8446 附录 A.1；只有 1-RTT，不支持 HelloRetryRequest、PSK、客户端证书）。
+// 先证明再写：对应 formal/Lark/Tls13.lean 的 St / Ev / next / step / run。证明了（handshake_order）：
+// 走到 Connected 时，事件一定以 SendCH、SH、EE、Cert、CV、Fin 开头，后面只有 Post；
+// 所以 Finished 没核对就不会收发应用数据，也不能跳过 Certificate / CertificateVerify。
+// 事件是“检查已经通过了”的抽象：调用的人先核对 ServerHello、证书链、签名、Finished 的 MAC，
+// 通过了才给对应的事件，否则给 Other。实验性：没有经过审计
+pub enum St {
+    Start
+    WaitSH
+    WaitEE
+    WaitCert
+    WaitCV
+    WaitFin
+    Connected
+    Failed
+}
+
+pub enum Ev {
+    SendCH    // 发出 ClientHello
+    SH        // 检查都通过的 ServerHello
+    EE        // EncryptedExtensions
+    Cert      // 验证通过的证书链
+    CV        // 签名对上的 CertificateVerify
+    Fin       // MAC 对上的 Finished
+    Post      // 握手以后的消息：应用数据、NewSessionTicket、KeyUpdate
+    Other     // 别的一切：不认识的、检查没通过的、顺序不对的
+}
+
+// 每个状态只接受一种事件（模型里的 next；这里不叫 next，免得和迭代器的 next 混在一起）
+pub fn expected(s: St) -> (Ev, St) {
+    match s {
+        Start => (SendCH, WaitSH)
+        WaitSH => (SH, WaitEE)
+        WaitEE => (EE, WaitCert)
+        WaitCert => (Cert, WaitCV)
+        WaitCV => (CV, WaitFin)
+        WaitFin => (Fin, Connected)
+        Connected => (Post, Connected)
+        Failed => (Other, Failed)
+    }
+}
+
+// 失败了就一直是 Failed；事件对了走到下一个状态，不对就失败（step）
+pub fn step(s: St, e: Ev) -> St {
+    if s == Failed { return Failed }
+    want, dst = expected(s)
+    if e == want { dst } else { Failed }
+}
+
+// 依次走完所有事件（run）
+pub fn run(s: St, es: [Ev]) -> St {
+    cur = s.copy()
+    for e in es { cur = step(cur, e) }
+    cur
+}
+
+pub fn show(s: St) -> str {
+    match s {
+        Start => "Start"
+        WaitSH => "WaitSH"
+        WaitEE => "WaitEE"
+        WaitCert => "WaitCert"
+        WaitCV => "WaitCV"
+        WaitFin => "WaitFin"
+        Connected => "Connected"
+        Failed => "Failed"
+    }
+}

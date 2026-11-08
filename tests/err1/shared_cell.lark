@@ -1,0 +1,10 @@
+// 期望错误：shared 里不能有 Mutex：lock 会经由 shared 修改内容
+type C {
+    tag: int
+    m: Mutex[[int]]
+}
+
+fn main() {
+    c = share(C(tag: 7, m: mutex([1, 2, 3])))
+    lock c.m as v { v.push(4) }
+}

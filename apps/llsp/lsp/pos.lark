@@ -1,0 +1,82 @@
+// LSP 的位置（行，列）和文档里字节偏移的换算。行从 0 数；列默认数 UTF-16 单元，客户端支持 positionEncoding = "utf-8" 时数字节。
+// 换行有 \n、\r\n、\r 三种（LSP 规范的 “Text Documents” 一节）。
+// 先证明再写：对应 formal/Lark/Lsp.lean 的第 2 部分，函数和定义一一对应：
+//   doc ↔ doc（按 utf8.chars 切成字符，\r 后面紧跟的 \n 并进去，norm）、is_eol ↔ isEol、units ↔ u16 / u8
+//   off_of ↔ offOf / offGo、pos_of ↔ posOf / posGo
+// 证明了：任何位置（包括超出范围的）换成的偏移都在字符边界上、不超过文档长度（off_boundary）；
+// 边界上的偏移换成位置再换回来不变（pos_off），文档里真有的位置换成偏移再换回来不变（off_pos）。
+// 落在字符中间（代理对的中间、\r 和 \n 之间）时取字符的开头；列超过行尾时停在换行之前；行超过文档时是文档末尾。
+// 模型里是自然数，这里负的行号、列号当 0。每次从头走一遍文档（O(n)），以后要快再加行的索引（先证明和这里一样）
+import "std/utf8"
+
+pub enum Enc {
+    U16     // UTF-16 单元（LSP 默认）
+    U8      // 字节
+}
+
+pub type Pos {
+    pub line: int
+    pub ch: int
+}
+
+pub fn is_eol(e: str) -> bool { e == "\n" || e == "\r" || e == "\r\n" }
+
+// 一个元素占几个列单位：UTF-16 里 4 字节的 UTF-8 字符（U+10000 以上）是一对代理，2 个单元；坏的字节当 U+FFFD，1 个
+pub fn units(enc: Enc, e: str) -> int {
+    match enc {
+        U16 => if len(e) == 4 { 2 } else { 1 }
+        U8 => len(e)
+    }
+}
+
+// 文档切成的元素：字符，\r\n 算一个
+pub fn doc(text: str) -> [str] {
+    cs = utf8.chars(text)
+    out: [str] = []
+    i = 0
+    for i < len(cs) {
+        if cs[i] == "\r" && i + 1 < len(cs) && cs[i + 1] == "\n" {
+            out.push("\r\n")
+            i += 2
+        } else {
+            out.push(cs[i])
+            i += 1
+        }
+    }
+    out
+}
+
+// (行, 列) → 偏移：先跳过 line 行，再在这一行里走 ch 个单元（offGo）
+pub fn off_of(enc: Enc, xs: [str], p: Pos) -> int {
+    l = if p.line < 0 { 0 } else { p.line }
+    c = if p.ch < 0 { 0 } else { p.ch }
+    o = 0
+    for e in xs {
+        if l > 0 {
+            if is_eol(e) { l -= 1 }
+        } else {
+            if is_eol(e) || c < units(enc, e) { return o }
+            c -= units(enc, e)
+        }
+        o += len(e)
+    }
+    o
+}
+
+// 偏移 → (行, 列)：落在元素中间时取这个元素开头的位置（posGo）
+pub fn pos_of(enc: Enc, xs: [str], o: int) -> Pos {
+    l = 0
+    c = 0
+    r = o
+    for e in xs {
+        if r < len(e) { return Pos(line: l, ch: c) }
+        r -= len(e)
+        if is_eol(e) {
+            l += 1
+            c = 0
+        } else {
+            c += units(enc, e)
+        }
+    }
+    Pos(line: l, ch: c)
+}

@@ -1,0 +1,282 @@
+// 诊断（LSP 规范的 “textDocument/publishDiagnostics”）：文档打开或者改了以后交给编译器（lark1）检查，
+// 把它的错误换成 LSP 的诊断发给编辑器。
+// 先证明再写：对应 formal/Lark/LspDiag.lean，函数和定义一一对应：
+//   c_go / c_pos / c_off ↔ cGo / cPos / cOff、dpos ↔ dpos、parse_line ↔ parseLine、pubs ↔ pubs
+// 编译器的位置是 “行、列从 1 数，列是字节，只有 \n 换行”，LSP 的是 “从 0 数，列按商量好的单位，\r、\n、\r\n 都换行”，
+// 所以先按编译器的规则换成字节偏移（c_off），再用阶段 1 的 pos_of 换成 LSP 的位置。
+// 证明了：偏移 → 编译器的行列 → 偏移不变（c_round）；编译器指着字符开头时编辑器里标在同一个字节上（dpos_exact、diag_round）；
+// 编译器写出的错误行能读回行、列和信息（parse_fmt）；发诊断的是这次通知的文档、带最新的版本，关掉时清空（pubs_latest），
+// 不发的通知什么都没改（pubs_quiet），每条通知最多发一次（pubs_len）。
+// 没证：运行编译器（check）。文档的内容写到临时文件，在包的根目录（有 lark.pkg 的目录）里运行 lark1 --test，
+// 所以 import "lsp/pos" 这种相对包根的路径能找到；相对文件所在目录的 import、依赖的别的包还不支持。
+import "std/os"
+import "std/proc"
+import "std/json"
+import "lsp/pos"
+import "lsp/docs"
+
+// ---------- 编译器的行列 ↔ 字节偏移 ----------
+
+// 第 l 行第 c 列（从 0 数）的偏移（cGo）：列超过行尾时停在 \n 上，行超过最后一行时是末尾
+pub fn c_go(d: str, l: int, c: int) -> int {
+    o = 0
+    line = 0
+    for line < l && o < len(d) {
+        if byte_at(d, o) == 10 { line += 1 }
+        o += 1
+    }
+    if line < l { return len(d) }
+    k = 0
+    for k < c && o < len(d) && byte_at(d, o) != 10 {
+        o += 1
+        k += 1
+    }
+    o
+}
+
+// 偏移 o 在编译器里的行列，从 0 数（cPos）
+pub fn c_pos(d: str, o: int) -> (int, int) {
+    l = 0
+    c = 0
+    n = if o < len(d) { o } else { len(d) }
+    for i in 0..n {
+        if byte_at(d, i) == 10 {
+            l += 1
+            c = 0
+        } else {
+            c += 1
+        }
+    }
+    (l, c)
+}
+
+// 编译器报的（从 1 数的）行列的偏移（cOff；模型里自然数的减法到 0 为止）
+pub fn c_off(d: str, l: int, c: int) -> int {
+    c_go(d, if l > 1 { l - 1 } else { 0 }, if c > 1 { c - 1 } else { 0 })
+}
+
+pub fn dpos(enc: pos.Enc, d: str, l: int, c: int) -> pos.Pos { pos.pos_of(enc, pos.doc(d), c_off(d, l, c)) }
+
+// ---------- 编译器的一行错误：文件:行:列: 信息 ----------
+
+pub type Line {
+    pub line: int
+    pub col: int
+    pub rest: str
+}
+
+// d[a..b) 是一串 ASCII 数字（Lsp.num）
+fn num(d: str, a: int, b: int) -> int? {
+    if a >= b { return None }
+    n = 0
+    for i in a..b {
+        c = byte_at(d, i)
+        if c < 48 || c > 57 { return None }
+        n = n * 10 + (c - 48)
+    }
+    Some(n)
+}
+
+// 从 at 起第一个冒号的下标（spl）；没有时是 -1
+fn colon(s: str, at: int) -> int {
+    for i in at..len(s) {
+        if byte_at(s, i) == 58 { return i }
+    }
+    -1
+}
+
+// 只认文件名是 name 的行（别的文件里的错误、指着列的 ^ 那两行都是 None）
+pub fn parse_line(name: str, s: str) -> Line? {
+    p = name + ":"
+    if len(s) < len(p) || slice(s, 0, len(p)) != p { return None }
+    a = len(p)
+    b = colon(s, a)
+    if b < 0 { return None }
+    c = colon(s, b + 1)
+    if c < 0 { return None }
+    l = num(s, a, b)?
+    col = num(s, b + 1, c)?
+    if c + 1 >= len(s) || byte_at(s, c + 1) != 32 { return None }
+    Some(Line(line: l, col: col, rest: slice(s, c + 2, len(s))))
+}
+
+// ---------- 诊断 ----------
+
+pub type Item {
+    pub start: pos.Pos
+    pub end: pos.Pos
+    pub sev: int        // 1 = Error，2 = Warning
+    pub msg: str
+}
+
+fn after(s: str, p: str) -> str? {
+    if len(s) >= len(p) && slice(s, 0, len(p)) == p { Some(slice(s, len(p), len(s))) } else { None }
+}
+
+// 偏移 o 所在的元素（字符、换行或者坏的字节）的结尾；在末尾时就是 o
+fn next_bound(xs: [str], o: int) -> int {
+    b = 0
+    for e in xs {
+        b += len(e)
+        if b > o { return b }
+    }
+    o
+}
+
+// 编译器的标准错误 → 这个文件的诊断（name 是交给编译器的文件名）
+pub fn items(enc: pos.Enc, name: str, text: str, err: str) -> [Item] {
+    out: [Item] = []
+    xs = pos.doc(text)
+    start = 0
+    for i in 0..len(err) + 1 {
+        if i == len(err) || byte_at(err, i) == 10 {
+            ln = slice(err, start, i)
+            start = i + 1
+            match take parse_line(name, ln) {
+                Some(r) => {
+                    o = c_off(text, r.line, r.col)
+                    sev = 1
+                    msg = r.rest.copy()
+                    match take after(r.rest, "错误：") {
+                        Some(m) => { msg = m }
+                        None => {
+                            match take after(r.rest, "警告：") {
+                                Some(m) => {
+                                    msg = m
+                                    sev = 2
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    a = pos.pos_of(enc, xs, o)
+                    b = pos.pos_of(enc, xs, next_bound(xs, o))
+                    out.push(Item(start: a, end: b, sev: sev, msg: msg))
+                }
+                None => {}
+            }
+        }
+    }
+    out
+}
+
+fn pos_json(p: pos.Pos) -> json.Json {
+    json.object([("line", json.Num(p.line)), ("character", json.Num(p.ch))])
+}
+
+// textDocument/publishDiagnostics 通知的内容；ver < 0 时不带版本（关掉文档时清空诊断）
+pub fn publish(uri: str, ver: int, xs: [Item]) -> str {
+    ds: [json.Json] = []
+    for it in xs {
+        r = json.object([("start", pos_json(it.start)), ("end", pos_json(it.end))])
+        ds.push(json.object([("range", r), ("severity", json.Num(it.sev)), ("source", json.Str("lark")), ("message", json.Str(it.msg.copy()))]))
+    }
+    params = json.object([("uri", json.Str(uri))])
+    if ver >= 0 { json.insert(&params, "version", json.Num(ver)) }
+    json.insert(&params, "diagnostics", json.Arr(ds))
+    json.format(json.object([("jsonrpc", json.Str("2.0")), ("method", json.Str("textDocument/publishDiagnostics")), ("params", params)]))
+}
+
+// ---------- 什么时候发诊断 ----------
+
+pub type Pub {
+    pub uri: str
+    pub ver: int        // -1：清空（关掉了）
+}
+
+fn no_pubs() -> [Pub] { [] }
+
+// 一条通知以后要发的诊断（pubs）；s 是这条通知之前记着的文档
+pub fn pubs(s: [docs.Doc], e: docs.Ev) -> [Pub] {
+    match e {
+        Opn(uri, v, _) => [Pub(uri: uri.copy(), ver: v)]
+        Chg(uri, v, _) => {
+            match take docs.get(s, uri) {
+                Some(d) => if d.ver < v { [Pub(uri: uri.copy(), ver: v)] } else { no_pubs() }
+                None => no_pubs()
+            }
+        }
+        Cls(uri) => [Pub(uri: uri.copy(), ver: -1)]
+    }
+}
+
+// ---------- 运行编译器（没证） ----------
+
+fn hex(c: int) -> int {
+    if c >= 48 && c <= 57 { c - 48 } else if c >= 97 && c <= 102 { c - 87 } else if c >= 65 && c <= 70 { c - 55 } else { -1 }
+}
+
+// file:///a/b%20c.lark → /a/b c.lark；不是 file: 的 uri 是 ""
+pub fn file_path(uri: str) -> str {
+    p = "file://"
+    if len(uri) < len(p) || slice(uri, 0, len(p)) != p { return "" }
+    out: [u8] = []
+    i = len(p)
+    for i < len(uri) {
+        c = byte_at(uri, i)
+        hi = if c == 37 && i + 2 < len(uri) { hex(byte_at(uri, i + 1)) } else { -1 }
+        lo = if c == 37 && i + 2 < len(uri) { hex(byte_at(uri, i + 2)) } else { -1 }
+        if hi >= 0 && lo >= 0 {
+            out.push((hi * 16 + lo).wrap_u8())
+            i += 3
+        } else {
+            out.push(c.wrap_u8())
+            i += 1
+        }
+    }
+    from_bytes(out)
+}
+
+// 往上找有 lark.pkg 的目录；没有时是文件所在的目录
+pub fn pkg_root(path: str) -> str {
+    d = os.dir(path)
+    for _i in 0..64 {
+        if os.is_file(os.join_path(d, "lark.pkg")) { return d }
+        up = os.dir(d)
+        if up == d || up == "" { break }
+        d = up
+    }
+    os.dir(path)
+}
+
+// Lark 的安装目录（里面有 build/lark1、std/）：$LARK_HOME，否则从 llsp 所在的目录往上找；找不到是 ""（不检查）
+pub fn find_home() -> str {
+    h = os.env("LARK_HOME") ?? ""
+    if h != "" && os.is_file(os.join_path(h, "build/lark1")) { return h }
+    exe = match take os.exe_path() {
+        Ok(p) => p
+        Err(_) => { return "" }
+    }
+    d = os.dir(exe)
+    for _i in 0..64 {
+        if os.is_file(os.join_path(d, "build/lark1")) { return d }
+        up = os.dir(d)
+        if up == d || up == "" { break }
+        d = up
+    }
+    ""
+}
+
+fn no_items() -> [Item] { [] }
+
+// 检查 uri 这个文档现在的内容 text；不是 .lark 文件、或者编译器跑不起来时没有诊断
+pub fn check(home: str, uri: str, text: str, enc: pos.Enc) -> [Item] {
+    path = file_path(uri)
+    if path == "" || os.ext(path) != ".lark" { return no_items() }
+    tmp = os.join_path(os.temp_dir(), "llsp_check_" + os.base(path))
+    match os.write(tmp, text) {
+        Ok => {}
+        Err(_) => { return no_items() }
+    }
+    o = proc.opts()
+    o.dir = pkg_root(path)
+    o.timeout_ms = 30000
+    argv = [os.join_path(home, "build/lark1"), "--test", tmp.copy(), "-p", "std=" + os.join_path(home, "std"), "-o", tmp + ".c"]
+    r = proc.run_opts(argv, o)
+    _a = os.remove(tmp)
+    _b = os.remove(tmp + ".c")
+    match take r {
+        Ok(out) => items(enc, tmp, text, out.err)
+        Err(_) => no_items()
+    }
+}

@@ -1,0 +1,21 @@
+// 列表预分配容量：xs.reserve(n) 保证之后再放 n 个元素都不用扩容（需要 lark1 及以后的版本）
+// 事先知道大概要放多少个时用它，省掉中间几次“容量翻倍、整块复制”。n <= 0 时什么都不做。
+// 编译：lark1 examples/reserve.lark -o out.c
+
+fn main() {
+    xs: [int] = []
+    xs.reserve(1000)
+    for i in 0..1000 { xs.push(i * i) }
+    print("#{len(xs)} #{xs[999]}")
+    ws = ["a", "b"]
+    reserve(&ws, 0)
+    ws.reserve(-5)
+    ws.push("c")
+    print("#{ws}")
+    ys: [[int]] = []
+    ys.reserve(2)
+    ys.push([1])
+    ys.push([2, 3])
+    ys.push([4])
+    print("#{ys}")
+}

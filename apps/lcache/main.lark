@@ -1,0 +1,112 @@
+// lcache：用 Lark 写的键值缓存，HTTP 接口，键可以带过期时间（接口见 kv/api.lark）。
+// 构建：在 apps/lcache 里 lark build，得到 build/lcache。连接循环和 HTTP 的解析、回复用 std/http（serve）
+//
+//   lcache [--port 端口] [--bind 地址]      默认 127.0.0.1:8090；端口给 0 时由系统挑
+//
+//   curl -X PUT --data-binary 'hi' 'http://127.0.0.1:8090/k/a?ttl=60'
+//   curl http://127.0.0.1:8090/k/a
+//
+// 每个连接一个任务（std/http 的 serve）；数据分 16 段，每段一个 Mutex（kv/store.lark）。另有一个任务每秒清一次过期的键：
+// serve 返回时（accept 出错，所有连接都处理完）调用 stop.cancel()，清理的任务收到就退出（std/sync 的 Cancel）；清理按 std/timer 的 every 对齐。
+// 还有一个任务等 SIGINT / SIGTERM（on_signal），收到就写日志退出。
+import "std/net"
+import "std/io"
+import "std/time"
+import "std/log"
+import "std/signal"
+import "std/sync"
+import "std/timer"
+import "std/http"
+import "kv/store"
+import "kv/api"
+
+const SWEEP_MS = 1000
+
+type Server {
+    l: net.Listener
+    s: store.Store
+    stop: sync.Cancel       // serve 返回时 cancel：清理的任务就知道该退出了
+}
+
+fn serve_kv(take sv: Server) {
+    s = sv.s.copy()
+    h: Fn(http.Request) -> http.Response = |req| api.handle(s, req, time.unix_ms())
+    match http.serve(sv.l, h) {
+        Ok => {}
+        Err(e) => log.new("lcache").log(log.ERROR, "accept 出错，不再接受新连接", ["err", e.copy()])
+    }
+    sv.stop.cancel()
+}
+
+type Sweeper {
+    s: store.Store
+    stop: sync.Cancel
+}
+
+fn sweeper(take w: Sweeper) {
+    stop = w.stop.watch()
+    t = timer.every(SWEEP_MS)
+    going = true
+    for going {
+        select {
+            _v <- stop => { going = false }
+            after t.next_ms() => { _n = store.sweep(w.s, time.unix_ms()) }
+        }
+    }
+}
+
+fn run_server(host: str, port: int) -> ()! {
+    // 先登记信号再告诉别人准备好了：之后的 Ctrl-C、kill 都由 on_signal 处理
+    sigs = signal.notify([signal.INT, signal.TERM])?
+    l = net.listen(host, port)?
+    p = l.local_port()?
+    // 先写出来再开始等：测试脚本靠这一行知道端口
+    out = io.stdout()
+    out.write_line("lcache 在 http://#{host}:#{p}/ 上")?
+    out.flush()?
+    s = store.new()
+    stop = sync.new_cancel()
+    scope {
+        spawn(on_signal, sigs)
+        spawn(sweeper, Sweeper(s: s.copy(), stop: stop.copy()))
+        spawn(serve_kv, Server(l: l, s: s, stop: stop))
+    }
+}
+
+// 收到 SIGINT（Ctrl-C）或 SIGTERM（kill）：写一行日志就退出，不等进行中的连接
+fn on_signal(take s: signal.Signals) {
+    n = s.wait() ?? signal.TERM
+    log.new("lcache").info("收到 #{signal.name(n)}，退出")
+    exit(0)
+}
+
+fn usage() {
+    eprint("用法：lcache [--port 端口] [--bind 地址]")
+    exit(2)
+}
+
+fn main() {
+    av = args()
+    host = "127.0.0.1"
+    port = 8090
+    k = 1
+    for k < len(av) {
+        if k + 1 >= len(av) { usage() }
+        if av[k] == "--port" {
+            port = try_parse_int(av[k + 1]) ?? -1
+            if port < 0 { usage() }
+        } else if av[k] == "--bind" {
+            host = av[k + 1].copy()
+        } else {
+            usage()
+        }
+        k += 2
+    }
+    match run_server(host, port) {
+        Ok => {}
+        Err(e) => {
+            eprint("lcache：#{e}")
+            exit(1)
+        }
+    }
+}

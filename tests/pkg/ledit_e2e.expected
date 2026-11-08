@@ -1,0 +1,10 @@
+ok   save_msg
+ok   saved
+ok   new_file
+ok   quit_warn
+ok   unsaved
+ok   undo_save
+ok   screen
+ok   bad_script
+ok   not_tty
+ok   big_file

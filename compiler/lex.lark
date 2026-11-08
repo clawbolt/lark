@@ -1,0 +1,488 @@
+// Lark 编译器 stage1 · 词法分析
+// token 的 kind：标识符 "ident"、整数 "int"、浮点数 "float"（text 是原文）、字符串 "str"、换行 "nl"、结束 "eof"；
+// 关键字和符号直接用原文作 kind。插值字符串展开成
+//   istart（ipart | icode … icodeend）* iend
+
+type Tok {
+    kind: str
+    text: str
+    num: int
+    line: int
+    col: int
+}
+
+type Lx {
+    src: str
+    i: int
+    stop: int
+    line: int
+    col: int
+    stack: [int]
+    last: str
+    toks: [Tok]
+}
+
+// 注意：Lark 的续行规则要求运算符写在行尾
+fn is_keyword(s: str) -> bool {
+    s == "fn" || s == "type" || s == "enum" || s == "if" || s == "else" || s == "match" ||
+        s == "for" || s == "in" || s == "return" || s == "break" || s == "continue" ||
+        s == "true" || s == "false" || s == "take" || s == "inout" || s == "interface" || s == "pub" || s == "import" || s == "scope" || s == "select" || s == "const"
+}
+
+// 这些 token 之后的换行视为续行
+fn continues(k: str) -> bool {
+    k == "+" || k == "-" || k == "*" || k == "/" || k == "%" || k == "==" || k == "!=" ||
+        k == "<" || k == "<=" || k == ">" || k == ">=" || k == "&&" || k == "||" ||
+        k == "!" || k == "=" || is_compound(k) || k == "," ||
+        k == "." || k == ".." || k == "->" || k == "=>" || k == "&" || k == ":" ||
+        k == "(" || k == "[" || k == "{" || k == "nl" || k == "??" ||
+        k == "|" || k == "^" || k == "<<" || k == ">>" || k == ">>>" || k == "+%" || k == "-%" || k == "*%"
+}
+
+fn is_ident_start(c: int) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+fn is_digit(c: int) -> bool {
+    c >= '0' && c <= '9'
+}
+
+fn peek_at(lx: Lx, k: int) -> int {
+    if lx.i + k < lx.stop { byte_at(lx.src, lx.i + k) } else { 0 }
+}
+
+fn adv(inout lx: Lx) {
+    if byte_at(lx.src, lx.i) == '\n' {
+        lx.line += 1
+        lx.col = 1
+    } else {
+        lx.col += 1
+    }
+    lx.i += 1
+}
+
+fn add_tok(inout lx: Lx, kind: str, text: str, num: int, line: int, col: int) {
+    lx.toks.push(Tok(kind: kind, text: text, num: num, line: line, col: col))
+    lx.last = kind
+}
+
+fn newline_significant(lx: Lx) -> bool {
+    n = len(lx.stack)
+    n == 0 || lx.stack[n - 1] == '{'
+}
+
+fn next_line_starts_with_dot(lx: Lx) -> bool {
+    j = lx.i
+    for j < lx.stop {
+        c = byte_at(lx.src, j)
+        if c != ' ' && c != '\t' && c != '\n' && c != '\r' { break }
+        j += 1
+    }
+    j + 1 < lx.stop && byte_at(lx.src, j) == '.' && byte_at(lx.src, j + 1) != '.'
+}
+
+// 跳过数字和分隔用的 _
+fn skip_digits(inout lx: Lx) {
+    for lx.i < lx.stop && (is_digit(byte_at(lx.src, lx.i)) || byte_at(lx.src, lx.i) == '_') { adv(&lx) }
+}
+
+fn no_underscore(s: str) -> str {
+    out = ""
+    for i in 0..len(s) {
+        if byte_at(s, i) != '_' { out = out + slice(s, i, i + 1) }
+    }
+    out
+}
+
+fn read_escape(inout lx: Lx, line: int, col: int) -> int {
+    adv(&lx)
+    if lx.i >= lx.stop { fail(line, col, "字符串未结束") }
+    c = byte_at(lx.src, lx.i)
+    adv(&lx)
+    match c {
+        'n' => 10
+        't' => 9
+        'r' => 13
+        '0' => 0
+        '\\' => '\\'
+        '"' => '"'
+        '\'' => '\''
+        '#' => '#'
+        'e' => 27
+        'x' => read_hex2(&lx, line, col)
+        _ => { fail(line, col, "未知转义 \\#{from_byte(c)}（能写的：\\n \\t \\r \\0 \\e \\xHH \\\\ \\\" \\' \\#）"); exit(1) }
+    }
+}
+
+// \x 后面正好两位十六进制数字：一个字节（\x1b 是 ESC，\xe4\xb8\xad 是“中”的 UTF-8）
+fn read_hex2(inout lx: Lx, line: int, col: int) -> int {
+    v = 0
+    for _k in 0..2 {
+        d = if lx.i < lx.stop { hex_digit(byte_at(lx.src, lx.i)) } else { -1 }
+        if d < 0 { fail(line, col, "\\x 后面要正好两位十六进制数字，比如 \\x1b") }
+        v = v * 16 + d
+        adv(&lx)
+    }
+    v
+}
+
+// 复合赋值：x op= v 就是 x = x op v
+fn is_compound(k: str) -> bool {
+    k == "+=" || k == "-=" || k == "*=" || k == "/=" || k == "%=" || k == "&=" || k == "|=" || k == "^=" ||
+        k == "<<=" || k == ">>=" || k == ">>>="
+}
+
+fn two_char_op(s: str) -> bool {
+    s == ".." || s == "->" || s == "=>" || s == "==" || s == "!=" || s == "<=" || s == ">=" ||
+        s == "&&" || s == "||" || s == "+=" || s == "-=" || s == "*=" || s == "??" ||
+        s == "/=" || s == "%=" || s == "&=" || s == "|=" || s == "^=" ||
+        s == "<<" || s == ">>" || s == "+%" || s == "-%" || s == "*%"
+}
+
+fn one_char_op(c: int) -> bool {
+    c == ',' || c == ':' || c == ';' || c == '.' || c == '&' || c == '+' || c == '-' ||
+        c == '*' || c == '/' || c == '%' || c == '<' || c == '>' || c == '!' || c == '=' || c == '?' || c == '|' || c == '^'
+}
+
+fn lex_string(inout lx: Lx, line: int, col: int) {
+    adv(&lx)
+    buf = ""
+    interp = false
+    done = false
+    for !done {
+        if lx.i >= lx.stop { fail(line, col, "字符串未结束") }
+        c = byte_at(lx.src, lx.i)
+        if c == '"' {
+            adv(&lx)
+            done = true
+        } else if c == '\\' {
+            b = read_escape(&lx, line, col)
+            buf = buf + from_byte(b)
+        } else if c == '#' && peek_at(lx, 1) == '{' {
+            if !interp {
+                add_tok(&lx, "istart", "", 0, line, col)
+                interp = true
+            }
+            if len(buf) > 0 {
+                add_tok(&lx, "ipart", buf, 0, line, col)
+                buf = ""
+            }
+            adv(&lx)
+            adv(&lx)
+            cl = lx.line
+            cc = lx.col
+            b0 = lx.i
+            depth = 1
+            for depth > 0 {
+                if lx.i >= lx.stop { fail(line, col, "插值 \#{ 未闭合") }
+                d = byte_at(lx.src, lx.i)
+                if d == '{' { depth += 1 }
+                if d == '}' { depth -= 1 }
+                if depth > 0 { adv(&lx) }
+            }
+            add_tok(&lx, "icode", "", 0, cl, cc)
+            sub = Lx(src: lx.src, i: b0, stop: lx.i, line: cl, col: cc, stack: [], last: "nl", toks: [])
+            lex_all(&sub)
+            subtoks = replace(&sub.toks, [])
+            for t in subtoks {
+                lx.toks.push(t.copy())
+            }
+            el = lx.line
+            ec = lx.col
+            add_tok(&lx, "icodeend", "", 0, el, ec)
+            adv(&lx)
+        } else {
+            buf = buf + from_byte(c)
+            adv(&lx)
+        }
+    }
+    if interp {
+        if len(buf) > 0 { add_tok(&lx, "ipart", buf, 0, line, col) }
+        add_tok(&lx, "iend", "", 0, line, col)
+    } else {
+        add_tok(&lx, "str", buf, 0, line, col)
+    }
+}
+
+// 一位十六进制数字的值，不是时为 -1
+fn hex_digit(d: int) -> int {
+    if d >= '0' && d <= '9' {
+        d - '0'
+    } else if d >= 'a' && d <= 'f' {
+        d - 'a' + 10
+    } else if d >= 'A' && d <= 'F' {
+        d - 'A' + 10
+    } else {
+        -1
+    }
+}
+
+// 0x 十六进制、0o 八进制、0b 二进制的整数字面量，可以用 _ 分隔（0o755 是文件权限的常见写法）。最多 64 位：
+// 第 64 位是 1 时按补码读成负数（0xFFFF_FFFF_FFFF_FFFF 是 -1），这样写掩码和哈希常数时不用换算
+fn lex_radix(inout lx: Lx, line: int, col: int) {
+    r = peek_at(lx, 1)
+    base = if r == 'x' { 16 } else if r == 'o' { 8 } else { 2 }
+    adv(&lx)
+    adv(&lx)
+    w = if base == 16 { 4 } else if base == 8 { 3 } else { 1 }
+    ds: [int] = []
+    nd = 0
+    for lx.i < lx.stop && (is_ident_start(byte_at(lx.src, lx.i)) || is_digit(byte_at(lx.src, lx.i))) {
+        d = byte_at(lx.src, lx.i)
+        if d != '_' {
+            v = if base == 16 { hex_digit(d) } else if d >= '0' && d - '0' < base { d - '0' } else { -1 }
+            if v < 0 {
+                kind = if base == 16 { "十六进制" } else if base == 8 { "八进制" } else { "二进制" }
+                fail(line, col, "#{kind}字面量里不能有 #{from_byte(d)}")
+            }
+            nd += 1
+            // 开头的 0 不算位数
+            if v > 0 || len(ds) > 0 { ds.push(v) }
+        }
+        adv(&lx)
+    }
+    if nd == 0 { fail(line, col, "0x / 0o / 0b 后面要有数字") }
+    if len(ds) == 0 {
+        add_tok(&lx, "int", "", 0, line, col)
+        return
+    }
+    // 最高的一位数字占几位
+    top = 0
+    t = ds[0]
+    for t > 0 {
+        top += 1
+        t = t / 2
+    }
+    bits = (len(ds) - 1) * w + top
+    if bits > 64 { fail(line, col, "整数字面量超过 64 位") }
+    neg = bits == 64
+    if neg {
+        // 去掉第 64 位，算出低 63 位之后再加上 int 的最小值
+        hb = 1
+        for _k in 1..top { hb = hb * 2 }
+        ds[0] = ds[0] - hb
+    }
+    n = 0
+    for d in ds { n = n * base + d }
+    if neg { n = n + int_min() }
+    add_tok(&lx, "int", "", n, line, col)
+}
+
+fn lex_all(inout lx: Lx) {
+    for lx.i < lx.stop {
+        c = byte_at(lx.src, lx.i)
+        line = lx.line
+        col = lx.col
+        if c == '\n' {
+            adv(&lx)
+            if newline_significant(lx) && !continues(lx.last) && !next_line_starts_with_dot(lx) {
+                add_tok(&lx, "nl", "", 0, line, col)
+            }
+        } else if c == ' ' || c == '\t' || c == '\r' {
+            adv(&lx)
+        } else if c == '/' && peek_at(lx, 1) == '/' {
+            for lx.i < lx.stop && byte_at(lx.src, lx.i) != '\n' { adv(&lx) }
+        } else if is_ident_start(c) {
+            b = lx.i
+            for lx.i < lx.stop && (is_ident_start(byte_at(lx.src, lx.i)) || is_digit(byte_at(lx.src, lx.i))) {
+                adv(&lx)
+            }
+            s = slice(lx.src, b, lx.i)
+            if is_keyword(s) {
+                add_tok(&lx, s, s, 0, line, col)
+            } else {
+                add_tok(&lx, "ident", s, 0, line, col)
+            }
+        } else if c == '0' && (peek_at(lx, 1) == 'x' || peek_at(lx, 1) == 'o' || peek_at(lx, 1) == 'b') {
+            lex_radix(&lx, line, col)
+        } else if is_digit(c) {
+            // 数字：整数，或者带小数点 / 指数的浮点数（1.5、2e10、3.0e-3）。
+            // t.0.1 这类元组下标紧跟在 . 后面，不当成小数；1..5 的 .. 也不是小数点
+            b0 = lx.i
+            skip_digits(&lx)
+            is_float = false
+            if lx.last != "." && peek_at(lx, 0) == '.' && is_digit(peek_at(lx, 1)) {
+                is_float = true
+                adv(&lx)
+                skip_digits(&lx)
+            }
+            e0 = peek_at(lx, 0)
+            if e0 == 'e' || e0 == 'E' {
+                s1 = peek_at(lx, 1)
+                ek = if s1 == '+' || s1 == '-' { 2 } else { 1 }
+                if is_digit(peek_at(lx, ek)) {
+                    is_float = true
+                    for _j in 0..ek { adv(&lx) }
+                    skip_digits(&lx)
+                }
+            }
+            if is_float {
+                add_tok(&lx, "float", no_underscore(slice(lx.src, b0, lx.i)), 0, line, col)
+            } else {
+                n = 0
+                for j in b0..lx.i {
+                    d = byte_at(lx.src, j)
+                    if d != '_' {
+                        if n > (int_max() - (d - '0')) / 10 {
+                            fail(line, col, "整数字面量超出 int 的范围（最大 9223372036854775807，最小值请写成 -MAX - 1）")
+                        }
+                        n = n * 10 + (d - '0')
+                    }
+                }
+                add_tok(&lx, "int", "", n, line, col)
+            }
+        } else if c == '\'' {
+            adv(&lx)
+            if lx.i >= lx.stop { fail(line, col, "字符字面量未结束") }
+            ch = 0
+            if byte_at(lx.src, lx.i) == '\\' {
+                ch = read_escape(&lx, line, col)
+            } else {
+                ch = byte_at(lx.src, lx.i)
+                adv(&lx)
+            }
+            if lx.i >= lx.stop || byte_at(lx.src, lx.i) != '\'' { fail(line, col, "字符字面量只能包含一个字节") }
+            adv(&lx)
+            add_tok(&lx, "int", "", ch, line, col)
+        } else if c == '"' {
+            lex_string(&lx, line, col)
+        } else {
+            two = if lx.i + 1 < lx.stop { slice(lx.src, lx.i, lx.i + 2) } else { "" }
+            three = if lx.i + 2 < lx.stop { slice(lx.src, lx.i, lx.i + 3) } else { "" }
+            if three == ">>>" && peek_at(lx, 3) == '=' {
+                for _k in 0..4 { adv(&lx) }
+                add_tok(&lx, ">>>=", ">>>=", 0, line, col)
+            } else if three == ">>>" || three == "<<=" || three == ">>=" {
+                for _k in 0..3 { adv(&lx) }
+                add_tok(&lx, three, three, 0, line, col)
+            } else if two_char_op(two) {
+                adv(&lx)
+                adv(&lx)
+                add_tok(&lx, two, two, 0, line, col)
+            } else if c == '(' || c == '[' || c == '{' {
+                lx.stack.push(c)
+                adv(&lx)
+                s = from_byte(c)
+                add_tok(&lx, s, s, 0, line, col)
+            } else if c == ')' || c == ']' || c == '}' {
+                if len(lx.stack) == 0 { fail(line, col, "多余的 #{from_byte(c)}") }
+                lx.stack.pop()
+                adv(&lx)
+                s = from_byte(c)
+                add_tok(&lx, s, s, 0, line, col)
+            } else if one_char_op(c) {
+                adv(&lx)
+                s = from_byte(c)
+                add_tok(&lx, s, s, 0, line, col)
+            } else {
+                fail(line, col, "无法识别的字符 '#{from_byte(c)}'")
+            }
+        }
+    }
+}
+
+// 行号编码：第 k 个文件（从 0 数）的第 n 行记为 k * 100000 + n，报错时再拆开（见 main.lark 的 fail）
+fn file_base(k: int) -> int { k * 100000 }
+
+fn tokenize_files(srcs: [str]) -> [Tok] {
+    lx = Lx(src: "", i: 0, stop: 0, line: 1, col: 1, stack: [], last: "nl", toks: [])
+    for k in 0..len(srcs) {
+        lx.src = srcs[k]
+        // 开头的 UTF-8 BOM（EF BB BF，Windows 的编辑器常常加上）跳过；列号照样从 1 数
+        bom = len(srcs[k]) >= 3 && byte_at(srcs[k], 0) == 0xEF && byte_at(srcs[k], 1) == 0xBB && byte_at(srcs[k], 2) == 0xBF
+        lx.i = if bom { 3 } else { 0 }
+        lx.stop = len(srcs[k])
+        lx.line = file_base(k) + 1
+        lx.col = 1
+        lx.stack = []
+        lex_all(&lx)
+        el = lx.line
+        ec = lx.col
+        // 每个文件结尾都补一个换行，防止上一个文件的最后一行和下一个文件的第一行粘在一起
+        add_tok(&lx, "nl", "", 0, el, ec)
+    }
+    fl = lx.line
+    fc = lx.col
+    add_tok(&lx, "eof", "", 0, fl, fc)
+    replace(&lx.toks, [])
+}
+
+// ---------- 单元测试（lark1 --test，见 make unit-compiler） ----------
+
+// 一段源码的 token 种类，用空格隔开
+fn tok_kinds(src: str) -> str {
+    ks: [str] = []
+    for t in tokenize_files([src]) { ks.push(t.kind) }
+    join(ks, " ")
+}
+
+test "词法：基本 token 和行尾" {
+    assert_eq(tok_kinds("x = 1 + 2"), "ident = int + int nl eof")
+    assert_eq(tok_kinds("fn main() {}"), "fn ident ( ) { } nl eof")
+    // test 不是关键字
+    assert_eq(tok_kinds("test"), "ident nl eof")
+}
+
+test "词法：括号里和运算符之后的换行不算语句结束" {
+    assert_eq(tok_kinds("f(1,\n2)"), "ident ( int , int ) nl eof")
+    assert_eq(tok_kinds("a +\nb"), "ident + ident nl eof")
+    assert_eq(tok_kinds("a\nb"), "ident nl ident nl eof")
+    // 下一行以 . 开头时是续行，.. 不算
+    assert_eq(tok_kinds("xs\n    .len()"), "ident . ident ( ) nl eof")
+}
+
+test "词法：数字" {
+    ts = tokenize_files(["1_000 1.5 2e3 1..3 t.0"])
+    assert_eq(ts[0].num, 1000)
+    assert_eq(ts[1].kind, "float")
+    assert_eq(ts[1].text, "1.5")
+    assert_eq(ts[2].kind, "float")
+    assert_eq(ts[3].kind, "int")
+    assert_eq(ts[4].kind, "..")
+    // 元组下标 t.0 的 0 不是小数
+    assert_eq(ts[8].kind, "int")
+    ch = tokenize_files(["'a'"])
+    assert_eq(ch[0].num, 97)
+    big = tokenize_files(["9223372036854775807"])
+    assert_eq(big[0].num, int_max())
+}
+
+test "词法：十六进制、八进制、二进制和位运算符" {
+    ts = tokenize_files(["0xff 0b1010 0x_FF_ff 0x0 0xFFFF_FFFF_FFFF_FFFF 0x8000_0000_0000_0000 0x7FFF_FFFF_FFFF_FFFF"])
+    assert_eq(ts[0].num, 255)
+    assert_eq(ts[1].num, 10)
+    assert_eq(ts[2].num, 65535)
+    assert_eq(ts[3].num, 0)
+    assert_eq(ts[4].num, -1)
+    assert_eq(ts[5].num, int_min())
+    assert_eq(ts[6].num, int_max())
+    os = tokenize_files(["0o755 0o0 0o1_000 0o100644 0o1777777777777777777777"])
+    assert_eq(os[0].num, 493)
+    assert_eq(os[1].num, 0)
+    assert_eq(os[2].num, 512)
+    assert_eq(os[3].num, 33188)
+    assert_eq(os[4].num, -1)
+    assert_eq(tok_kinds("a & b | c ^ d"), "ident & ident | ident ^ ident nl eof")
+    assert_eq(tok_kinds("a << 1 >> 2 >>> 3"), "ident << int >> int >>> int nl eof")
+    assert_eq(tok_kinds("a +% b -% c *% d"), "ident +% ident -% ident *% ident nl eof")
+    assert_eq(tok_kinds("a /= b %= c &= d |= e ^= f <<= g >>= h >>>= i"), "ident /= ident %= ident &= ident |= ident ^= ident <<= ident >>= ident >>>= ident nl eof")
+    // a <= b 和 a << b 不受影响
+    assert_eq(tok_kinds("a <= b << c >>> d"), "ident <= ident << ident >>> ident nl eof")
+    // 行尾的位运算符表示还没写完
+    assert_eq(tok_kinds("x = a |\nb"), "ident = ident | ident nl eof")
+}
+
+test "词法：字符串和插值" {
+    assert_eq(tok_kinds("\"a\\n\""), "str nl eof")
+    tab = tokenize_files(["\"a\\tb\""])
+    assert_eq(tab[0].text, "a\tb")
+    assert_eq(tok_kinds("\"a\#{x}b\""), "istart ipart icode ident icodeend ipart iend nl eof")
+}
+
+test "词法：行号里编码了文件序号" {
+    ts = tokenize_files(["a", "b\nc"])
+    assert_eq(ts[0].line, 1)
+    assert_eq(ts[2].line, 100001)
+    assert_eq(ts[4].line, 100002)
+    assert_eq(ts[4].col, 1)
+}

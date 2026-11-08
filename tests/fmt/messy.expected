@@ -1,0 +1,32 @@
+// 格式化测试：缩进、续行、行内空格、空行
+fn add(a: int, b: int) -> int { a + b }
+
+fn main() {
+    xs = [1, 2, 3]
+    total = 0
+    for x in xs {
+        total += x   // 行尾注释前的空格保留
+    }
+    ok = total > 3 &&
+        total < 10
+    if ok &&
+        total != 0 {
+        print("ok：#{add(1,2)}  {不动}")
+    } else {
+        print("不对")
+    }
+    s = "第一行
+  第二行原样
+"
+    print(s)
+    c = ','
+    m = match total {
+        6 => "六"
+        _ =>
+            "其它"
+    }
+
+    print(m)
+    ys = xs
+        .copy()
+}

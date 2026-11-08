@@ -1,0 +1,48 @@
+// HKDF-SHA256（RFC 5869），以及 TLS 1.3 的 HKDF-Expand-Label 和 Derive-Secret（RFC 8446 第 7.1 节）。
+// 先证明再写：对应 formal/Lark/Tls.lean 的 expT / expand（expand_len：输出正好 n 字节；expand_ctr：块计数放得进 1 个字节）
+// 和 labelInfo（label_inj：不同的 长度、label、context 拼出来的 info 一定不同）
+import "std/digest"
+
+// PRK = HMAC(salt, ikm)。salt 是空的时候和 32 个 0 一样（HMAC 的密钥本来就补 0）
+pub fn extract(salt: [u8], ikm: [u8]) -> [u8] { digest.hmac_sha256(salt, ikm) }
+
+// T(i) = HMAC(prk, T(i-1) + info + i)，i = 1..(n + 31) / 32，拼起来取前 n 字节（expT 和 expand）。
+// n 不在 0..8160 里时 panic（调用的人写错了）：8160 = 255 × 32，这样 i 最大 255，放得进 1 个字节
+pub fn expand(prk: [u8], info: [u8], n: int) -> [u8] {
+    if n < 0 || n > 255 * 32 { panic("hkdf.expand：长度 #{n} 不在 0..8160 里") }
+    out: [u8] = []
+    t: [u8] = []
+    for i in 1..(n + 31) / 32 + 1 {
+        m = t.copy()
+        for b in info { m.push(b) }
+        m.push(i.wrap_u8())
+        t = digest.hmac_sha256(prk, m)
+        for b in t {
+            if len(out) < n { out.push(b) }
+        }
+    }
+    out
+}
+
+// HkdfLabel（labelInfo）：长度（2 字节大端）、"tls13 " + label（前面 1 字节长度）、context（前面 1 字节长度）。
+// label_inj 要每个长度都放得进它的位置，所以 label 超过 249 字节（加上 "tls13 " 超过 255）、
+// context 超过 255 字节时 panic，不截断；n 由 expand 检查（≤ 8160，放得进 2 个字节）
+pub fn expand_label(secret: [u8], label: str, context: [u8], n: int) -> [u8] {
+    if len(label) > 249 { panic("hkdf.expand_label：label 有 #{len(label)} 字节，最多 249") }
+    if len(context) > 255 { panic("hkdf.expand_label：context 有 #{len(context)} 字节，最多 255") }
+    if n < 0 || n > 255 * 32 { panic("hkdf.expand：长度 #{n} 不在 0..8160 里") }
+    full = "tls13 " + label
+    info: [u8] = []
+    info.push((n >>> 8).wrap_u8())
+    info.push((n & 255).wrap_u8())
+    info.push(len(full).wrap_u8())
+    for b in full.to_bytes() { info.push(b) }
+    info.push(len(context).wrap_u8())
+    for b in context { info.push(b) }
+    expand(secret, info, n)
+}
+
+// Derive-Secret(secret, label, 消息) = expand_label(secret, label, 消息的 SHA-256, 32)；这里直接给摘要
+pub fn derive_secret(secret: [u8], label: str, transcript_hash: [u8]) -> [u8] {
+    expand_label(secret, label, transcript_hash, 32)
+}

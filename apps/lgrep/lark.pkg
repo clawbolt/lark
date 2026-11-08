@@ -1,0 +1,3 @@
+# lgrep：用 Lark 写的 grep，自带一个小的正则表达式引擎（见 re/re.lark）
+name = lgrep
+version = 0.1.0

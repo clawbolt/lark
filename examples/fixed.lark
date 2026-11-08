@@ -1,0 +1,49 @@
+// 定宽整数 u8、u16、u32、i32：读写寄存器、二进制格式用。值放在 C 里同样宽的类型里（uint16_t……）。
+// 和 u8 一样只存不算：可以比较、做 & | ^ !、打印、放进列表和结构体，不能直接 + - * / %：
+// 先 .to_int() 算，再用 .to_u16()（超出范围时 panic）、.wrap_u16()（只取低位）、.try_u16()（u16?）转回来
+type Header {
+    magic: u32
+    version: u16
+    offset: i32
+}
+
+fn parse(d: [u8]) -> Header {
+    m = (d[0].to_int() << 24) | (d[1].to_int() << 16) | (d[2].to_int() << 8) | d[3].to_int()
+    v = (d[4].to_int() << 8) | d[5].to_int()
+    o = (d[6].to_int() << 24) | (d[7].to_int() << 16) | (d[8].to_int() << 8) | d[9].to_int()
+    Header(magic: m.to_u32(), version: v.to_u16(), offset: o.wrap_i32())
+}
+
+fn main() {
+    // 字面量按期望的类型检查范围；i32 可以直接写负数
+    a: u16 = 65_535
+    b: u32 = 4_294_967_295
+    c: i32 = -2_147_483_648
+    print("最大最小：#{a} #{b} #{c}")
+    // 位运算的结果还是原来的类型；! 只翻转它自己的那些位
+    flags: u16 = 0b1010
+    print("位运算：#{flags & 0b0110} #{flags | 1} #{flags ^ 0xFFFF} #{!flags}")
+    zero: u32 = 0
+    print("u32 取反：#{!zero}")
+    // 比较
+    print("比较：#{a > 1} #{c < 0} #{b == 4_294_967_295}")
+    // 算术先转成 int
+    sum = a.to_int() + 1
+    print("算术：#{sum} 回绕成 u16 是 #{sum.wrap_u16()}，放进 u16：#{sum.try_u16()}")
+    p31 = 2_147_483_648
+    p32 = 4_294_967_295
+    m1 = -1
+    print("i32 回绕：#{p31.wrap_i32()} #{p32.wrap_i32()} #{m1.wrap_u32()}")
+    n70k = 70_000
+    n300 = 300
+    print("try：#{m1.try_u16()} #{n70k.try_u16()} #{n300.try_i32()}")
+    // 从字节里读出头部
+    h = parse([0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x03, 0xFF, 0xFF, 0xFF, 0xF0])
+    print("头部：magic=#{h.magic} version=#{h.version} offset=#{h.offset}")
+    // 列表、元组、T? 里都能放
+    regs: [u32] = [1, 2, 0xFFFF_FFFF]
+    print("列表：#{regs} 元组：#{(a, c)}")
+    // 超出范围：panic
+    big = 65_536
+    print("#{big.to_u16()}")
+}

@@ -1,0 +1,1238 @@
+// Lark 编译器 stage1 · C 代码生成：控制流、语句、函数与整个程序
+
+type FnOut {
+    proto: str
+    body: str
+}
+
+// if 条件：已经整体带括号就不再套一层
+fn paren(s: str) -> str {
+    n = len(s)
+    wrapped = false
+    if n >= 2 && byte_at(s, 0) == '(' {
+        depth = 0
+        closes_at = -1
+        for i in 0..n {
+            if closes_at < 0 {
+                b = byte_at(s, i)
+                if b == '(' { depth += 1 }
+                if b == ')' {
+                    depth -= 1
+                    if depth == 0 { closes_at = i }
+                }
+            }
+        }
+        wrapped = closes_at == n - 1
+    }
+    if wrapped { s } else { "(" + s + ")" }
+}
+
+fn gen_return(c: Ctx, inout g: Gen, val: Expr?) {
+    rt = g.ret
+    match val {
+        Some(rv) => {
+            if is_self_tail(c, g.fi, rv) && !c.wrap[rv.id] && !defers_active(g) {
+                // return f(…) 调用自己：变成跳转
+                match rv.kind {
+                    ECall(_, args, _) => gen_tail(c, &g, rv, args)
+                    _ => {}
+                }
+            } else if rt != 3 {
+                v = owned(c, &g, rv)
+                if c.ety[rv.id] != 4 {
+                    r = fresh(&g, "r")
+                    ct = ctype(c, &g, rt)
+                    emit(&g, "#{ct} #{r} = #{v};")
+                    drop_all(c, &g)
+                    emit(&g, "return #{r};")
+                }
+            } else {
+                discard(c, &g, rv)
+                drop_all(c, &g)
+                emit(&g, "return;")
+            }
+        }
+        None => {
+            drop_all(c, &g)
+            if is_res_unit(c, rt) {
+                // ()! 函数里的裸 return 表示成功
+                emit(&g, "return lk_ok_#{mangle(c, rt)}();")
+            } else {
+                emit(&g, "return;")
+            }
+        }
+    }
+}
+
+// 只为副作用求值，结果丢弃
+fn discard(c: Ctx, inout g: Gen, e: Expr) {
+    t = c.ety[e.id]
+    register(c, &g, t)
+    match e.kind {
+        EIf(_, _, _) => control(c, &g, e, "")
+        EMatch(_, _, _) => control(c, &g, e, "")
+        EBlock(_) => control(c, &g, e, "")
+        EScope(_) => control(c, &g, e, "")
+        ELock(_, _, _, _) => control(c, &g, e, "")
+        ESelect(_) => control(c, &g, e, "")
+        EInt(_) => {}
+        EFloat(_) => {}
+        EBool(_) => {}
+        EStr(_) => {}
+        _ => {
+            if !is_place(e) {
+                v = read(c, &g, e)
+                if v != "" && !managed(t) { emit(&g, "(void)(#{v});") }
+            }
+        }
+    }
+}
+
+// target 为 "" 时丢弃结果
+fn assign_into(c: Ctx, inout g: Gen, target: str, e: Expr) {
+    if target == "" {
+        discard(c, &g, e)
+    } else {
+        v = owned(c, &g, e)
+        if v != "" && c.ety[e.id] != 4 { emit(&g, "#{target} = #{v};") }
+    }
+}
+
+fn block_into(c: Ctx, inout g: Gen, b: Block, target: str) {
+    g.ind += 1
+    open_scope(&g, false)
+    for s in b.stmts { gen_stmt(c, &g, s) }
+    match b.tail {
+        Some(tx) => {
+            if !quiet_head(c, tx) { emit(&g, line_mark(tx.line)) }
+            assign_into(c, &g, target, tx)
+        }
+        None => {}
+    }
+    close_scope(c, &g)
+    g.ind -= 1
+}
+
+fn control(c: Ctx, inout g: Gen, e: Expr, target: str) {
+    match e.kind {
+        EIf(cond, thn, els) => {
+            cv = read(c, &g, cond)
+            emit(&g, "if #{paren(cv)} {")
+            block_into(c, &g, thn, target)
+            match els {
+                Some(eb) => {
+                    emit(&g, "} else {")
+                    block_into(c, &g, eb, target)
+                }
+                None => {}
+            }
+            emit(&g, "}")
+        }
+        EBlock(b) => {
+            emit(&g, "{")
+            block_into(c, &g, b, target)
+            emit(&g, "}")
+        }
+        EScope(b) => {
+            // 块里的 spawn 登记到这个 lk_scope，块尾逐个等待；从块里跳出去（return、?、break、continue）时也先等（见 drop_jump）
+            n = fresh(&g, "sc")
+            g.full_rt = true
+            emit(&g, "{ lk_scope #{n} = {0};")
+            g.sc.push(n)
+            open_exit(&g, "lk_scope_end(&#{n});", true)
+            block_into(c, &g, b, target)
+            g.scopes.pop()
+            g.sc.pop()
+            emit(&g, "lk_scope_end(&#{n}); }")
+        }
+        ELock(mx, _, id, b) => {
+            // 块里的 x 是指向互斥量里的值的指针；块尾解锁，从块里跳出去时也先解锁（见 drop_jump；panic 时进程直接退出）
+            mt = c.ety[mx.id]
+            mv = read(c, &g, mx)
+            n = fresh(&g, "mx")
+            emit(&g, "{ #{ctype(c, &g, mt)} #{n} = #{mv}; lk_mutex_lock(&#{n}->lk);")
+            v = c.vid[id]
+            emit(&g, "#{ctype(c, &g, telem(c, mt))}* #{c.locals[v].cname} = &#{n}->v;")
+            g.ptrs[v] = true
+            open_exit(&g, "lk_mutex_unlock(&#{n}->lk);", false)
+            block_into(c, &g, b, target)
+            g.scopes.pop()
+            emit(&g, "lk_mutex_unlock(&#{n}->lk); }")
+        }
+        EMatch(owning, scrut, arms) => gen_match(c, &g, owning, scrut, arms, target)
+        ESelect(sarms) => gen_select(c, &g, sarms, target)
+        _ => panic("内部错误：control")
+    }
+}
+
+// 模式的匹配条件。x 是被匹配值的 C 表达式（枚举、T?、T! 是指针；元组是结构体）；嵌套模式按 && 短路，
+// 所以先判断外层的标签，再读里面的字段
+fn arm_cond(c: Ctx, inout g: Gen, t: int, pat: Pat, x: str) -> str {
+    match pat {
+        PWild => "1"
+        PBind(_, _) => "1"
+        PInt(n) => "#{x} == INT64_C(#{n})"
+        PBool(b) => if b { x + " == true" } else { x + " == false" }
+        PStr(s) => {
+            l = lit(&g, s)
+            "lk_str_eq(#{x}, #{l})"
+        }
+        PType(_, id, _) => "(#{x}).vt->tid == INT64_C(#{c.ety[id]})"
+        POr(alts) => {
+            // 任一个选项匹配；每个选项单独加括号
+            cs: [str] = []
+            for a in alts {
+                sub = arm_cond(c, &g, t, a, x)
+                cs.push("(" + sub + ")")
+            }
+            join(cs, " || ")
+        }
+        PTuple(items) => {
+            es = tuple_elems(c, t)
+            cs: [str] = []
+            for k in 0..len(items) {
+                sub = arm_cond(c, &g, es[k], items[k], "(#{x}).f_#{k}")
+                cs.push(sub)
+            }
+            and_all(cs)
+        }
+        PVariant(vn, fs) => {
+            cs: [str] = []
+            if vn == "Some" {
+                cs.push(box_has(c, t, x))
+                if len(fs) == 1 { cs.push(arm_cond(c, &g, telem(c, t), fs[0], "(" + box_val(c, t, x) + ")")) }
+            } else if vn == "None" {
+                cs.push("!(" + box_has(c, t, x) + ")")
+            } else if vn == "Ok" {
+                cs.push(racc(c, t, x) + "ok")
+                if len(fs) == 1 { cs.push(arm_cond(c, &g, telem(c, t), fs[0], racc(c, t, x) + "val")) }
+            } else if vn == "Err" {
+                cs.push("!" + racc(c, t, x) + "ok")
+                if len(fs) == 1 { cs.push(arm_cond(c, &g, res_err(c, t), fs[0], racc(c, t, x) + "err")) }
+            } else {
+                ei = find_enum(c, tname(c, t))
+                idx = variant_index(c, ei, vn)
+                cs.push("#{eacc(c, t, x)}tag == #{idx + 1}")
+                for j in 0..len(fs) {
+                    ft = c.enums[ei].variants[idx].ftys[j]
+                    fx = "#{eacc(c, t, x)}u.v#{idx}." + fld(c.enums[ei].variants[idx].fnames[j])
+                    cs.push(arm_cond(c, &g, ft, fs[j], fx))
+                }
+            }
+            and_all(cs)
+        }
+    }
+}
+
+fn and_all(cs: [str]) -> str {
+    parts: [str] = []
+    for s in cs {
+        if s != "1" { parts.push(s) }
+    }
+    // 只有一个条件时不加括号（否则生成 if ((a == b))，clang 会警告）
+    if len(parts) == 0 {
+        "1"
+    } else if len(parts) == 1 {
+        parts[0].copy()
+    } else {
+        ws: [str] = []
+        for s in parts { ws.push("(" + s + ")") }
+        join(ws, " && ")
+    }
+}
+
+// 借用的 match：模式里的名字都是指向被匹配值内部的指针（只读），可以任意嵌套
+fn bind_ref(c: Ctx, inout g: Gen, t: int, pat: Pat, x: str) {
+    match pat {
+        PBind(_, id) => {
+            v = c.vid[id]
+            cn = c.locals[v].cname
+            ct = ctype(c, &g, t)
+            emit(&g, "#{ct}* #{cn} = &(#{x});")
+            g.ptrs[v] = true
+        }
+        PType(name, id, _) => {
+            // dyn 里装的值在堆上，obj 就指向它
+            if name != "_" {
+                v = c.vid[id]
+                cn = c.locals[v].cname
+                ct = ctype(c, &g, c.ety[id])
+                emit(&g, "#{ct}* #{cn} = (#{ct}*)(#{x}).obj;")
+                g.ptrs[v] = true
+            }
+        }
+        PTuple(items) => {
+            es = tuple_elems(c, t)
+            for k in 0..len(items) { bind_ref(c, &g, es[k], items[k], "(#{x}).f_#{k}") }
+        }
+        PVariant(vn, fs) => {
+            if vn == "Some" && len(fs) == 1 {
+                bind_ref(c, &g, telem(c, t), fs[0], "(" + box_val(c, t, x) + ")")
+            } else if vn == "Ok" && len(fs) == 1 {
+                bind_ref(c, &g, telem(c, t), fs[0], racc(c, t, x) + "val")
+            } else if vn == "Err" && len(fs) == 1 {
+                bind_ref(c, &g, res_err(c, t), fs[0], racc(c, t, x) + "err")
+            } else if tkind(c, t) == "enum" {
+                ei = find_enum(c, tname(c, t))
+                idx = variant_index(c, ei, vn)
+                for j in 0..len(fs) {
+                    ft = c.enums[ei].variants[idx].ftys[j]
+                    bind_ref(c, &g, ft, fs[j], "#{eacc(c, t, x)}u.v#{idx}." + fld(c.enums[ei].variants[idx].fnames[j]))
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn pat_name(p: Pat) -> str {
+    match p {
+        PBind(n, _) => n
+        _ => "_"
+    }
+}
+
+fn pat_id(p: Pat) -> int {
+    match p {
+        PBind(_, i) => i
+        _ => -1
+    }
+}
+
+fn bind_arm(c: Ctx, inout g: Gen, owning: bool, st: int, pat: Pat, sv: str, sval: str, shell_drop: str) {
+    match pat {
+        PWild => {
+            if owning { emit(&g, shell_drop) }
+        }
+        PBind(_, id) => {
+            v = c.vid[id]
+            cn = c.locals[v].cname
+            ct = ctype(c, &g, st)
+            if owning {
+                emit(&g, "#{ct} #{cn} = #{sv}; memset(&#{sv}, 0, sizeof(#{sv}));")
+                own_place(&g, cn, st)
+            } else {
+                emit(&g, "#{ct}* #{cn} = &(#{sval});")
+                g.ptrs[v] = true
+            }
+        }
+        PInt(_) => {}
+        PBool(_) => {}
+        PStr(_) => {}
+        PTuple(_) => {}
+        PType(_, _, _) => {}
+        POr(_) => {
+            // 不绑定名字：整个值用不到了，和 _ 一样释放
+            if owning { emit(&g, shell_drop) }
+        }
+        PVariant(vn, fields) => {
+            if is_box(c, st) {
+                bind_opt_arm(c, &g, owning, st, vn, fields, sv, sval, shell_drop)
+                return
+            }
+            ei = find_enum(c, tname(c, st))
+            idx = variant_index(c, ei, vn)
+            for j in 0..len(fields) {
+                if pat_name(fields[j]) != "_" {
+                    v = c.vid[pat_id(fields[j])]
+                    cn = c.locals[v].cname
+                    ft = c.enums[ei].variants[idx].ftys[j]
+                    lv = "#{eacc(c, st, sval)}u.v#{idx}." + fld(c.enums[ei].variants[idx].fnames[j])
+                    ct = ctype(c, &g, ft)
+                    if owning {
+                        emit(&g, "#{ct} #{cn} = #{lv}; memset(&(#{lv}), 0, sizeof(#{cn}));")
+                        own_place(&g, cn, ft)
+                    } else {
+                        emit(&g, "#{ct}* #{cn} = &(#{lv});")
+                        g.ptrs[v] = true
+                    }
+                }
+            }
+            if owning { emit(&g, shell_drop) }
+        }
+    }
+}
+
+// 可选值与结果的分支。sval 是容器指针本身（借用时为 (*m)，取得所有权时为 sv）。
+fn bind_opt_arm(c: Ctx, inout g: Gen, owning: bool, st: int, vn: str, fields: [Pat], sv: str, sval: str, shell_drop: str) {
+    if vn == "Ok" || vn == "Err" {
+        if len(fields) == 1 && pat_name(fields[0]) != "_" {
+            v = c.vid[pat_id(fields[0])]
+            cn = c.locals[v].cname
+            et = if vn == "Err" { res_err(c, st) } else { telem(c, st) }
+            fl = if vn == "Err" { "err" } else { "val" }
+            ct = ctype(c, &g, et)
+            if owning {
+                emit(&g, "#{ct} #{cn} = #{racc(c, st, sv)}#{fl}; memset(&#{racc(c, st, sv)}#{fl}, 0, sizeof(#{cn})); #{shell_drop}")
+                own_place(&g, cn, et)
+            } else {
+                emit(&g, "#{ct}* #{cn} = &(#{racc(c, st, sval)}#{fl});")
+                g.ptrs[v] = true
+            }
+        } else if owning {
+            emit(&g, shell_drop)
+        }
+        return
+    }
+    if vn == "Some" && pat_name(fields[0]) != "_" {
+        v = c.vid[pat_id(fields[0])]
+        cn = c.locals[v].cname
+        et = telem(c, st)
+        ct = ctype(c, &g, et)
+        if owning {
+            emit(&g, opt_take(c, st, sv, ct, cn))
+            own_place(&g, cn, et)
+        } else {
+            emit(&g, "#{ct}* #{cn} = &(#{box_val(c, st, sval)});")
+            g.ptrs[v] = true
+        }
+    } else if owning {
+        emit(&g, shell_drop)
+    }
+}
+
+fn gen_match(c: Ctx, inout g: Gen, owning: bool, s: Expr, arms: [Arm], target: str) {
+    st0 = c.ety[s.id]
+    // match 一个 shared 值：匹配的是里面的值（只读）
+    st = if is_shared(c, st0) { telem(c, st0) } else { st0 }
+    is_enum = tkind(c, st) == "enum" || is_box(c, st)
+    sv = fresh(&g, "m")
+    ct = ctype(c, &g, st)
+    if is_enum && owning {
+        v = owned(c, &g, s)
+        emit(&g, "#{ct} #{sv} = #{v};")
+    } else if is_enum {
+        v0 = read(c, &g, s)
+        v = if is_shared(c, st0) { "(" + v0 + ")->v" } else { v0 }
+        emit(&g, "#{ct}* #{sv} = &(#{v});")
+    } else {
+        v0 = read(c, &g, s)
+        v = if is_shared(c, st0) { "(" + v0 + ")->v" } else { v0 }
+        emit(&g, "#{ct} #{sv} = #{v};")
+    }
+    sval = if is_enum && !owning { "(*" + sv + ")" } else { sv }
+    shell_drop = drop_stmt(c, st, sv)
+    for i in 0..len(arms) {
+        cond = arm_cond(c, &g, st, arms[i].pat, sval)
+        kw = if i == 0 { "if" } else { "} else if" }
+        emit(&g, "#{kw} (#{cond}) {")
+        g.ind += 1
+        open_scope(&g, false)
+        if owning {
+            bind_arm(c, &g, owning, st, arms[i].pat, sv, sval, shell_drop)
+        } else {
+            bind_ref(c, &g, st, arms[i].pat, sval)
+        }
+        assign_into(c, &g, target, arms[i].body)
+        close_scope(c, &g)
+        g.ind -= 1
+    }
+    emit(&g, "} else {")
+    emit(&g, "  lk_unreachable();")
+    emit(&g, "}")
+}
+
+// 循环开始：取走 SLabel 给的标签，带标签的循环在 C 里有一个名字（lk_brk_名字、lk_cont_名字），没带的是 ""。
+// 先取走（for in 的范围、列表只算一次，不算这个循环），进循环时再用 open_loop 登记；for 条件的条件每轮都算，在 open_loop 以后。和 check 里 labels 的时机一样
+fn loop_tag(inout g: Gen) -> str {
+    l = replace(&g.pend_label, "")
+    if l == "" { "" } else { fresh(&g, "L") }
+}
+
+fn open_loop(inout g: Gen, tag: str) {
+    g.loops.push(tag)
+    open_scope(&g, true)
+}
+
+// 循环结束：释放本轮的值，关上 for 的 {。带标签时 continue outer 跳到本轮的值都释放以后、进下一轮之前，
+// break outer 跳到整个循环后面（外层的值由 drop_jump 在跳之前释放）。
+// 两个标签通常只用到一个，标成 unused 免得 -Wextra 报 unused label
+fn loop_end(c: Ctx, inout g: Gen) {
+    tag = g.loops.pop()
+    close_scope(c, &g)
+    if tag != "" { emit(&g, "lk_cont_#{tag}: __attribute__((unused)) ;") }
+    g.ind -= 1
+    emit(&g, "}")
+    if tag != "" { emit(&g, "lk_brk_#{tag}: __attribute__((unused)) ;") }
+}
+
+fn gen_loop_body(c: Ctx, inout g: Gen, body: Block) {
+    emit(&g, "{")
+    block_into(c, &g, body, "")
+    emit(&g, "}")
+}
+
+fn gen_stmt(c: Ctx, inout g: Gen, s: Stmt) {
+    if !quiet_stmt(c, s) { emit(&g, line_mark(s.line)) }
+    match s.kind {
+        SExpr(e) => discard(c, &g, e)
+        SAssign(target, _, rhs) => {
+            if c.decl[s.id] && is_tuple_expr(target) {
+                gen_destructure(c, &g, target, rhs)
+            } else if c.decl[s.id] {
+                v = c.vid[target.id]
+                cn = c.locals[v].cname
+                lt = c.locals[v].ty
+                val = owned(c, &g, rhs)
+                ct = ctype(c, &g, lt)
+                emit(&g, "#{ct} #{cn} = #{val};")
+                own_place(&g, cn, lt)
+            } else if c.rkind[s.id] == "setindex" {
+                gen_set_index(c, &g, s.id, target, rhs)
+            } else if self_append(c, target, rhs) {
+                // s += x、s = s + x + y …：原地追加（没有别人引用时不重新分配）。不然每次都整段复制，循环里拼字符串就成了平方的。
+                // 先按从左到右把 x、y … 都算好，再一段段追加
+                rs = chain_reads(c, &g, target, rhs)
+                pl = place(c, &g, target)
+                for rb in rs { emit(&g, "lk_str_append(&(#{pl}), #{rb});") }
+            } else {
+                t = c.ety[target.id]
+                val = owned(c, &g, rhs)
+                if managed(t) {
+                    tn = fresh(&g, "t")
+                    ct = ctype(c, &g, t)
+                    emit(&g, "#{ct} #{tn} = #{val};")
+                    pl = place(c, &g, target)
+                    emit(&g, drop_stmt(c, t, pl))
+                    emit(&g, "#{pl} = #{tn};")
+                } else {
+                    pl = place(c, &g, target)
+                    emit(&g, "#{pl} = #{val};")
+                }
+            }
+        }
+        SForCond(cond, body) => {
+            tag = loop_tag(&g)
+            emit(&g, "for (;;) {")
+            g.ind += 1
+            open_loop(&g, tag)
+            match cond {
+                Some(cx) => {
+                    cv = read(c, &g, cx)
+                    emit(&g, "if (!(#{cv})) {")
+                    g.ind += 1
+                    n = len(g.scopes)
+                    drop_scope_at(c, &g, n - 1)
+                    emit(&g, "break;")
+                    g.ind -= 1
+                    emit(&g, "}")
+                }
+                None => {}
+            }
+            gen_loop_body(c, &g, body)
+            loop_end(c, &g)
+        }
+        SForRange(_, id, lo, hi, body) => {
+            tag = loop_tag(&g)
+            v = c.vid[id]
+            cn = c.locals[v].cname
+            lv = read(c, &g, lo)
+            lot = fresh(&g, "lo")
+            emit(&g, "int64_t #{lot} = #{lv};")
+            hv = read(c, &g, hi)
+            hit = fresh(&g, "hi")
+            emit(&g, "int64_t #{hit} = #{hv};")
+            emit(&g, "for (int64_t #{cn} = #{lot}; #{cn} < #{hit}; #{cn}++) {")
+            g.ind += 1
+            open_loop(&g, tag)
+            gen_loop_body(c, &g, body)
+            loop_end(c, &g)
+        }
+        SForEach(_, id, it, body, iname, iid) => {
+            tag = loop_tag(&g)
+            // for i, x in …：下标是循环里的一个新变量（改它不影响循环）
+            icn = if iname != "" { c.locals[c.vid[iid]].cname.copy() } else { "" }
+            if c.rkind[s.id] == "iter" {
+                gen_iter_for(c, &g, s.id, c.vid[id], it, body, icn, tag)
+                return
+            }
+            if c.rkind[s.id] == "at" {
+                gen_at_for(c, &g, s.id, c.vid[id], it, body, icn, tag)
+                return
+            }
+            v = c.vid[id]
+            cn = c.locals[v].cname
+            lt = c.locals[v].ty
+            iv = read(c, &g, it)
+            lst = fresh(&g, "l")
+            ix = fresh(&g, "i")
+            ct = ctype(c, &g, c.ety[it.id])
+            emit(&g, "#{ct}* #{lst} = &(#{iv});")
+            emit(&g, "for (int64_t #{ix} = 0; #{ix} < #{lst}->len; #{ix}++) {")
+            g.ind += 1
+            open_loop(&g, tag)
+            ce = ctype(c, &g, lt)
+            emit(&g, "#{ce}* #{cn} = &#{lst}->data[#{ix}];")
+            if icn != "" { emit(&g, "int64_t #{icn} = #{ix};") }
+            g.ptrs[v] = true
+            gen_loop_body(c, &g, body)
+            loop_end(c, &g)
+        }
+        SLabel(name, body) => {
+            g.pend_label = name.copy()
+            emit(&g, "{")
+            block_into(c, &g, body, "")
+            emit(&g, "}")
+        }
+        SDefer(body) => {
+            // 体先生成成一段代码，挂在当前作用域的释放列表里，和释放按逆序交错：离开作用域时（走到块尾、return、?、
+            // break、continue、尾调用）在释放 defer 之前声明的值之前执行。每条出口都抄一份，各自在 { } 里，临时变量不会重名
+            saved = replace(&g.lines, [])
+            emit(&g, "{")
+            block_into(c, &g, body, "")
+            emit(&g, "}")
+            code = replace(&g.lines, saved)
+            n = len(g.scopes)
+            g.scopes[n - 1].places.push(join(code, "\n"))
+            g.scopes[n - 1].tys.push(-1)
+        }
+    }
+}
+
+// s += x、s = s + x 或 s = s + x + y …（s 是字符串的变量、字段或下标）：左结合的 + 链最左边就是赋值的目标本身。
+// 链上有两段以上时，x、y … 里不能提到 s 所在的变量（s = s + "a" + s 的第二个 s 要的是追加前的值），这时照常整段拼
+fn self_append(c: Ctx, target: Expr, rhs: Expr) -> bool {
+    if c.ety[target.id] != 2 || !is_place(target) { return false }
+    n = chain_len(c, target, rhs)
+    if n <= 1 { return n == 1 }
+    v = root(c, target)
+    v >= 0 && !chain_mentions(c, target, rhs, v)
+}
+
+// e 是 target + x1 + … + xn 时是 n，不是时是 0
+fn chain_len(c: Ctx, target: Expr, e: Expr) -> int {
+    match e.kind {
+        EBinary(op, a, _) => {
+            if op != "+" || c.ety[a.id] != 2 || c.wrap[e.id] { return 0 }
+            if same_place(c, a, target) { return 1 }
+            n = chain_len(c, target, a)
+            if n == 0 { 0 } else { n + 1 }
+        }
+        _ => 0
+    }
+}
+
+// 链上加进来的各段里有没有提到变量 v
+fn chain_mentions(c: Ctx, target: Expr, e: Expr, v: int) -> bool {
+    match e.kind {
+        EBinary(_, a, b) => mentions(c, b, v) || (!same_place(c, a, target) && chain_mentions(c, target, a, v))
+        _ => false
+    }
+}
+
+// 按从左到右算出链上加进来的各段（只在 chain_len 认过的链上调用）
+fn chain_reads(c: Ctx, inout g: Gen, target: Expr, e: Expr) -> [str] {
+    match e.kind {
+        EBinary(_, a, b) => {
+            out: [str] = []
+            if !same_place(c, a, target) { out = chain_reads(c, &g, target, a) }
+            out.push(read(c, &g, b))
+            out
+        }
+        _ => []
+    }
+}
+
+fn same_place(c: Ctx, a: Expr, t: Expr) -> bool {
+    // += 展开时左操作数是目标的副本，id 相同
+    if a.id == t.id { return true }
+    if !is_var(a) || !is_var(t) { return false }
+    c.rkind[a.id] != "const" && c.rkind[t.id] != "const" && c.vid[a.id] >= 0 && c.vid[a.id] == c.vid[t.id]
+}
+
+// for x in it（自定义迭代器，见 check_iter）：迭代器放进外层块里的临时变量（块结束时释放），
+// 每轮调用 next(&迭代器)；T? 是堆上的值，取出后释放外壳，值归循环变量。icn 不为 "" 时另有一个从 0 数起的序号
+fn gen_iter_for(c: Ctx, inout g: Gen, sid: int, v: int, it: Expr, body: Block, icn: str, tag: str) {
+    cn = c.locals[v].cname
+    et = c.locals[v].ty
+    itt = c.ety[it.id]
+    nf = c.rname[sid]
+    ot = c.fns[find_fn(c, nf)].ret
+    emit(&g, "{")
+    g.ind += 1
+    open_scope(&g, false)
+    iv = owned(c, &g, it)
+    itn = fresh(&g, "it")
+    ict = ctype(c, &g, itt)
+    emit(&g, "#{ict} #{itn} = #{iv};")
+    own_place(&g, itn, itt)
+    cnt = fresh(&g, "n")
+    if icn != "" { emit(&g, "int64_t #{cnt} = 0;") }
+    emit(&g, "for (;;) {")
+    g.ind += 1
+    open_loop(&g, tag)
+    oct = ctype(c, &g, ot)
+    nx = fresh(&g, "nx")
+    emit(&g, "#{oct} #{nx} = #{fname(nf)}(&#{itn});")
+    emit(&g, "if (!(#{box_has(c, ot, nx)})) break;")
+    ce = ctype(c, &g, et)
+    emit(&g, opt_take(c, ot, nx, ce, cn))
+    own_place(&g, cn, et)
+    if icn != "" { emit(&g, "int64_t #{icn} = #{cnt}++;") }
+    gen_loop_body(c, &g, body)
+    loop_end(c, &g)
+    close_scope(c, &g)
+    g.ind -= 1
+    emit(&g, "}")
+}
+
+// 借用遍历（见 check_iter）：和列表一样借用来源，先调用一次 iter_len，每轮 x = iter_at(&来源, i)，x 归循环变量
+fn gen_at_for(c: Ctx, inout g: Gen, sid: int, v: int, it: Expr, body: Block, icn: str, tag: str) {
+    cn = c.locals[v].cname
+    et = c.locals[v].ty
+    lf = c.fns[c.ridx[sid]].name.copy()
+    af = c.rname[sid]
+    iv = read(c, &g, it)
+    src = fresh(&g, "l")
+    n = fresh(&g, "n")
+    ix = fresh(&g, "i")
+    ct = ctype(c, &g, c.ety[it.id])
+    emit(&g, "#{ct}* #{src} = &(#{iv});")
+    emit(&g, "int64_t #{n} = #{fname(lf)}(#{src});")
+    emit(&g, "for (int64_t #{ix} = 0; #{ix} < #{n}; #{ix}++) {")
+    g.ind += 1
+    open_loop(&g, tag)
+    ce = ctype(c, &g, et)
+    emit(&g, "#{ce} #{cn} = #{fname(af)}(#{src}, #{ix});")
+    own_place(&g, cn, et)
+    if icn != "" { emit(&g, "int64_t #{icn} = #{ix};") }
+    gen_loop_body(c, &g, body)
+    loop_end(c, &g)
+}
+
+// x[i] = v 调用 set_index(&x, i, v)（见 check_set_index）；先算 v，和普通赋值一样
+fn gen_set_index(c: Ctx, inout g: Gen, sid: int, target: Expr, rhs: Expr) {
+    match target.kind {
+        EIndex(b, i) => {
+            fi = find_fn(c, c.rname[sid])
+            val = owned(c, &g, rhs)
+            tn = fresh(&g, "t")
+            ct = ctype(c, &g, c.fns[fi].ptys[2])
+            emit(&g, "#{ct} #{tn} = #{val};")
+            pb = place(c, &g, b)
+            ri = read(c, &g, i)
+            ai = op_arg(c.fns[fi].ptys[1], ri)
+            emit(&g, "#{fname(c.rname[sid])}(&(#{pb}), #{ai}, #{tn});")
+        }
+        _ => {}
+    }
+}
+
+fn gen_fn(c: Ctx, inout g: Gen, f: FnDecl, fi: int) -> FnOut {
+    g.lines = []
+    g.ind = 1
+    g.scopes = []
+    rt = c.fns[fi].ret
+    g.ret = rt
+    g.fi = fi
+    g.pnames = []
+    g.tail_used = false
+    g.loops = []
+    g.pend_label = ""
+    ps: [str] = []
+    for k in 0..len(f.params) {
+        v = c.vid[f.params[k].id]
+        g.pnames.push(c.locals[v].cname)
+        pt = c.fns[fi].ptys[k]
+        m = c.fns[fi].pmodes[k]
+        by_ptr = m == "inout" || (m == "read" && managed(pt) && pt != 2)
+        if by_ptr { g.ptrs[v] = true }
+        ct = ctype(c, &g, pt)
+        star = if by_ptr { "*" } else { "" }
+        ps.push("#{ct}#{star} #{c.locals[v].cname}")
+    }
+    rct = ctype(c, &g, rt)
+    plist = if len(ps) == 0 { "void" } else { join(ps, ", ") }
+    header = "static #{rct} #{fname(c.fns[fi].name)}(#{plist})"
+    // 调用栈记录要在尾调用的标号之前：跳回开头时不重新挂一次
+    shown = fn_display(g, c.fns[fi].uname)
+    fr = frame_decl(g, shown, f.line)
+    emit(&g, fr)
+    open_scope(&g, false)
+    for k in 0..len(f.params) {
+        if c.fns[fi].pmodes[k] == "take" {
+            v = c.vid[f.params[k].id]
+            cn = c.locals[v].cname
+            own_place(&g, cn, c.fns[fi].ptys[k])
+        }
+    }
+    // 尾调用跳回这里；没用到时这一行留空（避免“未使用的标号”警告）。emit 会跳过空串，所以直接 push
+    label_at = len(g.lines)
+    if rt == 3 {
+        g.lines.push("")
+        emit(&g, "{")
+        block_into(c, &g, f.body, "")
+        emit(&g, "}")
+        close_scope(c, &g)
+    } else {
+        r = fresh(&g, "r")
+        emit(&g, "#{rct} #{r} = {0};")
+        label_at = len(g.lines)
+        g.lines.push("")
+        emit(&g, "{")
+        block_into(c, &g, f.body, r)
+        emit(&g, "}")
+        // ()! 函数正常走到结尾表示成功
+        if is_res_unit(c, rt) { emit(&g, "if (#{res_unset(c, rt, r)}) #{r} = lk_ok_#{mangle(c, rt)}();") }
+        close_scope(c, &g)
+        emit(&g, "return #{r};")
+    }
+    if g.tail_used { g.lines[label_at] = "lk_top:;" }
+    body_lines = replace(&g.lines, [])
+    FnOut(proto: header + ";\n", body: header + " {\n" + join(body_lines, "\n") + "\n}\n\n")
+}
+
+// extern "c" 的函数：用汇编标号声明 C 函数 lkc_名字（见运行时的 LK_CSYM），再生成一个普通的 f_名字 包一层：
+// int 转成 C 的窄整数时检查范围，str 传以 0 结尾的字节，[u8] 传数据指针，C 返回的字符串复制一份
+fn gen_extern(c: Ctx, inout g: Gen, f: FnDecl, fi: int) -> FnOut {
+    rt = c.fns[fi].ret
+    shown = c_string(f.name)
+    cps: [str] = []
+    ps: [str] = []
+    args: [str] = []
+    for k in 0..len(f.params) {
+        pt = c.fns[fi].ptys[k]
+        cps.push(ext_c(f.params[k].ty))
+        an = "a#{k}"
+        star = if pt == 13 || is_ofn(c, pt) { "*" } else { "" }
+        ps.push(ctype(c, &g, pt) + star + " " + an)
+        args.push(ext_arg(f.params[k].ty, an, shown))
+    }
+    rct = ctype(c, &g, rt)
+    cplist = if len(cps) == 0 { "void" } else { join(cps, ", ") }
+    plist = if len(ps) == 0 { "void" } else { join(ps, ", ") }
+    decl = "#{ext_c(f.ret)} lkc_#{f.name}(#{cplist}) LK_CSYM(#{c_string(f.name)});\n"
+    call = "lkc_#{f.name}(#{join(args, ", ")})"
+    body = if rt == 3 { call + ";" } else { "return " + ext_ret(f.ret, call, shown) + ";" }
+    header = "static #{rct} #{fname(c.fns[fi].name)}(#{plist})"
+    FnOut(proto: decl + header + ";\n", body: header + " { " + body + " }\n\n")
+}
+
+// 传给 C 的实参
+fn ext_arg(ty: str, a: str, shown: str) -> str {
+    if ty == "c_int" {
+        "lk_c_int(#{shown}, #{a})"
+    } else if ty == "c_uint" {
+        "lk_c_uint(#{shown}, #{a})"
+    } else if ty == "c_ulong" {
+        "lk_c_ulong(#{shown}, #{a})"
+    } else if ty == "usize" {
+        "lk_c_usize(#{shown}, #{a})"
+    } else if ty == "c_long" || ty == "isize" {
+        "(#{ext_c(ty)})(#{a})"
+    } else if ty == "str" {
+        "lk_str_ptr(#{a})"
+    } else if ty == "Fn()->()" {
+        "(lk_hook){ #{a}->f, #{a}->env }"
+    } else if ty == "[u8]" {
+        "#{a}->data"
+    } else {
+        a.copy()
+    }
+}
+
+// C 的返回值转成 Lark 的值
+fn ext_ret(ty: str, v: str, shown: str) -> str {
+    if ty == "c_ulong" || ty == "usize" {
+        "lk_c_unsigned_ret(#{shown}, #{v})"
+    } else if ty == "c_int" || ty == "c_uint" || ty == "c_long" || ty == "isize" {
+        "(int64_t)(#{v})"
+    } else if ty == "str" {
+        "lk_c_str(#{v})"
+    } else {
+        v.copy()
+    }
+}
+
+fn gen_program(c: Ctx, prog: Program) -> str {
+    g = new_gen(len(c.locals))
+    g.paths = prog.paths.copy()
+    g.tnames = prog.tests.copy()
+    outs: [FnOut] = []
+    for i in 0..len(prog.fns) {
+        if is_template(c, i) { continue }
+        if prog.fns[i].ext {
+            eo = gen_extern(c, &g, prog.fns[i], i)
+            outs.push(eo)
+            continue
+        }
+        o = gen_fn(c, &g, prog.fns[i], i)
+        outs.push(o)
+    }
+    for j in 0..len(c.insts) {
+        o = gen_fn(c, &g, c.insts[j], len(prog.fns) + j)
+        outs.push(o)
+    }
+    register(c, &g, 6)
+    dyns = emit_dyn_impls(c, &g)
+    types = emit_types(c, &g)
+    // 没有 import 系统层的模块、也没有用到可选部分时只带运行时的核心（见运行时开头）；编译 C 时 -DLK_FULL 可以强制带上全部
+    core = if g.full_rt || imports_system(c) { "" } else { "#ifndef LK_FULL\n#define LK_CORE 1\n#endif\n" }
+    parts: [str] = ["// 由 Lark stage1 生成，请勿手改\n#{core}#include \"lark_rt.h\"\n\n", types, "\n"]
+    for o in outs { parts.push(o.proto) }
+    parts.push(emit_shows(c, g))
+    parts.push(dyns)
+    parts.push("\n")
+    for l in g.lits { parts.push(l) }
+    parts.push("\n")
+    for cl in g.clos { parts.push(cl) }
+    parts.push("\n")
+    for o in outs { parts.push(o.body) }
+    if prog.testing {
+        parts.push(test_main(prog))
+    } else {
+        parts.push("int main(int argc, char** argv) { lk_init(argc, argv); f_main(); return 0; }\n")
+    }
+    join(parts, "")
+}
+
+// 程序（包括它 import 的文件）有没有 import 系统层的 std 模块（和 tools/apicov.lark 的 layer_of 一致）。
+// mods 里是“模块名@文件序号”；只看模块名，所以自己的包里叫 os、time 的模块也算，结果只是多带了运行时的可选部分
+fn imports_system(c: Ctx) -> bool {
+    for m in c.mods {
+        for n in ["os", "io", "time", "net", "proc", "term", "signal", "timer", "sync"] {
+            k = len(n)
+            if len(m) > k && slice(m, 0, k + 1) == n + "@" { return true }
+        }
+    }
+    false
+}
+
+// lark1 --test：main 依次运行每个 test 块（见运行时的 lk_run_tests）；命令行的第一个参数是名字过滤
+fn test_main(prog: Program) -> str {
+    o: [str] = []
+    names: [str] = []
+    fns: [str] = []
+    for k in 0..len(prog.tests) {
+        o.push("static void lk_test_#{k}(void) { #{fname(prog.test_fns[k])}(); }\n")
+        names.push(c_string(prog.tests[k]) + ", ")
+        fns.push("lk_test_#{k}, ")
+    }
+    o.push("static const char* lk_test_names[] = { #{join(names, "")}NULL };\n")
+    o.push("static lk_test_fn const lk_test_fns[] = { #{join(fns, "")}NULL };\n")
+    n = len(prog.tests)
+    o.push("int main(int argc, char** argv) { lk_init(argc, argv); return lk_run_tests(#{n}, lk_test_names, lk_test_fns, argc > 1 ? argv[1] : NULL); }\n")
+    join(o, "")
+}
+
+// ---------- 调用栈（见运行时的 LK_FRAME） ----------
+
+// 函数开头挂上调用栈记录：函数名、所在文件和行
+fn frame_decl(g: Gen, name: str, line: int) -> str {
+    fi = line / 100000
+    path = if fi < len(g.paths) { g.paths[fi].copy() } else { "?" }
+    "LK_FRAME(#{c_string(name)}, #{c_string(path)}, #{line % 100000});"
+}
+
+// 每条语句之前记下它所在的行
+fn line_mark(line: int) -> str { "LK_LINE(#{line % 100000});" }
+
+// ---------- 哪些语句不用记行号 ----------
+// 行号只在两种时候被读到：这条语句里 panic 了，或者它调用的函数里 panic 了（调用栈要显示调用者停在哪一行）。
+// 所以既不调用函数（包括运算符重载、自定义的 eq 和析构）、也不会 panic（越界、整数溢出、除以零、移位越界）
+// 的语句不用记。这里只认很少几种写法，其余一律照常记。
+
+// 表达式不调用函数、也不会 panic
+fn quiet(c: Ctx, e: Expr) -> bool {
+    match e.kind {
+        EInt(_) => true
+        EFloat(_) => true
+        EBool(_) => true
+        EStr(_) => true
+        EVar(_) => true
+        EField(b, _) => quiet(c, b)
+        EUnary(op, a) => quiet_unary(c, e, op, a)
+        EBinary(op, a, b) => c.rkind[e.id] != "op" && quiet_op(c, op, a, b) && quiet(c, a) && quiet(c, b)
+        ECall(_, args, _) => quiet_call(c, e, args)
+        _ => false
+    }
+}
+
+// !x，以及 float 的 -x（int 的 -x 在最小值时会溢出）
+fn quiet_unary(c: Ctx, e: Expr, op: str, a: Expr) -> bool {
+    if c.rkind[e.id] == "op" { return false }
+    (op == "!" || (op == "-" && c.ety[e.id] == 9)) && quiet(c, a)
+}
+
+fn quiet_op(c: Ctx, op: str, a: Expr, b: Expr) -> bool {
+    ta = c.ety[a.id]
+    if op == "&&" || op == "||" { return true }
+    if op == "<<" || op == ">>" || op == ">>>" {
+        // 移位数是 0..63 的常数时不会 panic
+        k = match b.kind {
+            EInt(n) => n <= 63
+            _ => false
+        }
+        return k
+    }
+    if is_bit_op(op) { return true }
+    if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+        // 基本类型的比较；别的类型可能调用 eq / cmp
+        return ta == 0 || ta == 1 || ta == 2 || ta == 9 || is_fixed(ta)
+    }
+    if ta == 9 { return true }
+    if ta == 2 && op == "+" { return true }
+    if ta == 0 && (op == "/" || op == "%") {
+        // 除数是非零的常数（字面量都不是负数，所以也不会是 -1）
+        k2 = match b.kind {
+            EInt(n) => n != 0
+            _ => false
+        }
+        return k2
+    }
+    false
+}
+
+// 构造结构体和变体、读常量、Some / None / Ok / Err、len、push
+fn quiet_call(c: Ctx, e: Expr, args: [Arg]) -> bool {
+    rk = c.rkind[e.id]
+    rn = c.rname[e.id]
+    ok = rk == "struct" || rk == "variant" || rk == "const" ||
+        (rk == "builtin" && (rn == "Some" || rn == "None" || rn == "Ok" || rn == "Err" || rn == "len" || rn == "push"))
+    if !ok { return false }
+    for a in args {
+        if !quiet(c, a.value) { return false }
+    }
+    true
+}
+
+// 赋值和声明：目标是变量或变量的字段，类型不带自定义析构（覆盖旧值时不会调用 drop）
+fn quiet_target(c: Ctx, target: Expr, rhs: Expr) -> bool {
+    simple = match target.kind {
+        EVar(_) => true
+        EField(b, _) => quiet(c, b)
+        _ => false
+    }
+    simple && !has_dtor(c, c.ety[rhs.id])
+}
+
+fn quiet_stmt(c: Ctx, s: Stmt) -> bool {
+    match s.kind {
+        SAssign(target, _, rhs) => quiet_target(c, target, rhs) && quiet(c, rhs)
+        SExpr(e) => quiet_head(c, e)
+        _ => false
+    }
+}
+
+// if / match 作为语句时，只看条件和被匹配的值：分支里的语句各自记行号
+fn quiet_head(c: Ctx, e: Expr) -> bool {
+    match e.kind {
+        EIf(cond, _, _) => quiet(c, cond)
+        EMatch(_, scrut, _) => quiet(c, scrut)
+        _ => quiet(c, e)
+    }
+}
+
+// 调用栈里显示的函数名：test 块（test__k）显示成 测试“名字”
+fn fn_display(g: Gen, uname: str) -> str {
+    if len(uname) > 6 && slice(uname, 0, 6) == "test__" {
+        r = try_parse_int(slice(uname, 6, len(uname)))
+        match r {
+            Ok(k) => {
+                if k >= 0 && k < len(g.tnames) { return "测试“#{g.tnames[k]}”" }
+            }
+            Err(_) => {}
+        }
+    }
+    uname.copy()
+}
+
+// select：通道和输出位置排成数组交给运行时；返回收到值的分支序号，-1 是超时，-2 是全部结束
+fn gen_select(c: Ctx, inout g: Gen, arms: [SelArm], target: str) {
+    g.full_rt = true
+    n = fresh(&g, "sel")
+    chs: [str] = []
+    outs: [str] = []
+    slots: [int] = []      // 每个 recv 分支在数组里的位置；其它分支为 -1
+    tmo = "-1"
+    for a in arms {
+        match a.src {
+            Some(s) => {
+                if a.kind == "recv" {
+                    ch = read(c, &g, s)
+                    el = telem(c, c.ety[s.id])
+                    k = len(chs)
+                    ect = ctype(c, &g, el)
+                    emit(&g, "#{ect} #{n}_v#{k};")
+                    chs.push(ch)
+                    outs.push("&#{n}_v#{k}")
+                    slots.push(k)
+                } else {
+                    tmo = read(c, &g, s)
+                    slots.push(-1)
+                }
+            }
+            None => { slots.push(-1) }
+        }
+    }
+    emit(&g, "lk_chan* #{n}_ch[] = { #{join(chs, ", ")} };")
+    emit(&g, "void* #{n}_out[] = { #{join(outs, ", ")} };")
+    emit(&g, "int #{n} = lk_select(#{n}_ch, #{n}_out, #{len(chs)}, #{tmo});")
+    first = true
+    for k in 0..len(arms) {
+        ak = arms[k].kind
+        cond = if ak == "recv" { "#{n} == #{slots[k]}" } else if ak == "after" { "#{n} == -1" } else { "#{n} == -2" }
+        head = if first { "if (#{cond}) {" } else { "} else if (#{cond}) {" }
+        emit(&g, head)
+        first = false
+        g.ind += 1
+        open_scope(&g, false)
+        if ak == "recv" {
+            v = c.vid[arms[k].id]
+            el = c.locals[v].ty
+            cn = c.locals[v].cname
+            vct = ctype(c, &g, el)
+            emit(&g, "#{vct} #{cn} = #{n}_v#{slots[k]};")
+            own_place(&g, cn, el)
+        }
+        assign_into(c, &g, target, arms[k].body)
+        close_scope(c, &g)
+        g.ind -= 1
+    }
+    emit(&g, "}")
+}
+
+// a, b = 元组：先放进临时变量，再把各字段移给新变量；_ 对应的字段直接释放
+fn gen_destructure(c: Ctx, inout g: Gen, target: Expr, rhs: Expr) {
+    t = c.ety[target.id]
+    val = owned(c, &g, rhs)
+    tn = fresh(&g, "t")
+    ct = ctype(c, &g, t)
+    emit(&g, "#{ct} #{tn} = #{val};")
+    match target.kind {
+        ETuple(ts) => {
+            for k in 0..len(ts) {
+                et = c.ety[ts[k].id]
+                if var_name(ts[k]) == "_" {
+                    emit(&g, drop_stmt(c, et, "#{tn}.f_#{k}"))
+                } else {
+                    v = c.vid[ts[k].id]
+                    cn = c.locals[v].cname
+                    ect = ctype(c, &g, et)
+                    emit(&g, "#{ect} #{cn} = #{tn}.f_#{k};")
+                    own_place(&g, cn, et)
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---------- 单元测试（lark1 --test，见 make unit-compiler） ----------
+
+fn has_text(s: str, sub: str) -> bool {
+    n = len(sub)
+    for i in 0..len(s) - n + 1 {
+        if slice(s, i, i + n) == sub { return true }
+    }
+    false
+}
+
+// 把一段源码完整地编译成 C（检查、所有权检查都要通过）
+fn compile_src(src: str, testing: bool) -> str {
+    prog = parse_files([src], 1, [""])
+    prog.paths = ["t.lark"]
+    prog.testing = testing
+    toks = replace(&prog.toks, [])
+    c = check_program(prog, toks)
+    own_program(c, prog)
+    gen_program(c, prog)
+}
+
+test "代码生成：小工具" {
+    assert_eq(paren("a"), "(a)")
+    assert_eq(paren("(a)"), "(a)")
+    // 两边的括号不是一对
+    assert_eq(paren("(a) && (b)"), "((a) && (b))")
+    assert_eq(and_all(["1", "x"]), "x")
+    assert_eq(and_all(["a", "b"]), "(a) && (b)")
+    assert_eq(and_all(["1"]), "1")
+    assert(has_text("hello", "ll"))
+    assert(!has_text("he", "hello"))
+}
+
+test "代码生成：整个程序" {
+    src = "type P {\n    x: int\n}\n\nfn add(a: int, b: int) -> int { a + b }\n\nfn main() {\n    p = P(x: add(1, 2))\n    print(\"\#{p.x}\")\n}\n"
+    out = compile_src(src, false)
+    assert(has_text(out, "#include \"lark_rt.h\""))
+    // 只做计算：只带运行时的核心
+    assert(has_text(out, "#define LK_CORE 1"))
+    assert(has_text(out, "typedef struct S_P S_P;"))
+    // 整数加法带溢出检查
+    assert(has_text(out, "lk_add("))
+    assert(has_text(out, "f_add("))
+    assert(has_text(out, "int main(int argc, char** argv) { lk_init(argc, argv); f_main(); return 0; }"))
+    assert(!has_text(out, "lk_run_tests"))
+    // 调用栈：函数开头挂上记录，语句之前记下行号
+    assert(has_text(out, "LK_FRAME(\"add\", \"t.lark\", 5);"))
+    assert(has_text(out, "LK_LINE(8);"))
+}
+
+test "代码生成：不调用函数、也不会 panic 的语句不记行号" {
+    src = "fn f(xs: [int]) -> int {\n    a = 1\n    b = a < 2\n    n = a + 1\n    d = xs[0]\n    e = d / 3\n    if b { n } else { e }\n}\n\nfn main() {\n    print(\"\#{f([1])}\")\n}\n"
+    out = compile_src(src, false)
+    // 字面量、比较、除以非零常数：不记
+    assert(!has_text(out, "LK_LINE(2);"))
+    assert(!has_text(out, "LK_LINE(3);"))
+    assert(!has_text(out, "LK_LINE(6);"))
+    assert(!has_text(out, "LK_LINE(7);"))
+    // 加法会溢出、下标会越界、调用函数：照常记
+    assert(has_text(out, "LK_LINE(4);"))
+    assert(has_text(out, "LK_LINE(5);"))
+    assert(has_text(out, "LK_LINE(11);"))
+}
+
+test "代码生成：测试模式的 main" {
+    src = "fn main() {}\n\ntest \"甲\" {\n    assert_eq(1 + 1, 2)\n}\n"
+    out = compile_src(src, true)
+    assert(has_text(out, "lk_run_tests(1, lk_test_names, lk_test_fns"))
+    assert(has_text(out, "static void lk_test_0(void) { f_test__0(); }"))
+    // assert_eq 的位置和“：左边是 ”是同一个字符串字面量；非 ASCII 字节在 C 里写成八进制转义
+    assert(has_text(out, c_string("断言失败：t.lark:4:5：左边是 ")))
+    assert(!has_text(out, "f_main(); return 0;"))
+}
+
+test "代码生成：枚举按值存放或放在堆上" {
+    // Tok 不递归，按值存放；Ex 经过自己的变体成环，Node 经过结构体 Box 成环，都在堆上；Js 只在列表里包含自己，按值
+    src = "enum Tok {\n    Num(int)\n    Plus\n}\n\nenum Ex {\n    Lit(int)\n    Add(Ex, Ex)\n}\n\ntype Box {\n    n: Node\n}\n\nenum Node {\n    Leaf\n    More(Box)\n}\n\nenum Js {\n    Arr([Js])\n    Nul\n}\n\nfn main() {\n    t = Num(1)\n    e = Add(Lit(1), Lit(2))\n    n = More(Box(n: Leaf))\n    j = Arr([Nul])\n    match t {\n        Num(v) => print(\"\#{v}\")\n        Plus => print(\"+\")\n    }\n    _ = e\n    _ = n\n    _ = j\n}\n"
+    out = compile_src(src, false)
+    assert(has_text(out, "typedef struct E_Tok_s E_Tok;"))
+    assert(has_text(out, "typedef struct E_Ex_s* E_Ex;"))
+    assert(has_text(out, "typedef struct E_Node_s* E_Node;"))
+    assert(has_text(out, "typedef struct E_Js_s E_Js;"))
+    // tag 从 1 开始，0 表示已移走；按值的枚举用 (x).tag 访问
+    assert(has_text(out, ".tag == 1"))
+    assert(has_text(out, "r->tag = 1;"))
+}
+
+test "代码生成：T? 按值存放或放在堆上" {
+    // int? 按值存放；Link? 经过 Link 的字段包含了自己，仍是指针
+    src = "type Link {\n    v: int\n    next: Link?\n}\n\nfn first(xs: [int]) -> int? {\n    if len(xs) == 0 { return None }\n    Some(xs[0])\n}\n\nfn main() {\n    a = first([1, 2]) ?? 0\n    l = Link(v: 1, next: None)\n    print(\"\#{a} \#{l.v}\")\n}\n"
+    out = compile_src(src, false)
+    assert(has_text(out, "struct LK_Oi { bool some; int64_t v; };"))
+    assert(has_text(out, "typedef S_Link* LK_OS4Link;"))
+    assert(has_text(out, ".some"))
+}
+
+test "代码生成：T! 按值存放或放在堆上" {
+    // int! 按值存放（{ set, ok, val, err }），返回结果不用分配内存；Tree 的变体里包含 Tree!，成环，仍是指针
+    src = "enum Tree {\n    Leaf\n    Wrap(r: Tree!)\n}\n\nfn half(n: int) -> int! {\n    if n % 2 != 0 { return Err(\"奇数\") }\n    Ok(n / 2)\n}\n\nfn main() {\n    a = half(4) ?? 0\n    t = Wrap(Ok(Leaf))\n    match half(3) {\n        Ok(v) => print(\"\#{v}\")\n        Err(e) => print(e)\n    }\n    print(\"\#{a}\")\n    _ = t\n}\n"
+    out = compile_src(src, false)
+    assert(has_text(out, "struct LK_Ri { bool set; bool ok; int64_t val; lk_str err; };"))
+    assert(has_text(out, "typedef struct LK_Ri LK_Ri;"))
+    assert(has_text(out, ").ok"))
+    assert(!has_text(out, "LK_Ri r = lk_alloc"))
+    assert(has_text(out, "typedef struct LK_RE4Tree_s* LK_RE4Tree;"))
+}
+
+test "代码生成：用到任务时带上整个运行时" {
+    // 通道、spawn：要调度器
+    src = "fn main() {\n    ch: Chan[int] = chan()\n    print(\"\#{len(\"x\")}\")\n}\n"
+    assert(!has_text(compile_src(src, false), "LK_CORE"))
+    // 系统的内置函数：文件系统
+    src2 = "fn main() { print(\"\#{file_kind(\"x\")}\") }\n"
+    assert(!has_text(compile_src(src2, false), "LK_CORE"))
+    // 读时间在核心里
+    src3 = "fn main() { print(\"\#{now_ms() > 0}\") }\n"
+    assert(has_text(compile_src(src3, false), "#define LK_CORE 1"))
+}

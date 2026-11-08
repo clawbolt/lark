@@ -1,0 +1,11 @@
+// 期望错误：不能在循环里移走循环外的变量 t
+type T { n: int }
+
+fn eat(take t: T) {}
+
+fn main() {
+    t = T(n: 1)
+    for i in 0..2 {
+        eat(t)
+    }
+}

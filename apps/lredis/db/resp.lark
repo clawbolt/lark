@@ -1,0 +1,172 @@
+// lredis · RESP 协议（Redis 序列化协议，第 2 版）：解析客户端发来的命令，编码回复。
+// 客户端发的命令是“多条批量字符串”：*2\r\n$3\r\nGET\r\n$1\r\na\r\n；也可以是一行空格分开的“内联命令”（PING\r\n）。
+// 回复：+简单字符串、-错误、:整数、$批量字符串（$-1 是空值）、*数组。
+import "std/str"
+
+// ---------- 解析命令 ----------
+
+// buf 里从 pos 开始的 \r\n 的位置；没有时 -1
+fn find_crlf(buf: str, pos: int) -> int {
+    i = pos
+    for i + 1 < len(buf) {
+        if byte_at(buf, i) == '\r' && byte_at(buf, i + 1) == '\n' { return i }
+        i += 1
+    }
+    -1
+}
+
+fn find_nl(buf: str, pos: int) -> int {
+    for i in pos..len(buf) {
+        if byte_at(buf, i) == '\n' { return i }
+    }
+    -1
+}
+
+// 解析 buf 里从 pos 开始的一条命令，得到 (参数, 下一条命令的位置, 错误)。
+// 位置是 -1 表示数据还不完整（等更多数据再来）；-2 表示格式错误（错误信息在第三项，回复后应该关闭连接）。
+// 空行得到空的参数列表，跳过就行
+pub fn parse(buf: str, pos: int) -> ([str], int, str) {
+    args: [str] = []
+    if pos >= len(buf) { return (args, -1, "") }
+    if byte_at(buf, pos) != '*' { return parse_inline(buf, pos) }
+    e = find_crlf(buf, pos)
+    if e < 0 { return (args, -1, "") }
+    n = try_parse_int(slice(buf, pos + 1, e)) ?? -1000
+    if n < -1 || n > 1048576 { return (args, -2, "Protocol error: invalid multibulk length") }
+    p = e + 2
+    for _k in 0..n {
+        if p >= len(buf) { return (args, -1, "") }
+        if byte_at(buf, p) != '$' {
+            got = slice(buf, p, p + 1)
+            return (args, -2, "Protocol error: expected '$', got '#{got}'")
+        }
+        e2 = find_crlf(buf, p)
+        if e2 < 0 { return (args, -1, "") }
+        m = try_parse_int(slice(buf, p + 1, e2)) ?? -1
+        if m < 0 || m > 536870912 { return (args, -2, "Protocol error: invalid bulk length") }
+        start = e2 + 2
+        if start + m + 2 > len(buf) { return (args, -1, "") }
+        args.push(slice(buf, start, start + m))
+        p = start + m + 2
+    }
+    (args, p, "")
+}
+
+// 内联命令：一行，按空白分开（像 redis-cli 那样，双引号里的空白不分开）
+fn parse_inline(buf: str, pos: int) -> ([str], int, str) {
+    none: [str] = []
+    e = find_nl(buf, pos)
+    if e < 0 { return (none, -1, "") }
+    line = slice(buf, pos, e)
+    if len(line) > 0 && byte_at(line, len(line) - 1) == '\r' { line = slice(line, 0, len(line) - 1) }
+    match take split_args(line) {
+        Some(args) => (args, e + 1, "")
+        None => (none, -2, "Protocol error: unbalanced quotes in request")
+    }
+}
+
+// 按空白切开一行，"…" 里可以有空白和 \n \r \t \\ \" 转义（redis-cli 的写法）；引号没配对时 None
+pub fn split_args(line: str) -> [str]? {
+    out: [str] = []
+    i = 0
+    n = len(line)
+    for true {
+        for i < n && is_blank(byte_at(line, i)) { i += 1 }
+        if i >= n { break }
+        cur = ""
+        if byte_at(line, i) == '"' {
+            i += 1
+            closed = false
+            for i < n {
+                ch = byte_at(line, i)
+                if ch == '\\' && i + 1 < n {
+                    nx = byte_at(line, i + 1)
+                    cur += if nx == 'n' { "\n" } else if nx == 'r' { "\r" } else if nx == 't' { "\t" } else { slice(line, i + 1, i + 2) }
+                    i += 2
+                } else if ch == '"' {
+                    closed = true
+                    i += 1
+                    break
+                } else {
+                    cur += slice(line, i, i + 1)
+                    i += 1
+                }
+            }
+            if !closed { return None }
+        } else {
+            start = i
+            for i < n && !is_blank(byte_at(line, i)) { i += 1 }
+            cur = slice(line, start, i)
+        }
+        out.push(cur)
+    }
+    Some(out)
+}
+
+fn is_blank(ch: int) -> bool { ch == ' ' || ch == '\t' }
+
+// ---------- 编码 ----------
+
+pub fn ok() -> str { "+OK\r\n" }
+
+pub fn simple(s: str) -> str { "+#{s}\r\n" }
+
+pub fn error(s: str) -> str { "-#{s}\r\n" }
+
+pub fn integer(n: int) -> str { ":#{n}\r\n" }
+
+pub fn bulk(s: str) -> str { "$#{len(s)}\r\n#{s}\r\n" }
+
+pub fn nil() -> str { "$-1\r\n" }
+
+pub fn nil_array() -> str { "*-1\r\n" }
+
+// 已经编码好的各项拼成数组
+pub fn array(items: [str]) -> str {
+    s = "*#{len(items)}\r\n"
+    for x in items { s += x }
+    s
+}
+
+pub fn bulks(xs: [str]) -> str {
+    s = "*#{len(xs)}\r\n"
+    for x in xs { s += bulk(x) }
+    s
+}
+
+// 客户端发的命令
+pub fn command(args: [str]) -> str { bulks(args) }
+
+// ---------- 常见的错误（和真 Redis 的写法一样） ----------
+
+pub fn wrong_args(name: str) -> str { error("ERR wrong number of arguments for '#{str.to_lower(name)}' command") }
+
+pub fn wrong_type() -> str { error("WRONGTYPE Operation against a key holding the wrong kind of value") }
+
+pub fn not_int() -> str { error("ERR value is not an integer or out of range") }
+
+pub fn syntax() -> str { error("ERR syntax error") }
+
+pub fn unknown(args: [str]) -> str {
+    s = "ERR unknown command '#{args[0]}', with args beginning with: "
+    for k in 1..len(args) { s += "'#{args[k]}' " }
+    error(s)
+}
+
+// Redis 认的整数写法：可选的 -，后面是数字，不能有前导 0、空白和 +（“007”“+1”“ 1”都不算）
+pub fn parse_int(s: str) -> int? {
+    n = len(s)
+    if n == 0 || n > 20 { return None }
+    start = if byte_at(s, 0) == '-' { 1 } else { 0 }
+    if start == n { return None }
+    for i in start..n {
+        ch = byte_at(s, i)
+        if ch < '0' || ch > '9' { return None }
+    }
+    if byte_at(s, start) == '0' && n - start > 1 { return None }
+    if s == "-0" { return None }
+    match try_parse_int(s) {
+        Ok(v) => Some(v)
+        Err(_) => None
+    }
+}

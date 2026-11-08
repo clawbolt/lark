@@ -1,0 +1,43 @@
+// ltls：从零写的 TLS 1.3（实验性：没有经过审计，不要用来保护真实的数据）。
+// 构建：在 apps/ltls 里 lark build，得到 build/ltls。阶段 1 是加密原语，阶段 2 是记录层、密钥计算、握手状态机（tls/ 下面），测试见 tests.lark：
+//   tls/chacha20、tls/poly1305、tls/aead（ChaCha20-Poly1305，RFC 8439）、tls/hkdf（RFC 5869 和 RFC 8446 第 7.1 节）、
+//   tls/x25519（RFC 7748）；tls/record（记录、握手消息、加密的记录）、tls/schedule（密钥计算）、tls/client（状态机），
+//   tls/hello（ClientHello、ServerHello）、tls/session（完整的握手），都先在 formal/Lark/Tls.lean、Tls13.lean、Hello.lean、
+//   Session.lean 里证明，再对照 RFC 8448 的握手记录检查；tests.lark 里在内存里完整握手一次。tls/ed25519（RFC 8032，Ed25519.lean）
+//   给 CertificateVerify 签名；tls/der、tls/x509（Der.lean）解析 DER 和证书，取出 Ed25519 公钥、验证证书的签名；
+//   握手里客户端用的公钥还是事先知道的，接上证书和证书链是下一步。
+//
+//   ltls pub 私钥            私钥（64 个十六进制字符）对应的 X25519 公钥
+//   ltls shared 私钥 公钥    和对方的公钥算出共享的密钥
+import "std/digest"
+import "std/flag"
+import "tls/x25519"
+
+fn main() {
+    p = flag.new("ltls", "从零写的 TLS 1.3（实验性，阶段 1：加密原语）")
+    p.add_command(flag.new("pub", "X25519 公钥：ltls pub 私钥"))
+    p.add_command(flag.new("shared", "X25519 共享密钥：ltls shared 私钥 对方的公钥"))
+    a = p.parse_or_exit()
+    match run(a) {
+        Ok(s) => print(s)
+        Err(e) => {
+            eprint("ltls：#{e}")
+            exit(1)
+        }
+    }
+}
+
+fn run(a: flag.Args) -> str! {
+    want = if a.command == "pub" { 1 } else { 2 }
+    if len(a.rest) != want { return Err("要 #{want} 个参数，这里是 #{len(a.rest)} 个") }
+    k = key32(a.rest[0], "私钥")?
+    if a.command == "pub" { return Ok(digest.to_hex(x25519.public_key(k))) }
+    peer = key32(a.rest[1], "公钥")?
+    Ok(digest.to_hex(x25519.shared(k, peer)?))
+}
+
+fn key32(s: str, what: str) -> [u8]! {
+    d = digest.from_hex(s)?
+    if len(d) != 32 { return Err("#{what}要 32 字节（64 个十六进制字符），这里是 #{len(d)} 字节") }
+    Ok(d)
+}

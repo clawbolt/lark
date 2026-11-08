@@ -1,0 +1,43 @@
+// 画框线的字符集（DEC Special Graphics）：ESC ( 0 / ESC ) 0 换成画线字符集，ESC ( B / ESC ) B 换回 ASCII，SO 用 G1、SI 用 G0。
+// 先证明再写：对应 formal/Lark/VtCharset.lean，函数和定义一一对应：
+//   gfx ↔ gfx、Cs ↔ Cs、new ↔ init、active ↔ active、map ↔ map、designate / so / si / reset ↔ step 的四种 Op。
+// 证明了：0x5F–0x7E 以外的字符不变（map_out）；用 ASCII 时什么都不变（map_ascii）；换出来的字符都占一格（width_get、map_width）；
+// 不同的字母换成不同的字符（gfx_inj）；ESC ( B + SI 或者复位以后一定回到 ASCII（reset_ascii）；设置 G0 不影响 G1（designate_other）。
+// 别的字符集（ESC ( A 等）当作 ASCII。没做：SS2 / SS3、G2 / G3。
+
+// 画线字符集：从 0x5F 开始的 32 个字符（q → ─、x → │、l → ┌ ……）
+pub fn gfx() -> [int] {
+    [0x00A0, 0x25C6, 0x2592, 0x2409, 0x240C, 0x240D, 0x240A, 0x00B0,
+        0x00B1, 0x2424, 0x240B, 0x2518, 0x2510, 0x250C, 0x2514, 0x253C,
+        0x23BA, 0x23BB, 0x2500, 0x23BC, 0x23BD, 0x251C, 0x2524, 0x2534,
+        0x252C, 0x2502, 0x2264, 0x2265, 0x03C0, 0x2260, 0x00A3, 0x00B7]
+}
+
+pub type Cs {
+    pub g0: bool        // true：画线字符集
+    pub g1: bool
+    pub shift: bool     // true：用 G1（SO）
+}
+
+pub fn new() -> Cs { Cs(g0: false, g1: false, shift: false) }
+
+pub fn active(s: Cs) -> bool { if s.shift { s.g1 } else { s.g0 } }
+
+// 一个字符经过现在的字符集
+pub fn map(s: Cs, c: int) -> int {
+    if active(s) && 0x5F <= c && c <= 0x7E {
+        t = gfx()
+        return t[c - 0x5F]
+    }
+    c
+}
+
+// ESC ( F（g = 0）、ESC ) F（g = 1）：F 是 0 时是画线字符集，别的都当作 ASCII
+pub fn designate(inout s: Cs, g: int, f: int) {
+    lines = f == 0x30
+    if g == 0 { s.g0 = lines } else { s.g1 = lines }
+}
+
+pub fn so(inout s: Cs) { s.shift = true }
+
+pub fn si(inout s: Cs) { s.shift = false }

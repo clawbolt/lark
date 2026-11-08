@@ -1,0 +1,21 @@
+// 整数溢出检查（需要 lark1 及以后的版本）
+// int 是 64 位有符号整数。+ - * 和一元 - 的结果超出范围（还有 MIN / -1）时 panic，退出码 101，
+// 而不是像 C 那样悄悄回绕（C 里有符号溢出是未定义行为）。
+// 整数字面量和常量表达式超出范围时，在编译时就报错。编译 C 时加 -DLK_UNCHECKED 可以关掉运行时检查。
+// 编译：lark1 examples/overflow.lark -o out.c
+
+const MAX = 9223372036854775807
+const MIN = -MAX - 1
+
+fn main() {
+    print("MAX = #{MAX}，MIN = #{MIN}")
+    near = MAX - 1
+    print("MAX - 1 + 1 = #{near + 1}")
+    print("MIN % -1 = #{MIN % -1}")
+    f = 1
+    for i in 1..30 {
+        f = f * i          // 21! 超出了 64 位，这里会 panic
+        print("#{i}! = #{f}")
+    }
+    print("不会执行到这里")
+}

@@ -1,0 +1,64 @@
+// 位运算、移位、回绕运算和十六进制 / 二进制字面量（需要 lark1 及以后的版本）
+// & | ^ 和一元 !（对 int 是按位取反）；<< 移出的位丢掉，>> 左边补符号位，>>> 左边补 0，移位数不在 0..63 时 panic。
+// +% -% *% 按 64 位补码回绕，不检查溢出（+ - * 照旧检查）。0x / 0b 字面量最多 64 位，第 64 位是 1 时是负数。
+// 优先级同 Rust：* / % *% 高于 + - +% -%，高于移位，高于 &，高于 ^，高于 |，高于比较。
+// 编译：lark1 examples/bits.lark -o out.c
+
+const MASK = 0xFF
+const HIGH = 1 << 62
+const COMBO = (MASK << 8) | MASK
+const NOT0 = !0
+const BIG = 0x7FFF_FFFF_FFFF_FFFF
+const WRAP = BIG +% 1
+const FNV_OFFSET = 0xcbf2_9ce4_8422_2325
+const FNV_PRIME = 0x100_0000_01b3
+const FNV_A = (FNV_OFFSET ^ 'a') *% FNV_PRIME     // 编译时算好的 FNV-1a("a")
+
+// 64 位 FNV-1a 哈希：异或一个字节，再回绕地乘一个质数
+fn fnv1a(s: str) -> int {
+    h = FNV_OFFSET
+    for i in 0..len(s) {
+        h = (h ^ byte_at(s, i)) *% FNV_PRIME
+    }
+    h
+}
+
+// 按 64 位无符号的样子写成 16 位十六进制
+fn hex64(x: int) -> str {
+    digits = "0123456789abcdef"
+    out = ""
+    for k in 0..16 {
+        d = (x >>> (15 - k) * 4) & 0xF
+        out = out + slice(digits, d, d + 1)
+    }
+    out
+}
+
+// 1 的个数：v & (v - 1) 去掉最低的 1。v 是最小的 int 时 v - 1 会溢出，所以用 -%
+fn popcount(x: int) -> int {
+    n = 0
+    v = x
+    for v != 0 {
+        v = v & (v -% 1)
+        n += 1
+    }
+    n
+}
+
+fn main() {
+    print("0xff = #{0xff}，0b1010 = #{0b1010}，0x7fff_ffff_ffff_ffff = #{0x7fff_ffff_ffff_ffff}，0xffff_ffff_ffff_ffff = #{0xffff_ffff_ffff_ffff}")
+    a = 0b1100
+    b = 0b1010
+    print("a & b = #{a & b}，a | b = #{a | b}，a ^ b = #{a ^ b}，!a = #{!a}")
+    x = -16
+    print("1 << 10 = #{1 << 10}，-16 >> 2 = #{x >> 2}，-16 >>> 60 = #{x >>> 60}，1 << 63 = #{1 << 63}")
+    print("优先级：#{6 & 3 == 2} #{1 + 2 << 3} #{1 | 2 ^ 3 & 4}")
+    print("常量：#{MASK} #{HIGH} #{COMBO} #{NOT0} #{WRAP}")
+    print("回绕：#{BIG +% 1} #{(0 - BIG - 1) -% 1} #{BIG *% 2} #{3 *% -1}")
+    print("FNV-1a：#{hex64(fnv1a(""))} #{hex64(fnv1a("a"))} #{hex64(fnv1a("foobar"))}")
+    print("编译时和运行时算的一样：#{FNV_A == fnv1a("a")}")
+    print("popcount：#{popcount(0)} #{popcount(255)} #{popcount(-1)} #{popcount(1 << 63)}")
+    n = 64
+    print("1 << 64 = #{1 << n}")      // 移位数超出 0..63，这里会 panic
+    print("不会执行到这里")
+}

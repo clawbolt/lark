@@ -1,0 +1,14 @@
+// 期望错误：Point 没有 fn show(Point) -> str，不满足 Show；报错指向调用处（第 13 行）
+interface Show {
+    fn show(x: Self) -> str
+}
+
+type Point {
+    x: int
+}
+
+fn show_all[T: Show](xs: [T]) -> int { len(xs) }
+
+fn main() {
+    n = show_all([Point(x: 1)])
+}

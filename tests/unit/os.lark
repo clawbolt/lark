@@ -1,0 +1,206 @@
+// std/os 的测试：只按字面算的路径函数、通配符匹配，以及在临时目录里建一棵小树测 glob 和 walk
+import "std/os"
+import "std/time"
+import "std/str"
+
+fn rel(a: str, b: str) -> str { os.rel(a, b) ?? "<无>" }
+
+fn put(p: str) {
+    match os.mkdir_all(os.dir(p)) {
+        Ok(_) => {}
+        Err(e) => panic(e)
+    }
+    match os.write(p, "x") {
+        Ok(_) => {}
+        Err(e) => panic(e)
+    }
+}
+
+// 去掉 root/ 前缀，用逗号连起来
+fn names(r: [str]!, root: str) -> str {
+    match r {
+        Ok(xs) => {
+            out: [str] = []
+            for x in xs { out.push(str.trim_prefix(x, root + "/")) }
+            join(out, ",")
+        }
+        Err(e) => panic(e)
+    }
+}
+
+test "整理路径" {
+    assert_eq(os.clean("a//b/./c/../d/"), "a/b/d")
+    assert_eq(os.clean("../a/.."), "..")
+    assert_eq(os.clean("a/../.."), "..")
+    assert_eq(os.clean("/../x"), "/x")
+    assert_eq(os.clean("//a"), "/a")
+    assert_eq(os.clean("/"), "/")
+    assert_eq(os.clean(""), ".")
+    assert_eq(os.clean("./"), ".")
+    assert(os.is_abs("/a"))
+    assert(!os.is_abs("a/b"))
+    assert(!os.is_abs(""))
+}
+
+test "相对路径和扩展名" {
+    assert_eq(rel("a/b", "a/c/d"), "../c/d")
+    assert_eq(rel("a", "a"), ".")
+    assert_eq(rel("a/b/c", "a"), "../..")
+    assert_eq(rel("/", "/usr/bin"), "usr/bin")
+    assert_eq(rel("./a/", "a/x"), "x")
+    assert_eq(rel("/x", "y"), "<无>")
+    assert_eq(rel("..", "a"), "<无>")
+    assert_eq(os.with_ext("a/b.txt", ".md"), "a/b.md")
+    assert_eq(os.with_ext("a/b", ".md"), "a/b.md")
+    assert_eq(os.with_ext("a/b.tar.gz", ""), "a/b.tar")
+    assert_eq(os.with_ext(".bashrc", ".bak"), ".bashrc.bak")
+}
+
+test "通配符匹配" {
+    assert(os.glob_match("*.txt", "a.txt"))
+    assert(!os.glob_match("*.txt", "a/b.txt"))
+    assert(!os.glob_match("*.lark", "x.lark.bak"))
+    assert(os.glob_match("a?c", "abc"))
+    assert(!os.glob_match("a?c", "a/c"))
+    assert(os.glob_match("[a-c]x", "bx"))
+    assert(!os.glob_match("[!a-c]x", "bx"))
+    assert(os.glob_match("[^a-c]x", "dx"))
+    assert(os.glob_match("[]]", "]"))
+    assert(os.glob_match("[abc", "[abc"))
+    assert(os.glob_match("\\*", "*"))
+    assert(!os.glob_match("\\*", "a"))
+    assert(os.glob_match("*a*b", "xaybzb"))
+    assert(!os.glob_match("*a*b", "xaybz"))
+    assert(os.glob_match("*", ""))
+    assert(os.glob_match("a*", "a"))
+    assert(os.glob_match("", ""))
+    assert(!os.glob_match("", "a"))
+    assert(os.glob_match("云*", "云雀"))
+}
+
+test "glob 和 walk" {
+    t = os.temp_dir()
+    assert(len(t) > 0)
+    assert(t == "/" || !str.ends_with(t, "/"))
+    root = os.join_path(t, "lark_os_test_#{time.unix_ms()}")
+    for f in ["a.txt", "b.lark", ".hidden.txt", "src/x.lark", "src/sub/y.lark", "src/sub/z.txt"] {
+        put(os.join_path(root, f))
+    }
+    assert_eq(names(os.glob(root + "/*.txt"), root), "a.txt")
+    assert_eq(names(os.glob(root + "/*"), root), "a.txt,b.lark,src")
+    assert_eq(names(os.glob(root + "/.*"), root), ".hidden.txt")
+    assert_eq(names(os.glob(root + "/**/*.lark"), root), "b.lark,src/sub/y.lark,src/x.lark")
+    assert_eq(names(os.glob(root + "/src/*/y.lark"), root), "src/sub/y.lark")
+    assert_eq(names(os.glob(root + "/src/sub"), root), "src/sub")
+    assert_eq(names(os.glob(root + "/nope/*"), root), "")
+    assert_eq(names(os.walk(root), root), ".hidden.txt,a.txt,b.lark,src/sub/y.lark,src/sub/z.txt,src/x.lark")
+    assert_eq(names(os.glob(root + "/src/**"), root), "src,src/sub,src/sub/y.lark,src/sub/z.txt,src/x.lark")
+    // 链接成环（src/loop -> ..）：walk 和 ** 都不跟进去，链接本身算一项
+    ok(os.symlink("..", os.join_path(root, "src/loop")))
+    assert_eq(names(os.walk(root), root), ".hidden.txt,a.txt,b.lark,src/loop,src/sub/y.lark,src/sub/z.txt,src/x.lark")
+    assert_eq(names(os.glob(root + "/src/**"), root), "src,src/loop,src/sub,src/sub/y.lark,src/sub/z.txt,src/x.lark")
+    match os.remove_all(root) {
+        Ok(_) => {}
+        Err(e) => panic(e)
+    }
+    assert(!os.exists(root))
+}
+
+test "程序路径" {
+    p = match take os.exe_path() {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    assert(os.is_abs(p))
+    assert(os.is_file(p))
+    // 测试程序是 build/unit_os
+    assert_eq(os.base(p), "unit_os")
+}
+
+test "权限和符号链接" {
+    root = os.join_path(os.temp_dir(), "lark_os_link_#{time.unix_ms()}")
+    f = os.join_path(root, "run.sh")
+    put(f)
+    ok(os.chmod(f, 0o755))
+    assert_eq(info(os.stat(f)).mode, 0o755)
+    ok(os.chmod(f, 0o600))
+    assert_eq(info(os.stat(f)).mode & 0o777, 0o600)
+
+    // 指向文件的链接：stat 跟过去，lstat 看链接本身；链接里写的路径原样读回来
+    link = os.join_path(root, "link")
+    ok(os.symlink("run.sh", link))
+    assert(info(os.stat(link)).is_file)
+    assert(!info(os.stat(link)).is_symlink)
+    assert(info(os.lstat(link)).is_symlink)
+    assert(!info(os.lstat(f)).is_symlink)
+    assert_eq(text(os.read_link(link)), "run.sh")
+    // 链接已经存在、读的不是链接、路径不存在：都是错误，信息里写着路径
+    assert(str.starts_with(err(os.symlink("x", link)), "无法新建符号链接 #{link}："))
+    assert(str.starts_with(err(os.read_link(f)), "无法读取符号链接 #{f}："))
+    assert(str.starts_with(err(os.lstat(root + "/nope")), "无法读取文件信息 #{root}/nope："))
+    assert(str.starts_with(err(os.chmod(root + "/nope", 0o644)), "无法修改权限 #{root}/nope："))
+
+    // remove_all 遇到指向目录的链接，只删链接，不删它指向的目录里的东西
+    keep = os.join_path(os.temp_dir(), "lark_os_keep_#{time.unix_ms()}")
+    put(os.join_path(keep, "k.txt"))
+    ok(os.symlink(keep, os.join_path(root, "to_keep")))
+    ok(os.remove_all(root))
+    assert(!os.exists(root))
+    assert(os.is_file(os.join_path(keep, "k.txt")))
+    ok(os.remove_all(keep))
+}
+
+test "硬链接和修改时间" {
+    root = os.join_path(os.temp_dir(), "lark_os_hard_#{time.unix_ms()}")
+    a = os.join_path(root, "a.txt")
+    put(a)
+    // 硬链接：写一个，另一个也变；删掉原来的，链接还在
+    b = os.join_path(root, "b.txt")
+    ok(os.hard_link(a, b))
+    ok(os.write(b, "改过"))
+    assert_eq(text(os.read(a)), "改过")
+    ok(os.remove(a))
+    assert_eq(text(os.read(b)), "改过")
+    assert(str.starts_with(err(os.hard_link(root + "/nope", a)), "无法新建硬链接 #{a}："))
+    ok(os.hard_link(b, a))
+    assert(str.starts_with(err(os.hard_link(b, a)), "无法新建硬链接 #{a}："))
+
+    // 修改时间按毫秒精确设回；1970 年以前（负数）也行
+    t = 1_700_000_000_123
+    ok(os.set_mtime(b, t))
+    assert_eq(info(os.stat(b)).mtime_ms, t)
+    ok(os.set_mtime(b, -1500))
+    assert_eq(info(os.stat(b)).mtime_ms, -1500)
+    ok(os.set_mtime(b, 0))
+    assert_eq(info(os.stat(b)).mtime_ms, 0)
+    assert(str.starts_with(err(os.set_mtime(root + "/nope", t)), "无法修改时间 #{root}/nope："))
+    ok(os.remove_all(root))
+}
+
+fn ok(r: ()!) {
+    match r {
+        Ok(_) => {}
+        Err(e) => panic(e)
+    }
+}
+
+fn info(take r: os.FileInfo!) -> os.FileInfo {
+    match take r {
+        Ok(i) => i
+        Err(e) => panic(e)
+    }
+}
+
+fn text(take r: str!) -> str {
+    match take r {
+        Ok(s) => s
+        Err(e) => panic(e)
+    }
+}
+
+fn err[T](r: T!) -> str {
+    match r {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}

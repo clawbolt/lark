@@ -1,0 +1,202 @@
+// lvm 的虚拟机：指令、一个线程（pc、操作数栈、局部变量）、走一步、一个时间片。
+// 先证明再写：对应 formal/Lark/VmCore.lean，函数和定义一一对应：
+//   Ins ↔ Ins、Th ↔ Th、step ↔ step、slice ↔ slice、R ↔ R；
+//   Ev 合起来表示 step 的结果（Out：Next / Done / Fault / Call）和时间片为什么停下（Stop：Budget / Done / Fault / Call）。
+// 证明了：一个时间片最多跑 budget 条指令（slice_le），用完时正好 budget 条（slice_budget）；
+// 先跑 n 条被抢占、再跑 m 条，和一口气跑 n + m 条结果一样（slice_split）——什么时候被换下去都不改变线程算出来的东西。
+// 和模型不一样的地方：线程就地修改（模型里返回新的线程），停在 Done / Fault 时线程不变（和模型一样）；
+// 名字：Ins 的 halt 和 sys 在这里是 Halt 和 Sys，结果里是 Done 和 Call（Lark 的变体名不能重复）；Sys 的种类用整数（SYS_*）。
+// 整数是 64 位的（模型里是 Int）：加减乘溢出时运行时报错退出。
+// 阶段 3 加了函数调用（formal/Lark/VmCall.lean）：Call / Ret 和调用帧 fr（Fr ↔ Fr），调用深度最多 DEPTH 帧（模型里的 D）；
+// 证明了 call 记下返回的地方和局部变量、ret 原样换回来（call_saves、ret_restores），帧最多 DEPTH 个（slice_depth），
+// 加了调用以后上面时间片的几条照样成立。指令 Call 和结果 Call 同名不行，所以指令叫 CallF、RetF。
+
+pub const DEPTH = 1000
+
+pub const SYS_YIELD = 0
+pub const SYS_SPAWN = 1
+pub const SYS_NEWCH = 2
+pub const SYS_SEND = 3
+pub const SYS_RECV = 4
+pub const SYS_SLEEP = 5
+pub const SYS_JOIN = 6
+pub const SYS_SELF = 7
+pub const SYS_PRINT = 8
+pub const SYS_SELECT = 9          // a 是同时等几个通道
+pub const SYS_TSELECT = 10        // 带超时的 select：a 是几个通道，超时（毫秒）在栈顶
+
+pub enum Ins {
+    Push(n: int)
+    Pop
+    Dup
+    Swap
+    Add
+    Sub
+    Mul
+    Lt
+    Eq
+    Load(i: int)
+    Store(i: int)
+    Jmp(a: int)
+    Jz(a: int)
+    Halt
+    Sys(k: int, a: int)     // a：spawn 时是新线程从哪条指令开始，newch 时是容量（-1 是不限）
+    CallF(a: int)
+    RetF
+}
+
+// 一帧：返回到哪条指令、调用前的局部变量
+pub type Fr {
+    pub ret: int
+    pub loc: [int]
+}
+
+pub type Th {
+    pub pc: int
+    pub st: [int]
+    pub loc: [int]
+    pub fr: [Fr]
+}
+
+fn zeros(n: int) -> [int] {
+    loc: [int] = []
+    for _i in 0..n { loc.push(0) }
+    loc
+}
+
+pub fn new_th(pc: int, nloc: int) -> Th {
+    st: [int] = []
+    fr: [Fr] = []
+    Th(pc: pc, st: st, loc: zeros(nloc), fr: fr)
+}
+
+pub enum Ev {
+    Next                            // 接着跑（只有 step 返回）
+    Budget                          // 时间片用完（只有 slice 返回）
+    Done(v: int, has: bool)         // 结束：栈顶（栈是空的时候 has 是 false）
+    Fault                           // 出错
+    Call(k: int, a: int)            // 要调度器做事：线程已经停在下一条指令，参数在栈上
+}
+
+// 调用前已经检查过栈够不够
+fn pop1(inout t: Th) -> int { t.st.pop() }
+
+fn bin(inout t: Th, op: int) -> Ev {
+    if len(t.st) < 2 { return Fault }
+    b = pop1(&t)
+    a = pop1(&t)
+    v = if op == 0 { a + b } else if op == 1 { a - b } else if op == 2 { a * b } else if op == 3 { (if a < b { 1 } else { 0 }) } else { (if a == b { 1 } else { 0 }) }
+    t.st.push(v)
+    t.pc += 1
+    Next
+}
+
+// 走一步（step）：Next 时 t 已经是下一步的样子；Call 时 pc 已经加一；Done / Fault 时 t 不变
+pub fn step(c: [Ins], inout t: Th) -> Ev {
+    if t.pc < 0 || t.pc >= len(c) { return Fault }
+    match c[t.pc] {
+        Push(n) => {
+            t.st.push(n)
+            t.pc += 1
+            Next
+        }
+        Pop => {
+            if len(t.st) < 1 { return Fault }
+            _v = pop1(&t)
+            t.pc += 1
+            Next
+        }
+        Dup => {
+            if len(t.st) < 1 { return Fault }
+            v = t.st[len(t.st) - 1]
+            t.st.push(v)
+            t.pc += 1
+            Next
+        }
+        Swap => {
+            if len(t.st) < 2 { return Fault }
+            b = pop1(&t)
+            a = pop1(&t)
+            t.st.push(b)
+            t.st.push(a)
+            t.pc += 1
+            Next
+        }
+        Add => bin(&t, 0)
+        Sub => bin(&t, 1)
+        Mul => bin(&t, 2)
+        Lt => bin(&t, 3)
+        Eq => bin(&t, 4)
+        Load(i) => {
+            if i < 0 || i >= len(t.loc) { return Fault }
+            v = t.loc[i]
+            t.st.push(v)
+            t.pc += 1
+            Next
+        }
+        Store(i) => {
+            if len(t.st) < 1 || i < 0 || i >= len(t.loc) { return Fault }
+            v = pop1(&t)
+            t.loc[i] = v
+            t.pc += 1
+            Next
+        }
+        Jmp(a) => {
+            t.pc = a
+            Next
+        }
+        Jz(a) => {
+            if len(t.st) < 1 { return Fault }
+            v = pop1(&t)
+            t.pc = if v == 0 { a } else { t.pc + 1 }
+            Next
+        }
+        Halt => {
+            n = len(t.st)
+            if n == 0 { Done(0, false) } else { Done(t.st[n - 1], true) }
+        }
+        Sys(k, a) => {
+            t.pc += 1
+            Call(k, a)
+        }
+        CallF(a) => {
+            if len(t.fr) >= DEPTH { return Fault }
+            n = len(t.loc)
+            old = replace(&t.loc, zeros(n))
+            t.fr.push(Fr(ret: t.pc + 1, loc: old))
+            t.pc = a
+            Next
+        }
+        RetF => {
+            if len(t.fr) == 0 { return Fault }
+            f = t.fr.pop()
+            t.pc = f.ret
+            t.loc = replace(&f.loc, [])
+            Next
+        }
+    }
+}
+
+pub fn is_next(e: Ev) -> bool {
+    match e {
+        Next => true
+        _ => false
+    }
+}
+
+// 一个时间片跑了几条、为什么停下（R；线程就是传进来的 t）
+pub type R {
+    pub used: int
+    pub stop: Ev
+}
+
+// 最多跑 n 条指令（slice）
+pub fn slice(c: [Ins], n: int, inout t: Th) -> R {
+    used = 0
+    for used < n {
+        e = step(c, &t)
+        used += 1
+        if !is_next(e) { return R(used: used, stop: e) }
+    }
+    R(used: used, stop: Budget)
+}

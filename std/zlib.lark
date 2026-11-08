@@ -1,0 +1,471 @@
+// Lark 标准库 · zlib、deflate 和 gzip（RFC 1950 / 1951 / 1952，用 Lark 自己写）
+// 用法：import "std/zlib"
+//
+//   z = zlib.compress(bytes)            // zlib 格式（git 对象、PNG 用的）；zlib.decompress(z) -> [u8]!
+//   g = zlib.gzip(bytes)                // .gz 文件；zlib.gunzip(g) -> [u8]!（几段连在一起的也行）
+//   d = zlib.deflate(bytes)             // 不带头和校验和的 deflate 数据；zlib.inflate(d) -> [u8]!
+//   zlib.adler32(bytes)                 // zlib 的校验和；gzip 的 CRC-32 在 std/digest
+//
+// 压缩：LZ77（32KB 窗口，哈希链，每个位置最多往回找 64 个候选）加固定 Huffman 码，写成一个块；
+// 结果比不压缩还大时改写成不压缩的块。压缩率不如 zlib 的默认级别（没有动态 Huffman 码），但格式完全合法。
+// 解压支持全部三种块，能读 zlib、gzip 写出来的数据。解码的做法照 zlib 自带的 puff.c：逐位读，按规范 Huffman 码的长度表查。
+// 解出来的数据最多 MAX_OUT（256 MiB），超过就报错：几百 KB 的“解压炸弹”能解出几十 GB。要别的上限用 decompress_max、gunzip_max、inflate_max
+import "bytes"
+import "digest"
+import "fmt"
+
+pub const MAX_OUT = 268_435_456
+
+pub fn adler32(data: [u8]) -> int {
+    a = 1
+    b = 0
+    i = 0
+    n = len(data)
+    for i < n {
+        // 每 5552 个字节取一次模，中间不会超过 32 位（zlib 的做法）
+        stop = if i + 5552 < n { i + 5552 } else { n }
+        for i < stop {
+            a += data[i].to_int()
+            b += a
+            i += 1
+        }
+        a %= 65521
+        b %= 65521
+    }
+    (b << 16) | a
+}
+
+// ---------- 三种外壳 ----------
+
+pub fn compress(data: [u8]) -> [u8] {
+    out: [u8] = [0x78, 0x01]
+    body = deflate(data)
+    out.reserve(len(body) + 6)
+    for b in body { out.push(b) }
+    bytes.push_u32_be(&out, adler32(data))
+    out
+}
+
+// zlib 格式：2 字节头、deflate 数据、4 字节 Adler-32（大端）
+pub fn decompress(data: [u8]) -> [u8]! { decompress_max(data, MAX_OUT) }
+
+pub fn decompress_max(data: [u8], max: int) -> [u8]! {
+    if len(data) < 6 { return Err("zlib：数据太短") }
+    cmf = data[0].to_int()
+    flg = data[1].to_int()
+    if cmf & 0x0F != 8 || (cmf * 256 + flg) % 31 != 0 { return Err("zlib 第 1 个字节：头不对（不是 zlib 数据）") }
+    if flg & 0x20 != 0 { return Err("zlib 第 2 个字节：不支持预设字典") }
+    out, pos = inflate_at(data, 2, max)?
+    if pos + 4 > len(data) { return Err("zlib 第 #{pos + 1} 个字节：缺少校验和") }
+    want = bytes.u32_be(data, pos)
+    if adler32(out) != want { return Err("zlib 第 #{pos + 1} 个字节：校验和不对，数据坏了") }
+    Ok(out)
+}
+
+pub fn gzip(data: [u8]) -> [u8] {
+    // 魔数、deflate、没有标志、时间 0、XFL 0、系统 255（未知）
+    out: [u8] = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255]
+    body = deflate(data)
+    out.reserve(len(body) + 18)
+    for b in body { out.push(b) }
+    bytes.push_u32_le(&out, digest.crc32(data))
+    bytes.push_u32_le(&out, len(data) & 0xFFFF_FFFF)
+    out
+}
+
+pub fn gunzip(data: [u8]) -> [u8]! { gunzip_max(data, MAX_OUT) }
+
+// 几段连在一起时，max 管的是加起来的总长
+pub fn gunzip_max(data: [u8], max: int) -> [u8]! {
+    if len(data) < 18 { return Err("gzip：数据太短") }
+    all: [u8] = []
+    pos = 0
+    // 几段 gzip 连在一起时依次解开、接在一起（和 gunzip 命令一样）
+    for pos < len(data) {
+        if pos + 18 > len(data) || data[pos] != 0x1f || data[pos + 1] != 0x8b { return Err("gzip 第 #{pos + 1} 个字节：头不对（不是 gzip 数据）") }
+        if data[pos + 2] != 8 { return Err("gzip 第 #{pos + 3} 个字节：不支持的压缩方法") }
+        flg = data[pos + 3].to_int()
+        p = pos + 10
+        // FEXTRA：2 字节长度加内容；FNAME、FCOMMENT：以 0 结尾的字符串；FHCRC：2 字节
+        if flg & 4 != 0 {
+            if p + 2 > len(data) { return Err("gzip 第 #{p + 1} 个字节：数据提前结束") }
+            p += 2 + bytes.u16_le(data, p)
+        }
+        for bit in [8, 16] {
+            if flg & bit != 0 {
+                for p < len(data) && data[p] != 0 { p += 1 }
+                p += 1
+            }
+        }
+        if flg & 2 != 0 { p += 2 }
+        if p > len(data) { return Err("gzip 第 #{len(data)} 个字节：数据提前结束") }
+        out, q = inflate_at(data, p, max - len(all))?
+        if q + 8 > len(data) { return Err("gzip 第 #{q + 1} 个字节：缺少校验和") }
+        if digest.crc32(out) != bytes.u32_le(data, q) { return Err("gzip 第 #{q + 1} 个字节：校验和不对，数据坏了") }
+        if (len(out) & 0xFFFF_FFFF) != bytes.u32_le(data, q + 4) { return Err("gzip 第 #{q + 5} 个字节：长度不对，数据坏了") }
+        if len(all) == 0 {
+            all = out
+        } else {
+            for b in out { all.push(b) }
+        }
+        pos = q + 8
+    }
+    Ok(all)
+}
+
+// ---------- 压缩 ----------
+
+type Bits {
+    out: [u8]
+    buf: int        // 还没写出去的位（低位先写）
+    cnt: int
+}
+
+fn put(inout w: Bits, v: int, n: int) {
+    w.buf = w.buf | (v << w.cnt)
+    w.cnt += n
+    for w.cnt >= 8 {
+        w.out.push((w.buf & 0xFF).wrap_u8())
+        w.buf = w.buf >>> 8
+        w.cnt -= 8
+    }
+}
+
+// Huffman 码从高位往低位写，位流是低位先写，所以先倒过来
+fn put_code(inout w: Bits, code: int, n: int) {
+    r = 0
+    for k in 0..n { r = r | (((code >>> k) & 1) << (n - 1 - k)) }
+    put(&w, r, n)
+}
+
+// 固定 Huffman 码（RFC 1951 3.2.6）
+fn put_lit(inout w: Bits, sym: int) {
+    if sym < 144 {
+        put_code(&w, 0x30 + sym, 8)
+    } else if sym < 256 {
+        put_code(&w, 0x190 + sym - 144, 9)
+    } else if sym < 280 {
+        put_code(&w, sym - 256, 7)
+    } else {
+        put_code(&w, 0xC0 + sym - 280, 8)
+    }
+}
+
+// 在表里找最后一个不大于 v 的基数
+fn slot(base: [int], v: int) -> int {
+    k = len(base) - 1
+    for base[k] > v { k -= 1 }
+    k
+}
+
+fn put_match(inout w: Bits, length: int, dist: int, lb: [int], lx: [int], db: [int], dx: [int]) {
+    li = slot(lb, length)
+    put_lit(&w, 257 + li)
+    if lx[li] > 0 { put(&w, length - lb[li], lx[li]) }
+    di = slot(db, dist)
+    put_code(&w, di, 5)
+    if dx[di] > 0 { put(&w, dist - db[di], dx[di]) }
+}
+
+const WIN = 32768
+const HBITS = 15
+const MAX_CHAIN = 64
+
+fn hash3(d: [u8], i: int) -> int {
+    ((d[i].to_int() << 10) ^ (d[i + 1].to_int() << 5) ^ d[i + 2].to_int()) & ((1 << HBITS) - 1)
+}
+
+// 不带头和校验和的 deflate 数据
+pub fn deflate(data: [u8]) -> [u8] {
+    n = len(data)
+    w = Bits(out: [], buf: 0, cnt: 0)
+    w.out.reserve(n / 2 + 16)
+    put(&w, 1, 1)       // 最后一个块
+    put(&w, 1, 2)       // 固定 Huffman
+    lb = lbase()
+    lx = lext()
+    db = dbase()
+    dx = dext()
+    // head[h]：哈希为 h 的最近一个位置；prev[i % WIN]：同一个哈希的上一个位置
+    head: [int] = []
+    for _k in 0..(1 << HBITS) { head.push(-1) }
+    prev: [int] = []
+    for _k in 0..WIN { prev.push(-1) }
+    i = 0
+    for i < n {
+        best = 0
+        bdist = 0
+        if i + 3 <= n {
+            h = hash3(data, i)
+            cand = head[h]
+            chain = 0
+            limit = if n - i < 258 { n - i } else { 258 }
+            for cand >= 0 && i - cand <= WIN && chain < MAX_CHAIN {
+                // 先比最佳长度那个位置，对不上就不用从头比
+                if data[cand + best] == data[i + best] || best == 0 {
+                    l = 0
+                    for l < limit && data[cand + l] == data[i + l] { l += 1 }
+                    if l > best {
+                        best = l
+                        bdist = i - cand
+                        if l == limit { break }
+                    }
+                }
+                cand = prev[cand % WIN]
+                chain += 1
+            }
+        }
+        if best >= 3 {
+            put_match(&w, best, bdist, lb, lx, db, dx)
+        } else {
+            best = 1
+            put_lit(&w, data[i].to_int())
+        }
+        // 匹配覆盖的每个位置都登记进哈希表
+        stop = i + best
+        for i < stop {
+            if i + 3 <= n {
+                h = hash3(data, i)
+                prev[i % WIN] = head[h]
+                head[h] = i
+            }
+            i += 1
+        }
+    }
+    put_lit(&w, 256)
+    if w.cnt > 0 { put(&w, 0, 8 - w.cnt) }
+    // 压不小时（已经压缩过的数据、很短的数据）改用不压缩的块：每块最多 65535 字节，加 5 字节的头
+    if len(w.out) > n + (n / 65535 + 1) * 5 { return stored_blocks(data) }
+    replace(&w.out, [])
+}
+
+fn stored_blocks(data: [u8]) -> [u8] {
+    n = len(data)
+    out: [u8] = []
+    out.reserve(n + (n / 65535 + 1) * 5)
+    pos = 0
+    first = true
+    for first || pos < n {
+        first = false
+        k = if n - pos > 65535 { 65535 } else { n - pos }
+        if pos + k == n { out.push(1) } else { out.push(0) }
+        bytes.push_u16_le(&out, k)
+        nk = !k & 0xFFFF
+        bytes.push_u16_le(&out, nk)
+        for j in pos..pos + k { out.push(data[j]) }
+        pos += k
+    }
+    out
+}
+
+// ---------- 解压 ----------
+
+type Inf {
+    data: [u8]
+    pos: int        // 下一个要读的字节
+    buf: int        // 还没用的位（低位先用）
+    cnt: int        // buf 里的位数
+    out: [u8]
+    max: int       // out 最多这么长，超过就报错（防解压炸弹）
+}
+
+type Huff {
+    count: [int]    // count[len]：码长为 len 的符号个数
+    symbol: [int]   // 按码排好的符号
+}
+
+fn bits(inout s: Inf, n: int) -> int! {
+    for s.cnt < n {
+        if s.pos >= len(s.data) { return Err(inf_err(s, "数据提前结束")) }
+        s.buf = s.buf | (s.data[s.pos].to_int() << s.cnt)
+        s.pos += 1
+        s.cnt += 8
+    }
+    v = s.buf & ((1 << n) - 1)
+    s.buf = s.buf >>> n
+    s.cnt -= n
+    Ok(v)
+}
+
+// 码长表 lens（每个符号一项，0 表示不用）变成规范 Huffman 的查表结构
+fn build(lens: [int]) -> Huff {
+    count: [int] = []
+    for _i in 0..16 { count.push(0) }
+    for l in lens { count[l] += 1 }
+    offs: [int] = [0, 0]
+    for l in 1..15 { offs.push(offs[l] + count[l]) }
+    symbol: [int] = []
+    for _i in 0..len(lens) { symbol.push(0) }
+    for s in 0..len(lens) {
+        l = lens[s]
+        if l != 0 {
+            symbol[offs[l]] = s
+            offs[l] += 1
+        }
+    }
+    count[0] = 0
+    Huff(count: count, symbol: symbol)
+}
+
+fn decode(inout s: Inf, h: Huff) -> int! {
+    code = 0
+    first = 0
+    pos = 0
+    for l in 1..16 {
+        code = code | bits(&s, 1)?
+        n = h.count[l]
+        if code - n < first { return Ok(h.symbol[pos + (code - first)]) }
+        pos += n
+        first = (first + n) << 1
+        code = code << 1
+    }
+    Err(inf_err(s, "Huffman 码不对"))
+}
+
+fn lbase() -> [int] { [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258] }
+
+fn lext() -> [int] { [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0] }
+
+fn dbase() -> [int] { [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577] }
+
+fn dext() -> [int] { [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13] }
+
+// 用 lit（字面量 / 长度码）和 dist（距离码）解一个块
+fn codes(inout s: Inf, lit: Huff, dist: Huff) -> ()! {
+    lb = lbase()
+    lx = lext()
+    db = dbase()
+    dx = dext()
+    for true {
+        sym = decode(&s, lit)?
+        if sym < 256 {
+            if len(s.out) >= s.max { return Err(too_big(s)) }
+            s.out.push(sym.wrap_u8())
+        } else if sym == 256 {
+            return Ok()
+        } else {
+            li = sym - 257
+            if li >= 29 { return Err(inf_err(s, "长度码不对")) }
+            n = lb[li] + bits(&s, lx[li])?
+            di = decode(&s, dist)?
+            if di >= 30 { return Err(inf_err(s, "距离码不对")) }
+            d = db[di] + bits(&s, dx[di])?
+            if d > len(s.out) { return Err(inf_err(s, "距离超出了已经解出的数据")) }
+            if len(s.out) + n > s.max { return Err(too_big(s)) }
+            start = len(s.out) - d
+            // 可以和正在写的部分重叠（比如 d = 1 表示重复上一个字节），所以逐个复制
+            for k in 0..n {
+                b = s.out[start + k]
+                s.out.push(b)
+            }
+        }
+    }
+}
+
+fn fixed(inout s: Inf) -> ()! {
+    lens: [int] = []
+    for i in 0..288 {
+        l = if i < 144 { 8 } else if i < 256 { 9 } else if i < 280 { 7 } else { 8 }
+        lens.push(l)
+    }
+    lit = build(lens)
+    dl: [int] = []
+    for _i in 0..30 { dl.push(5) }
+    dist = build(dl)
+    codes(&s, lit, dist)
+}
+
+fn code_order() -> [int] { [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15] }
+
+fn dynamic(inout s: Inf) -> ()! {
+    nlen = bits(&s, 5)? + 257
+    ndist = bits(&s, 5)? + 1
+    ncode = bits(&s, 4)? + 4
+    if nlen > 286 || ndist > 30 { return Err(inf_err(s, "动态块的码表太大")) }
+    order = code_order()
+    cl: [int] = []
+    for _i in 0..19 { cl.push(0) }
+    for i in 0..ncode { cl[order[i]] = bits(&s, 3)? }
+    lencode = build(cl)
+    lens: [int] = []
+    for len(lens) < nlen + ndist {
+        sym = decode(&s, lencode)?
+        if sym < 16 {
+            lens.push(sym)
+        } else {
+            rep = 0
+            val = 0
+            if sym == 16 {
+                if len(lens) == 0 { return Err(inf_err(s, "重复码前面没有码长")) }
+                val = lens[len(lens) - 1]
+                rep = 3 + bits(&s, 2)?
+            } else if sym == 17 {
+                rep = 3 + bits(&s, 3)?
+            } else {
+                rep = 11 + bits(&s, 7)?
+            }
+            if len(lens) + rep > nlen + ndist { return Err(inf_err(s, "码长太多")) }
+            for _k in 0..rep { lens.push(val) }
+        }
+    }
+    ll: [int] = []
+    for i in 0..nlen { ll.push(lens[i]) }
+    dl: [int] = []
+    for i in nlen..nlen + ndist { dl.push(lens[i]) }
+    lit = build(ll)
+    dist = build(dl)
+    codes(&s, lit, dist)
+}
+
+fn stored(inout s: Inf) -> ()! {
+    // 丢掉当前字节里剩下的位
+    s.buf = 0
+    s.cnt = 0
+    if s.pos + 4 > len(s.data) { return Err(inf_err(s, "数据提前结束")) }
+    n = bytes.u16_le(s.data, s.pos)
+    nn = bytes.u16_le(s.data, s.pos + 2)
+    if n != (!nn & 0xFFFF) { return Err(inf_err(s, "不压缩块的长度校验不对")) }
+    s.pos += 4
+    if s.pos + n > len(s.data) { return Err(inf_err(s, "数据提前结束")) }
+    if len(s.out) + n > s.max { return Err(too_big(s)) }
+    for k in 0..n {
+        b = s.data[s.pos + k]
+        s.out.push(b)
+    }
+    s.pos += n
+}
+
+pub fn inflate(data: [u8]) -> [u8]! { inflate_max(data, MAX_OUT) }
+
+// 解出来超过 max 字节时报错，不再往下解
+pub fn inflate_max(data: [u8], max: int) -> [u8]! {
+    out, _pos = inflate_at(data, 0, max)?
+    Ok(out)
+}
+
+// 从 data[start] 开始解一段 deflate 数据，最多解出 max 字节；返回解出的内容和最后一个块后面（对齐到整字节）的位置
+fn inflate_at(data: [u8], start: int, max: int) -> ([u8], int)! {
+    s = Inf(data: data.copy(), pos: start, buf: 0, cnt: 0, out: [], max: max)
+    last = 0
+    for last == 0 {
+        last = bits(&s, 1)?
+        kind = bits(&s, 2)?
+        if kind == 0 {
+            stored(&s)?
+        } else if kind == 1 {
+            fixed(&s)?
+        } else if kind == 2 {
+            dynamic(&s)?
+        } else {
+            return Err(inf_err(s, "块的类型不对"))
+        }
+    }
+    // 读进 buf 里还没用的整字节退回去
+    p = s.pos - s.cnt / 8
+    Ok((replace(&s.out, []), p))
+}
+
+// 解压时的错误：写明读到了第几个字节（从 1 数，包括 zlib / gzip 的头）
+fn inf_err(s: Inf, msg: str) -> str { "deflate 第 #{s.pos} 个字节：#{msg}" }
+
+fn too_big(s: Inf) -> str { inf_err(s, "解出来超过 #{fmt.byte_size(s.max)} 了（上限见 zlib.MAX_OUT，要更大用 *_max）") }

@@ -1,0 +1,66 @@
+// Lark 标准库 · 定时（用 Lark 自己写，底下是内置的 mono_ns、sleep_ms）
+// 用法：import "std/timer"
+//
+// 超时直接写在 select 里（after 毫秒数 => …）；这个模块管两件 select 自己做不了的事：
+//
+//   d = timer.deadline(5000)                 // 一件事总共最多 5 秒，不管中间等了几次
+//   for … { select { v <- ch => …, after d.left_ms() => { return Err("超时") } } }
+//   if d.is_expired() { … }
+//
+//   t = timer.every(1000)                    // 每秒一次，按开始的时刻对齐，不会越走越慢
+//   for … { select { v <- ch => …, after t.next_ms() => sweep() } }
+//   t.wait()                                 // 不用 select 时：睡到下一次
+//
+// 用的是单调时钟（mono_ns）：改系统时间不影响。错过的次数不补（算得太久时直接到下一次），t.count() 是到现在为止该有几次。
+import "std/time"
+
+// 某个时刻以前；left_ms 是还剩多少
+pub type Deadline {
+    at: int     // 单调时钟的纳秒
+}
+
+// 每隔一段时间一次，第 k 次在 开始 + k × 间隔
+pub type Ticker {
+    start: int
+    period: int     // 纳秒
+}
+
+// 从现在起 ms 毫秒以后（ms <= 0 时已经到了）
+pub fn deadline(ms: int) -> Deadline { Deadline(at: mono_ns() + ms * 1_000_000) }
+
+// 还剩几毫秒（向上取整，到了以后是 0），直接写进 select 的 after
+pub fn left_ms(d: Deadline) -> int { ceil_ms(d.at - mono_ns()) }
+
+pub fn is_expired(d: Deadline) -> bool { mono_ns() >= d.at }
+
+// 从现在起每 ms 毫秒一次；ms 不是正数时 panic
+pub fn every(ms: int) -> Ticker {
+    if ms <= 0 { panic("timer.every：间隔要是正的毫秒数，得到的是 #{ms}") }
+    Ticker(start: mono_ns(), period: ms * 1_000_000)
+}
+
+// 到下一次还有几毫秒（向上取整），直接写进 select 的 after。只看时钟、不改 t，所以 select 因为别的分支醒了再算一遍也没关系
+pub fn next_ms(t: Ticker) -> int {
+    k = count(t) + 1
+    ceil_ms(t.start + k * t.period - mono_ns())
+}
+
+// 睡到下一次
+pub fn wait(t: Ticker) { sleep_ms(next_ms(t)) }
+
+// 从 every 到现在，过了几个间隔
+pub fn count(t: Ticker) -> int { (mono_ns() - t.start) / t.period }
+
+fn ceil_ms(ns: int) -> int { if ns <= 0 { 0 } else { (ns + 999_999) / 1_000_000 } }
+
+// "#{d}"：Deadline(还剩 1.5s)（时间按 time.format_dur 的写法）
+pub fn show(d: Deadline) -> str {
+    left = time.format_dur(left_ms(d) * 1_000_000)
+    "Deadline(还剩 #{left})"
+}
+
+// "#{t}"：Ticker(每 1s)
+pub fn show(t: Ticker) -> str {
+    p = time.format_dur(t.period)
+    "Ticker(每 #{p})"
+}

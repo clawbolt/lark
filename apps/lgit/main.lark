@@ -1,0 +1,1222 @@
+// lgit：用 Lark 写的简单 git（仓库格式和真 git 兼容：真 git 能读 lgit 建的仓库，lgit 也能读真 git 的）
+// 构建：在 apps/lgit 里 lark build，得到 build/lgit
+//
+// 现在有的命令：
+//   lgit init [目录]
+//   lgit hash-object [-w] [-t 类型] 文件     算对象编号；-w 同时写进对象库
+//   lgit cat-file (-t | -s | -p) 对象         类型 / 大小 / 内容
+//   lgit ls-tree [-r] 版本                    列出 tree（-r 递归到子目录）
+//   lgit write-tree                           由暂存区建 tree，打印编号
+//   lgit add 路径…                            暂存文件或目录（. 是全部）；工作区里删掉了的文件从暂存区去掉
+//   lgit status                               要提交的、没暂存的变更和未跟踪的文件
+//   lgit commit -m 说明                       提交人取 GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL 或 git 配置里的 [user]
+//   lgit log [--oneline] [-n 数量] [版本]      沿第一个父提交往回列
+//   lgit diff [--cached] [版本 [版本]] [-- 路径…]  统一格式的差异（默认是暂存区 → 工作区）
+//   lgit branch [名字 [起点]] | (-d | -D) 名字    列出、新建、删除分支
+//   lgit checkout 分支 | -b 新分支 [起点] | 版本 | -- 路径…
+//   lgit merge 分支 | --abort                 三方合并（能快进时快进）；有冲突时写冲突标记，改好后 add 再 commit
+//   lgit merge-file [-p] 当前 共同祖先 对方    三方合并三个文件
+//
+// 参数由 std/flag 解析（每个命令是一个子命令）：短选项可以写在一起（ls-tree -r、log -n5），
+// lgit -h 列出命令，lgit 命令 -h 是这个命令的选项；写错时打印原因和用法，退出码 2。
+import "std/flag"
+import "std/os"
+import "std/io"
+import "git/repo"
+import "git/index"
+import "git/work"
+import "git/patch"
+import "git/merge"
+import "std/str"
+import "std/time"
+
+fn out(s: str) {
+    w = io.stdout()
+    match w.write(s) {
+        Ok => {}
+        Err(e) => eprint("lgit：#{e}")
+    }
+}
+
+fn die(msg: str) {
+    eprint("lgit：#{msg}")
+    exit(1)
+}
+
+fn need_root() -> str {
+    r = match repo.find_root() {
+        Ok(x) => x
+        Err(e) => {
+            die(e)
+            ""
+        }
+    }
+    r
+}
+
+// `--` 前面的位置参数（版本）和后面的（路径）；没写 `--` 时全在前面
+fn before_dash(a: flag.Args) -> [str] {
+    n = if a.dash < 0 { len(a.rest) } else { a.dash }
+    out: [str] = []
+    for i in 0..n { out.push(a.rest[i].copy()) }
+    out
+}
+
+fn after_dash(a: flag.Args) -> [str] {
+    out: [str] = []
+    if a.dash < 0 { return out }
+    for i in a.dash..len(a.rest) { out.push(a.rest[i].copy()) }
+    out
+}
+
+fn cmd_init(a: flag.Args) -> ()! {
+    if len(a.rest) > 1 { return Err("用法：lgit init [目录]") }
+    dir = if len(a.rest) == 1 { a.rest[0].copy() } else { "." }
+    if !os.is_dir(dir) { os.mkdir_all(dir)? }
+    g = repo.init(dir)?
+    print("已初始化空的 git 仓库：#{g}")
+}
+
+fn cmd_hash_object(a: flag.Args) -> ()! {
+    if len(a.rest) == 0 { return Err("用法：lgit hash-object [-w] [-t 类型] 文件") }
+    if len(a.rest) > 1 { return Err("hash-object 一次只能给一个文件，多出来的是 #{a.rest[1]}") }
+    kind = a.get_str("type")
+    text = os.read(a.rest[0])?
+    body = text.to_bytes()
+    if a.get_bool("write") {
+        g = repo.gdir(need_root())
+        id = repo.write_obj(g, kind, body)?
+        print(id)
+    } else {
+        print(repo.hash_of(kind, body))
+    }
+}
+
+// tree 的一行：模式补成 6 位、类型、编号、tab、名字
+fn tree_line(e: repo.Entry, path: str) -> str {
+    mode = if len(e.mode) < 6 { "0" + e.mode } else { e.mode.copy() }
+    kind = if e.mode == "40000" { "tree" } else if e.mode == "160000" { "commit" } else { "blob" }
+    "#{mode} #{kind} #{e.id}\t#{path}\n"
+}
+
+fn cmd_cat_file(a: flag.Args) -> ()! {
+    t = a.get_bool("type")
+    s = a.get_bool("size")
+    pp = a.get_bool("pretty")
+    picked = 0
+    for b in [t, s, pp] {
+        if b { picked += 1 }
+    }
+    if picked != 1 || len(a.rest) != 1 { return Err("用法：lgit cat-file (-t | -s | -p) 对象") }
+    g = repo.gdir(need_root())
+    id = repo.resolve(g, a.rest[0])?
+    o = repo.read_obj(g, id)?
+    if t {
+        print(o.kind)
+    } else if s {
+        print("#{len(o.body)}")
+    } else if o.kind == "tree" {
+        for e in repo.parse_tree(o.body)? { out(tree_line(e, e.name)) }
+    } else {
+        out(from_bytes(o.body))
+    }
+}
+
+// 版本是 commit 时取它的 tree
+fn tree_of(g: str, rev: str) -> str! {
+    id = repo.resolve(g, rev)?
+    o = repo.read_obj(g, id)?
+    if o.kind == "tree" { return Ok(id) }
+    if o.kind == "commit" {
+        c = repo.parse_commit(o.body)?
+        return Ok(c.tree)
+    }
+    Err("#{rev} 不是 tree 或 commit，而是 #{o.kind}")
+}
+
+fn list_tree(g: str, id: str, prefix: str, recursive: bool) -> ()! {
+    o = repo.read_obj(g, id)?
+    for e in repo.parse_tree(o.body)? {
+        path = prefix + e.name
+        if recursive && e.mode == "40000" {
+            list_tree(g, e.id, path + "/", true)?
+        } else {
+            out(tree_line(e, path))
+        }
+    }
+}
+
+fn cmd_ls_tree(a: flag.Args) -> ()! {
+    if len(a.rest) != 1 { return Err("用法：lgit ls-tree [-r] 版本") }
+    g = repo.gdir(need_root())
+    t = tree_of(g, a.rest[0])?
+    list_tree(g, t, "", a.get_bool("recursive"))
+}
+
+// ---------- 暂存和提交 ----------
+
+// 和 git 一样只区分两种权限：有人能执行就记成 100755，否则 100644
+fn add_file(g: str, root: str, rel: str, inout es: [index.IEntry]) -> ()! {
+    full = work.full_path(root, rel)
+    text = os.read(full)?
+    st = os.stat(full)?
+    perm = st.mode
+    mode = if (perm & 0o111) != 0 { 0o100755 } else { 0o100644 }
+    b = text.to_bytes()
+    id = repo.write_obj(g, "blob", b)?
+    index.put(&es, rel, mode, id, len(b))
+}
+
+// 去掉暂存区里 rel 下面、工作区里已经没有了的文件，得到去掉了几个
+fn prune(root: str, rel: str, inout es: [index.IEntry]) -> int {
+    kept: [index.IEntry] = []
+    removed = 0
+    for e in es {
+        if work.under(e.path, rel) && file_kind(work.full_path(root, e.path)) != 1 {
+            removed += 1
+        } else {
+            kept.push(e.copy())
+        }
+    }
+    es = kept
+    removed
+}
+
+fn cmd_add(a: flag.Args) -> ()! {
+    if len(a.rest) == 0 { return Err("用法：lgit add 路径…（. 表示全部）") }
+    root = need_root()
+    g = repo.gdir(root)
+    es = index.read(g)?
+    for arg in a.rest {
+        rel = work.rel_path(root, arg)?
+        full = work.full_path(root, rel)
+        kind = file_kind(full)
+        if kind == 1 {
+            add_file(g, root, rel, &es)?
+        } else if kind == 2 {
+            for f in work.walk(root, rel)? { add_file(g, root, f, &es)? }
+            _n = prune(root, rel, &es)
+        } else if prune(root, rel, &es) == 0 {
+            return Err("路径 #{arg} 不存在，也不在暂存区里")
+        }
+    }
+    index.write(g, es)
+}
+
+fn cmd_write_tree() -> ()! {
+    root = need_root()
+    g = repo.gdir(root)
+    es = index.read(g)?
+    cs = index.conflicted(es)
+    if len(cs) > 0 { return Err("还有没解决的冲突：#{join(cs, "、")}") }
+    print(work.write_tree(g, es)?)
+}
+
+// 提交人：环境变量 GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL，否则 .git/config、~/.gitconfig 里的 [user]
+fn config_value(text: str, key: str) -> str {
+    in_user = false
+    for ln0 in str.lines(text) {
+        ln = str.trim(ln0)
+        if str.starts_with(ln, "[") {
+            in_user = ln == "[user]"
+        } else if in_user {
+            k = str.find(ln, "=") ?? -1
+            if k > 0 && str.trim(slice(ln, 0, k)) == key { return str.trim(slice(ln, k + 1, len(ln))) }
+        }
+    }
+    ""
+}
+
+fn user_value(g: str, key: str, env: str, fallback: str) -> str {
+    v = os.env(env) ?? ""
+    if v != "" { return v }
+    v = config_value(os.read(os.join_path(g, "config")) ?? "", key)
+    if v != "" { return v }
+    home = os.env("HOME") ?? ""
+    if home != "" { v = config_value(os.read(os.join_path(home, ".gitconfig")) ?? "", key) }
+    if v != "" { v } else { fallback.copy() }
+}
+
+// "时间戳 时区"：GIT_AUTHOR_DATE 可以写成 "1700000000 +0800"（测试时用来固定提交号）；否则用现在的时间、时区 +0000
+fn now_stamp() -> str {
+    d = os.env("GIT_AUTHOR_DATE") ?? ""
+    if d != "" { return d }
+    "#{time.unix_ms() / 1000} +0000"
+}
+
+// 合并到一半（有冲突）时的状态，存在 .git 里，和真 git 一样：MERGE_HEAD 是对方的提交，MERGE_MSG 是提交说明
+fn merge_head(g: str) -> str { str.trim(os.read(os.join_path(g, "MERGE_HEAD")) ?? "") }
+
+fn clear_merge(g: str) -> ()! {
+    for n in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE"] {
+        p = os.join_path(g, n)
+        if os.is_file(p) { os.remove(p)? }
+    }
+}
+
+// 写一个提交，让当前分支（或分离的 HEAD）指向它
+fn make_commit(g: str, tree: str, parents: [str], msg: str) -> str! {
+    name = user_value(g, "name", "GIT_AUTHOR_NAME", "lgit")
+    email = user_value(g, "email", "GIT_AUTHOR_EMAIL", "lgit@localhost")
+    who = "#{name} <#{email}> #{now_stamp()}"
+    c = repo.Commit(tree: tree, parents: parents.copy(), author: who.copy(), committer: who, msg: msg.copy())
+    id = repo.write_obj(g, "commit", repo.commit_body(c))?
+    ref = repo.head_ref(g)?
+    if ref == "" {
+        os.write(os.join_path(g, "HEAD"), id + "\n")?
+    } else {
+        repo.write_ref(g, ref, id)?
+    }
+    Ok(id)
+}
+
+fn branch_label(g: str) -> str! {
+    ref = repo.head_ref(g)?
+    if ref == "" { Ok("分离头指针") } else { Ok(slice(ref, 11, len(ref))) }
+}
+
+// lgit commit -m 说明；合并有冲突、解决之后可以只写 lgit commit（用合并的说明）
+fn cmd_commit(a: flag.Args) -> ()! {
+    root = need_root()
+    g = repo.gdir(root)
+    mh = merge_head(g)
+    msg = ""
+    m = a.get_str("message")
+    if len(a.rest) > 0 {
+        return Err("用法：lgit commit -m 说明")
+    } else if m != "" {
+        msg = m + "\n"
+    } else if mh != "" {
+        msg = os.read(os.join_path(g, "MERGE_MSG")) ?? "Merge\n"
+    } else {
+        return Err("用法：lgit commit -m 说明")
+    }
+    es = index.read(g)?
+    cs = index.conflicted(es)
+    if len(cs) > 0 { return Err("还有没解决的冲突：#{join(cs, "、")}（改好后 lgit add，再提交）") }
+    if len(es) == 0 { return Err("暂存区是空的，没有要提交的内容（先 lgit add）") }
+    tree = work.write_tree(g, es)?
+    parent = repo.head_commit(g) ?? ""
+    parents: [str] = []
+    if parent != "" {
+        po = repo.read_obj(g, parent)?
+        pc = repo.parse_commit(po.body)?
+        // 合并提交的 tree 可以和第一个父提交一样（对方的改动都被放弃了）
+        if pc.tree == tree && mh == "" { return Err("没有要提交的变更") }
+        parents.push(parent)
+    }
+    if mh != "" { parents.push(mh) }
+    id = make_commit(g, tree, parents, msg)?
+    clear_merge(g)?
+    br = branch_label(g)?
+    root_mark = if parent == "" { "（根提交）" } else { "" }
+    mls = str.lines(msg)
+    first_line = if len(mls) > 0 { str.trim(mls[0]) } else { "" }
+    print("[#{br}#{root_mark} #{slice(id, 0, 7)}] #{first_line}")
+}
+
+// ---------- 状态 ----------
+
+// 冲突的种类，按暂存区里有哪几个 stage 来分（和 git status 的说法一样）
+fn conflict_kind(es: [index.IEntry], p: str) -> str {
+    seen = [false, false, false, false]
+    for e in es {
+        if e.path == p { seen[e.stage] = true }
+    }
+    if seen[1] && seen[2] && seen[3] { return "双方修改：" }
+    if seen[2] && seen[3] { return "双方添加：" }
+    if seen[1] && seen[3] { return "由我们删除：" }
+    if seen[1] && seen[2] { return "由他们删除：" }
+    if seen[2] { return "由我们添加：" }
+    "由他们添加："
+}
+
+fn cmd_status() -> ()! {
+    root = need_root()
+    g = repo.gdir(root)
+    ref = repo.head_ref(g)?
+    head = repo.head_commit(g) ?? ""
+    if ref == "" {
+        print("头指针分离于 #{slice(head, 0, 7)}")
+    } else {
+        print("位于分支 #{slice(ref, 11, len(ref))}")
+    }
+    if head == "" { print("还没有提交") }
+    h = work.flat_of_commit(g, head)?
+    es = index.read(g)?
+    cs = index.conflicted(es)
+    if merge_head(g) != "" {
+        if len(cs) > 0 {
+            print("正在合并，有没解决的冲突（改好后 lgit add，再 lgit commit；放弃合并用 lgit merge --abort）")
+        } else {
+            print("正在合并，冲突都解决了（运行 lgit commit 结束合并）")
+        }
+    }
+    staged: [str] = []
+    for e in es {
+        if e.stage != 0 { continue }
+        i = work.lookup(h, e.path)
+        if i < 0 {
+            staged.push("新文件：#{e.path}")
+        } else if h.ids[i] != e.id {
+            staged.push("修改：  #{e.path}")
+        }
+    }
+    for p in h.paths {
+        if index.find(es, p) < 0 { staged.push("删除：  #{p}") }
+    }
+    unstaged: [str] = []
+    for e in es {
+        if e.stage != 0 { continue }
+        full = work.full_path(root, e.path)
+        if file_kind(full) != 1 {
+            unstaged.push("删除：  #{e.path}")
+        } else {
+            text = os.read(full)?
+            if repo.hash_of("blob", text.to_bytes()) != e.id { unstaged.push("修改：  #{e.path}") }
+        }
+    }
+    untracked: [str] = []
+    for f in work.walk(root, "")? {
+        if index.find(es, f) < 0 { untracked.push(f) }
+    }
+    if len(staged) > 0 {
+        print("要提交的变更：")
+        for s in staged { print("  #{s}") }
+    }
+    if len(cs) > 0 {
+        print("未合并的路径：")
+        for p in cs { print("  #{conflict_kind(es, p)}#{p}") }
+    }
+    if len(unstaged) > 0 {
+        print("尚未暂存的变更：")
+        for s in unstaged { print("  #{s}") }
+    }
+    if len(untracked) > 0 {
+        print("未跟踪的文件：")
+        for s in untracked { print("  #{s}") }
+    }
+    if len(staged) + len(cs) + len(unstaged) + len(untracked) == 0 { print("没有要提交的内容，工作区是干净的") }
+}
+
+// ---------- 历史 ----------
+
+const DAYS = "SunMonTueWedThuFriSat"
+const MONTHS = "JanFebMarAprMayJunJulAugSepOctNovDec"
+
+// "1700000000 +0800" 写成 git log 的样子："Tue Nov 14 22:13:20 2023 +0800"
+fn git_date(stamp: str) -> str {
+    ws = str.words(stamp)
+    if len(ws) != 2 { return stamp.copy() }
+    ts = try_parse_int(ws[0]) ?? 0
+    tz = ws[1].copy()
+    mins = 0
+    if len(tz) == 5 {
+        hh = try_parse_int(slice(tz, 1, 3)) ?? 0
+        mm = try_parse_int(slice(tz, 3, 5)) ?? 0
+        mins = hh * 60 + mm
+        if byte_at(tz, 0) == '-' { mins = 0 - mins }
+    }
+    d = time.date_at(ts * 1000, mins)
+    wd = slice(DAYS, d.weekday * 3, d.weekday * 3 + 3)
+    mo = slice(MONTHS, (d.month - 1) * 3, d.month * 3)
+    hms = "#{two(d.hour)}:#{two(d.minute)}:#{two(d.second)}"
+    "#{wd} #{mo} #{d.day} #{hms} #{d.year} #{tz}"
+}
+
+fn two(n: int) -> str { if n < 10 { "0#{n}" } else { "#{n}" } }
+
+// 作者字段 "名字 <邮箱> 时间戳 时区" 拆成 ("名字 <邮箱>", "时间戳 时区")
+fn split_ident(s: str) -> (str, str) {
+    k = str.find(s, "> ") ?? -1
+    if k < 0 { return (s.copy(), "") }
+    (slice(s, 0, k + 1), slice(s, k + 2, len(s)))
+}
+
+fn cmd_log(a: flag.Args) -> ()! {
+    if len(a.rest) > 1 { return Err("用法：lgit log [--oneline] [-n 数量] [版本]") }
+    oneline = a.get_bool("oneline")
+    limit = a.get_int("max-count")
+    rev = if len(a.rest) == 1 { a.rest[0].copy() } else { "HEAD" }
+    g = repo.gdir(need_root())
+    id = repo.resolve(g, rev)?
+    shown = 0
+    for id != "" && (limit < 0 || shown < limit) {
+        o = repo.read_obj(g, id)?
+        if o.kind != "commit" { return Err("#{id} 不是 commit") }
+        c = repo.parse_commit(o.body)?
+        mls = str.lines(c.msg)
+        first_line = if len(mls) > 0 { str.trim(mls[0]) } else { "" }
+        if oneline {
+            out("#{slice(id, 0, 7)} #{first_line}\n")
+        } else {
+            who, stamp = split_ident(c.author)
+            if shown > 0 { out("\n") }
+            merge_line = if len(c.parents) > 1 { "Merge: #{slice(c.parents[0], 0, 7)} #{slice(c.parents[1], 0, 7)}\n" } else { "" }
+            out("commit #{id}\n#{merge_line}Author: #{who}\nDate:   #{git_date(stamp)}\n\n")
+            for ln in str.lines(str.trim(c.msg)) { out("    #{ln}\n") }
+        }
+        shown += 1
+        id = if len(c.parents) > 0 { c.parents[0].copy() } else { "" }
+    }
+}
+
+// ---------- 差异 ----------
+
+// 版本对应的提交（必须是 commit）
+fn commit_of(g: str, rev: str) -> str! {
+    id = repo.resolve(g, rev)?
+    o = repo.read_obj(g, id)?
+    if o.kind != "commit" { return Err("#{rev} 不是提交，而是 #{o.kind}") }
+    Ok(id)
+}
+
+// 暂存区的路径表（只算 stage 0，冲突的路径不在里面）
+fn index_flat(es: [index.IEntry]) -> work.Flat {
+    f = work.empty_flat()
+    for e in index.sorted(es) {
+        if e.stage != 0 { continue }
+        f.paths.push(e.path.copy())
+        f.modes.push(work.octal(e.mode))
+        f.ids.push(e.id.copy())
+    }
+    f
+}
+
+// 工作区里、暂存区跟踪着的文件的路径表（编号按现在的内容算）；工作区里删掉了的不在里面
+fn worktree_flat(root: str, es: [index.IEntry]) -> work.Flat! {
+    f = work.empty_flat()
+    for e in index.sorted(es) {
+        if e.stage != 0 { continue }
+        full = work.full_path(root, e.path)
+        if file_kind(full) == 1 {
+            fid = file_id(full)?
+            f.paths.push(e.path.copy())
+            f.modes.push(work.octal(e.mode))
+            f.ids.push(fid)
+        }
+    }
+    Ok(f)
+}
+
+fn file_id(full: str) -> str! {
+    text = os.read(full)?
+    Ok(repo.hash_of("blob", text.to_bytes()))
+}
+
+fn blob_text(g: str, id: str) -> str! {
+    o = repo.read_obj(g, id)?
+    Ok(from_bytes(o.body))
+}
+
+fn wanted(p: str, rels: [str]) -> bool {
+    if len(rels) == 0 { return true }
+    for r in rels {
+        if work.under(p, r) { return true }
+    }
+    false
+}
+
+// 比较两张路径表并打印差异；new_in_work 时新的一边的内容从工作区读
+fn print_diff(g: str, root: str, a: work.Flat, b: work.Flat, new_in_work: bool, rels: [str]) -> ()! {
+    ps: [str] = []
+    for p in a.paths { ps.push(p.copy()) }
+    for p in b.paths {
+        if work.lookup(a, p) < 0 { ps.push(p.copy()) }
+    }
+    for k in index.order_of(ps) {
+        p = ps[k].copy()
+        if !wanted(p, rels) { continue }
+        i = work.lookup(a, p)
+        j = work.lookup(b, p)
+        om = if i >= 0 { a.modes[i].copy() } else { "" }
+        oid = if i >= 0 { a.ids[i].copy() } else { "" }
+        nm = if j >= 0 { b.modes[j].copy() } else { "" }
+        nid = if j >= 0 { b.ids[j].copy() } else { "" }
+        if oid == nid && om == nm { continue }
+        ot = ""
+        if i >= 0 { ot = blob_text(g, oid)? }
+        nt = ""
+        if j >= 0 {
+            if new_in_work {
+                nt = os.read(work.full_path(root, p))?
+            } else {
+                nt = blob_text(g, nid)?
+            }
+        }
+        out(patch.file_patch(p, om, oid, ot, nm, nid, nt))
+    }
+}
+
+// lgit diff                  暂存区 → 工作区
+// lgit diff --cached [版本]   版本（默认 HEAD）→ 暂存区
+// lgit diff 版本              版本 → 工作区
+// lgit diff 版本 版本
+// 都可以在 -- 后面跟路径
+fn cmd_diff(a: flag.Args) -> ()! {
+    root = need_root()
+    g = repo.gdir(root)
+    cached = a.get_bool("cached") || a.get_bool("staged")
+    revs = before_dash(a)
+    rels: [str] = []
+    for p in after_dash(a) {
+        r = work.rel_path(root, p)?
+        rels.push(r)
+    }
+    if len(revs) > 2 || (cached && len(revs) == 2) { return Err("用法：lgit diff [--cached] [版本 [版本]] [-- 路径…]") }
+    es = index.read(g)?
+    if len(revs) == 2 {
+        c0 = commit_of(g, revs[0])?
+        c1 = commit_of(g, revs[1])?
+        fa = work.flat_of_commit(g, c0)?
+        fb = work.flat_of_commit(g, c1)?
+        return print_diff(g, root, fa, fb, false, rels)
+    }
+    if cached {
+        base = ""
+        if len(revs) == 1 {
+            base = commit_of(g, revs[0])?
+        } else {
+            base = repo.head_commit(g) ?? ""
+        }
+        fa = work.flat_of_commit(g, base)?
+        return print_diff(g, root, fa, index_flat(es), false, rels)
+    }
+    fw = worktree_flat(root, es)?
+    if len(revs) == 1 {
+        c = commit_of(g, revs[0])?
+        fc = work.flat_of_commit(g, c)?
+        return print_diff(g, root, fc, fw, true, rels)
+    }
+    print_diff(g, root, index_flat(es), fw, true, rels)
+}
+
+// ---------- 分支 ----------
+
+fn has_str(xs: [str], x: str) -> bool {
+    for v in xs {
+        if v == x { return true }
+    }
+    false
+}
+
+// 所有分支名，按字节序
+fn branch_names(g: str) -> [str]! {
+    names: [str] = []
+    if os.is_dir(os.join_path(g, "refs/heads")) {
+        for p in work.walk(g, "refs/heads")? { names.push(slice(p, 11, len(p))) }
+    }
+    packed = os.read(os.join_path(g, "packed-refs")) ?? ""
+    for ln in str.lines(packed) {
+        if len(ln) > 52 && slice(ln, 41, 52) == "refs/heads/" {
+            n = slice(ln, 52, len(ln))
+            if !has_str(names, n) { names.push(n) }
+        }
+    }
+    sorted_names: [str] = []
+    for k in index.order_of(names) { sorted_names.push(names[k].copy()) }
+    Ok(sorted_names)
+}
+
+// git check-ref-format 的主要规则
+fn check_branch_name(n: str) -> ()! {
+    bad = n == "" || n == "HEAD" || str.starts_with(n, "-") || str.starts_with(n, "/") || str.ends_with(n, "/")
+    bad = bad || str.ends_with(n, ".") || str.ends_with(n, ".lock") || str.contains(n, "..") || str.contains(n, "//") || str.contains(n, "@{")
+    for i in 0..len(n) {
+        c = byte_at(n, i)
+        if c <= ' ' || c == 127 || c == '~' || c == '^' || c == ':' || c == '?' || c == '*' || c == '[' || c == 92 { bad = true }
+    }
+    if bad { return Err("#{n} 不是合法的分支名") }
+}
+
+// a 是不是 b 自己或者 b 的祖先
+fn is_ancestor(g: str, a: str, b: str) -> bool! {
+    todo: [str] = []
+    if b != "" { todo.push(b.copy()) }
+    seen: [str] = []
+    for len(todo) > 0 {
+        c = todo.pop()
+        if c == a { return Ok(true) }
+        if has_str(seen, c) { continue }
+        seen.push(c.copy())
+        o = repo.read_obj(g, c)?
+        pc = repo.parse_commit(o.body)?
+        for p in pc.parents { todo.push(p.copy()) }
+    }
+    Ok(false)
+}
+
+fn create_branch(g: str, n: str, start: str) -> str! {
+    check_branch_name(n)?
+    ref = "refs/heads/" + n
+    if repo.read_ref(g, ref) != None { return Err("分支 #{n} 已经存在") }
+    id = commit_of(g, start)?
+    repo.write_ref(g, ref, id)?
+    Ok(id)
+}
+
+// lgit branch                列出分支，当前的前面有 *
+// lgit branch 名字 [起点]     新建分支（不切换）
+// lgit branch (-d | -D) 名字…  删除；-d 只删已经合并进当前分支的
+fn cmd_branch(a: flag.Args) -> ()! {
+    g = repo.gdir(need_root())
+    cur = repo.head_ref(g)?
+    soft = a.get_bool("delete")
+    hard = a.get_bool("force-delete")
+    if !soft && !hard && len(a.rest) == 0 {
+        if cur == "" {
+            h = repo.head_commit(g) ?? ""
+            print("* （头指针在 #{slice(h, 0, 7)} 分离）")
+        }
+        for n in branch_names(g)? {
+            mark = if "refs/heads/" + n == cur { "* " } else { "  " }
+            print(mark + n)
+        }
+        return Ok()
+    }
+    if soft || hard {
+        if len(a.rest) == 0 { return Err("用法：lgit branch (-d | -D) 分支…") }
+        head = repo.head_commit(g) ?? ""
+        for n in a.rest {
+            ref = "refs/heads/" + n
+            if ref == cur { return Err("不能删除当前所在的分支 #{n}") }
+            id = repo.read_ref(g, ref) ?? ""
+            if id == "" { return Err("没有分支 #{n}") }
+            merged = is_ancestor(g, id, head)?
+            if !hard && !merged { return Err("分支 #{n} 还没有完全合并到当前分支；确定要删除就用 -D") }
+            repo.delete_ref(g, ref)?
+            print("已删除分支 #{n}（曾为 #{slice(id, 0, 7)}）。")
+        }
+        return Ok()
+    }
+    if len(a.rest) > 2 { return Err("用法：lgit branch [名字 [起点]]") }
+    start = if len(a.rest) == 2 { a.rest[1].copy() } else { "HEAD" }
+    _id = create_branch(g, a.rest[0], start)?
+}
+
+// ---------- 切换 ----------
+
+fn listing(xs: [str]) -> str {
+    s = ""
+    for x in xs { s += "  #{x}\n" }
+    s
+}
+
+// 删掉文件后，往上把变空了的目录也删掉（不删根目录）
+fn prune_dirs(root: str, rel: str) -> ()! {
+    r = rel.copy()
+    for r != "." && r != "" {
+        full = work.full_path(root, r)
+        if !os.is_dir(full) { return Ok() }
+        names = os.read_dir(full)?
+        if len(names) > 0 { return Ok() }
+        os.remove(full)?
+        r = os.dir(r)
+    }
+}
+
+// 把对象 id 写到工作区的 p，暂存区里 p 设成这一项（stage 0）
+fn checkout_file(root: str, g: str, inout es: [index.IEntry], p: str, mode: str, id: str) -> ()! {
+    o = repo.read_obj(g, id)?
+    full = work.full_path(root, p)
+    os.mkdir_all(os.dir(full))?
+    os.write(full, from_bytes(o.body))?
+    // 和 git 一样：100755 的加上执行权限，100644 的去掉执行权限（文件原来就在、带着执行权限时），读写权限不动
+    st = os.stat(full)?
+    perm = st.mode
+    want = if mode == "100755" { perm | 0o111 } else { perm & !0o111 }
+    if want != perm { os.chmod(full, want)? }
+    index.put(&es, p, work.from_octal(mode), id, len(o.body))
+}
+
+// 从工作区和暂存区删掉 p，再删掉变空了的目录
+fn remove_file(root: str, inout es: [index.IEntry], p: str) -> ()! {
+    full = work.full_path(root, p)
+    if file_kind(full) == 1 { os.remove(full)? }
+    index.remove_path(&es, p)
+    prune_dirs(root, os.dir(p))
+}
+
+// 把工作区和暂存区从 HEAD 的提交换成 target 的提交。
+// 只动两个提交之间不一样的文件；这些文件在暂存区或工作区里有改动时拒绝切换（和 git 一样），
+// 其余文件的本地修改原样带过去。
+fn switch_tree(root: str, g: str, target: str) -> ()! {
+    cur = repo.head_commit(g) ?? ""
+    if cur == target { return Ok() }
+    h = work.flat_of_commit(g, cur)?
+    t = work.flat_of_commit(g, target)?
+    es = index.read(g)?
+    if len(index.conflicted(es)) > 0 { return Err("暂存区里有没解决的冲突，请先解决（或者 lgit merge --abort）") }
+    changed: [str] = []
+    for i in 0..len(h.paths) {
+        j = work.lookup(t, h.paths[i])
+        if j < 0 || t.ids[j] != h.ids[i] || t.modes[j] != h.modes[i] { changed.push(h.paths[i].copy()) }
+    }
+    for p in t.paths {
+        if work.lookup(h, p) < 0 { changed.push(p.copy()) }
+    }
+    dirty: [str] = []
+    untracked: [str] = []
+    for p in changed {
+        hi = work.lookup(h, p)
+        ti = work.lookup(t, p)
+        ii = index.find(es, p)
+        full = work.full_path(root, p)
+        k = file_kind(full)
+        if hi >= 0 {
+            clean = ii >= 0 && es[ii].id == h.ids[hi] && k == 1
+            if clean {
+                fid = file_id(full)?
+                clean = fid == h.ids[hi]
+            }
+            if !clean { dirty.push(p.copy()) }
+        } else if ii >= 0 {
+            dirty.push(p.copy())
+        } else if k != 0 {
+            same = false
+            if k == 1 {
+                fid = file_id(full)?
+                same = fid == t.ids[ti]
+            }
+            if !same { untracked.push(p.copy()) }
+        }
+    }
+    if len(dirty) > 0 { return Err("你对下列文件的本地修改会被检出操作覆盖：\n" + listing(dirty) + "请在切换分支前提交你的修改。") }
+    if len(untracked) > 0 { return Err("工作区中下列未跟踪的文件会被检出操作覆盖：\n" + listing(untracked) + "请在切换分支前移动或删除它们。") }
+    for p in changed {
+        ti = work.lookup(t, p)
+        if ti >= 0 {
+            checkout_file(root, g, &es, p, t.modes[ti], t.ids[ti])?
+        } else {
+            remove_file(root, &es, p)?
+        }
+    }
+    index.write(g, es)
+}
+
+fn set_head(g: str, text: str) -> ()! { os.write(os.join_path(g, "HEAD"), text + "\n") }
+
+// lgit checkout -- 路径…：用暂存区里的内容覆盖工作区的文件
+fn restore(root: str, g: str, paths: [str]) -> ()! {
+    if len(paths) == 0 { return Err("用法：lgit checkout -- 路径…") }
+    es = index.read(g)?
+    for arg in paths {
+        rel = work.rel_path(root, arg)?
+        hit = 0
+        for e in es {
+            if work.under(e.path, rel) {
+                o = repo.read_obj(g, e.id)?
+                full = work.full_path(root, e.path)
+                os.mkdir_all(os.dir(full))?
+                os.write(full, from_bytes(o.body))?
+                hit += 1
+            }
+        }
+        if hit == 0 { return Err("路径 #{arg} 不在暂存区里") }
+    }
+}
+
+// lgit checkout 分支 | -b 新分支 [起点] | 版本（分离头指针） | -- 路径…
+fn cmd_checkout(a: flag.Args) -> ()! {
+    use_msg = "用法：lgit checkout 分支 | -b 新分支 [起点] | 版本 | -- 路径…"
+    n = a.get_str("new-branch")
+    // `--` 只能写在最前面（lgit checkout 版本 -- 路径 还不支持）
+    if a.dash > 0 || (a.dash == 0 && n != "") { return Err(use_msg) }
+    if n == "" && len(a.rest) == 0 { return Err(use_msg) }
+    root = need_root()
+    g = repo.gdir(root)
+    if a.dash == 0 { return restore(root, g, a.rest) }
+    cur = repo.head_ref(g)?
+    if n != "" {
+        if len(a.rest) > 1 { return Err("用法：lgit checkout -b 新分支 [起点]") }
+        nref = "refs/heads/" + n
+        check_branch_name(n)?
+        if len(a.rest) == 0 && repo.head_commit(g) == None {
+            // 还没有任何提交：只是换个分支名
+            set_head(g, "ref: " + nref)?
+            eprint("切换到一个新分支 '#{n}'")
+            return Ok()
+        }
+        if repo.read_ref(g, nref) != None { return Err("分支 #{n} 已经存在") }
+        start = if len(a.rest) == 1 { a.rest[0].copy() } else { "HEAD" }
+        nid = commit_of(g, start)?
+        switch_tree(root, g, nid)?
+        repo.write_ref(g, nref, nid)?
+        set_head(g, "ref: " + nref)?
+        eprint("切换到一个新分支 '#{n}'")
+        return Ok()
+    }
+    if len(a.rest) != 1 { return Err(use_msg) }
+    name = a.rest[0].copy()
+    ref = "refs/heads/" + name
+    if ref == cur {
+        eprint("已经位于 '#{name}'")
+        return Ok()
+    }
+    bid = repo.read_ref(g, ref) ?? ""
+    if bid != "" {
+        switch_tree(root, g, bid)?
+        set_head(g, "ref: " + ref)?
+        eprint("切换到分支 '#{name}'")
+        return Ok()
+    }
+    // 不是分支：当作版本，HEAD 直接指向提交
+    id = commit_of(g, name)?
+    switch_tree(root, g, id)?
+    set_head(g, id)?
+    eprint("头指针现在位于 #{slice(id, 0, 7)}（分离头指针，不在任何分支上）")
+}
+
+// ---------- 合并 ----------
+
+// a 的所有祖先（含 a 自己）
+fn ancestors(g: str, a: str) -> [str]! {
+    out: [str] = []
+    todo = [a.copy()]
+    for len(todo) > 0 {
+        c = todo.pop()
+        if has_str(out, c) { continue }
+        out.push(c.copy())
+        o = repo.read_obj(g, c)?
+        pc = repo.parse_commit(o.body)?
+        for p in pc.parents { todo.push(p.copy()) }
+    }
+    Ok(out)
+}
+
+// 共同祖先：从 b 往回一层层找，第一个也是 a 的祖先的提交；没有时是 ""
+fn merge_base(g: str, a: str, b: str) -> str! {
+    anc = ancestors(g, a)?
+    queue = [b.copy()]
+    seen: [str] = []
+    k = 0
+    for k < len(queue) {
+        c = queue[k].copy()
+        k += 1
+        if has_str(anc, c) { return Ok(c) }
+        if has_str(seen, c) { continue }
+        seen.push(c.copy())
+        o = repo.read_obj(g, c)?
+        pc = repo.parse_commit(o.body)?
+        for p in pc.parents { queue.push(p.copy()) }
+    }
+    Ok("")
+}
+
+fn same_flat(a: work.Flat, b: work.Flat) -> bool {
+    if len(a.paths) != len(b.paths) { return false }
+    for i in 0..len(a.paths) {
+        j = work.lookup(b, a.paths[i])
+        if j < 0 || b.ids[j] != a.ids[i] || b.modes[j] != a.modes[i] { return false }
+    }
+    true
+}
+
+// 合并时对一个路径要做的事。kind："take"（换成 id 这个版本）、"delete"、"merged"（内容是 text）、
+// "conflict"（工作区写 text，暂存区记下三个版本：b 是共同祖先、o 是我们的、t 是对方的，没有的为 ""）
+type MAct {
+    path: str
+    kind: str
+    id: str
+    mode: str
+    text: str
+    bid: str
+    bm: str
+    oid: str
+    om: str
+    tid: str
+    tm: str
+}
+
+fn at_or(f: work.Flat, i: int, which: int) -> str {
+    if i < 0 { return "" }
+    if which == 0 { f.ids[i].copy() } else { f.modes[i].copy() }
+}
+
+fn stage_entry(inout es: [index.IEntry], p: str, mode: str, id: str, stage: int) {
+    if id != "" { es.push(index.IEntry(path: p.copy(), mode: work.from_octal(mode), id: id.copy(), size: 0, stage: stage)) }
+}
+
+// lgit merge 分支（或版本）| --abort
+fn cmd_merge(opts: flag.Args) -> ()! {
+    if opts.get_bool("abort") && len(opts.rest) == 0 { return merge_abort() }
+    if opts.get_bool("abort") || len(opts.rest) != 1 { return Err("用法：lgit merge 分支 | --abort") }
+    root = need_root()
+    g = repo.gdir(root)
+    if merge_head(g) != "" { return Err("上一次合并还没有完成（解决冲突后 lgit commit，或者 lgit merge --abort 放弃）") }
+    head = repo.head_commit(g) ?? ""
+    if head == "" { return Err("还没有任何提交，不能合并") }
+    rev = opts.rest[0].copy()
+    other = commit_of(g, rev)?
+    if is_ancestor(g, other, head)? {
+        print("已经是最新的。")
+        return Ok()
+    }
+    if is_ancestor(g, head, other)? {
+        // 快进：当前分支直接挪到对方的提交上
+        switch_tree(root, g, other)?
+        ref = repo.head_ref(g)?
+        if ref == "" {
+            set_head(g, other)?
+        } else {
+            repo.write_ref(g, ref, other)?
+        }
+        print("更新 #{slice(head, 0, 7)}..#{slice(other, 0, 7)}")
+        print("快进")
+        return Ok()
+    }
+    base = merge_base(g, head, other)?
+    if base == "" { return Err("拒绝合并无关的历史：#{rev} 和当前分支没有共同的祖先") }
+    b = work.flat_of_commit(g, base)?
+    o = work.flat_of_commit(g, head)?
+    t = work.flat_of_commit(g, other)?
+    es = index.read(g)?
+    if !same_flat(index_flat(es), o) { return Err("暂存区里有还没提交的变更，请先提交（lgit commit）") }
+    ps: [str] = []
+    for p in b.paths { ps.push(p.copy()) }
+    for p in o.paths {
+        if !has_str(ps, p) { ps.push(p.copy()) }
+    }
+    for p in t.paths {
+        if !has_str(ps, p) { ps.push(p.copy()) }
+    }
+    acts: [MAct] = []
+    notes: [str] = []
+    conflicts = 0
+    for k in index.order_of(ps) {
+        p = ps[k].copy()
+        bi = work.lookup(b, p)
+        oi = work.lookup(o, p)
+        ti = work.lookup(t, p)
+        a = MAct(path: p.copy(), kind: "", id: "", mode: "", text: "", bid: at_or(b, bi, 0), bm: at_or(b, bi, 1),
+            oid: at_or(o, oi, 0), om: at_or(o, oi, 1), tid: at_or(t, ti, 0), tm: at_or(t, ti, 1))
+        if a.oid == a.tid && a.om == a.tm { continue }
+        if a.tid == a.bid && a.tm == a.bm { continue }
+        if a.oid == a.bid && a.om == a.bm {
+            // 只有对方改了：照对方的来
+            a.kind = if a.tid == "" { "delete" } else { "take" }
+            a.id = a.tid.copy()
+            a.mode = a.tm.copy()
+        } else if a.oid != "" && a.tid != "" {
+            // 两边都改了：模式只有一边改了就用改了的，内容逐行合并
+            a.mode = if a.om == a.bm { a.tm.copy() } else { a.om.copy() }
+            if a.oid == a.tid {
+                a.kind = "take"
+                a.id = a.oid.copy()
+            } else {
+                bt = ""
+                if a.bid != "" { bt = blob_text(g, a.bid)? }
+                ot = blob_text(g, a.oid)?
+                tt = blob_text(g, a.tid)?
+                if patch.is_binary(bt) || patch.is_binary(ot) || patch.is_binary(tt) {
+                    a.kind = "conflict"
+                    a.text = ot
+                    notes.push("警告：不能合并二进制文件：#{p}（HEAD 和 #{rev}）")
+                    conflicts += 1
+                } else {
+                    text, n = merge.merge_text(bt, ot, tt, "HEAD", rev)
+                    notes.push("自动合并 #{p}")
+                    a.text = text
+                    if n == 0 {
+                        a.kind = "merged"
+                    } else {
+                        a.kind = "conflict"
+                        what = if a.bid == "" { "添加/添加" } else { "内容" }
+                        notes.push("冲突（#{what}）：合并冲突于 #{p}")
+                        conflicts += 1
+                    }
+                }
+            }
+        } else {
+            // 一边删了、另一边改了：留下改了的那个版本
+            a.kind = "conflict"
+            if a.oid == "" {
+                a.text = blob_text(g, a.tid)?
+                notes.push("冲突（修改/删除）：#{p} 在 HEAD 中被删除，在 #{rev} 中被修改。#{rev} 的 #{p} 版本被保留在树中。")
+            } else {
+                a.text = blob_text(g, a.oid)?
+                notes.push("冲突（修改/删除）：#{p} 在 #{rev} 中被删除，在 HEAD 中被修改。HEAD 的 #{p} 版本被保留在树中。")
+            }
+            conflicts += 1
+        }
+        acts.push(a)
+    }
+    // 要动的文件在工作区里不能有没提交的修改，也不能覆盖未跟踪的文件
+    dirty: [str] = []
+    untracked: [str] = []
+    for a in acts {
+        full = work.full_path(root, a.path)
+        kind = file_kind(full)
+        if a.oid != "" {
+            clean = kind == 1
+            if clean {
+                fid = file_id(full)?
+                clean = fid == a.oid
+            }
+            if !clean { dirty.push(a.path.copy()) }
+        } else if kind != 0 {
+            untracked.push(a.path.copy())
+        }
+    }
+    if len(dirty) > 0 { return Err("你对下列文件的本地修改会被合并操作覆盖：\n" + listing(dirty) + "请在合并前提交你的修改。") }
+    if len(untracked) > 0 { return Err("工作区中下列未跟踪的文件会被合并操作覆盖：\n" + listing(untracked) + "请在合并前移动或删除它们。") }
+    for a in acts {
+        p = a.path.copy()
+        if a.kind == "take" {
+            checkout_file(root, g, &es, p, a.mode, a.id)?
+        } else if a.kind == "delete" {
+            remove_file(root, &es, p)?
+        } else {
+            full = work.full_path(root, p)
+            os.mkdir_all(os.dir(full))?
+            os.write(full, a.text)?
+            if a.kind == "merged" {
+                body = a.text.to_bytes()
+                id = repo.write_obj(g, "blob", body)?
+                index.put(&es, p, work.from_octal(a.mode), id, len(body))
+            } else {
+                index.remove_path(&es, p)
+                stage_entry(&es, p, a.bm, a.bid, 1)
+                stage_entry(&es, p, a.om, a.oid, 2)
+                stage_entry(&es, p, a.tm, a.tid, 3)
+            }
+        }
+    }
+    index.write(g, es)?
+    for s in notes { print(s) }
+    is_branch = repo.read_ref(g, "refs/heads/" + rev) != None
+    msg = if is_branch { "Merge branch '#{rev}'\n" } else { "Merge commit '#{rev}'\n" }
+    if conflicts > 0 {
+        os.write(os.join_path(g, "MERGE_HEAD"), other + "\n")?
+        os.write(os.join_path(g, "MERGE_MSG"), msg)?
+        return Err("自动合并失败，修正冲突然后提交修正的结果。")
+    }
+    tree = work.write_tree(g, es)?
+    id = make_commit(g, tree, [head, other], msg)?
+    print("合并完成（三方合并），新的提交 #{slice(id, 0, 7)}")
+}
+
+// 放弃合并：工作区和暂存区回到 HEAD（合并时写的文件、冲突标记都去掉）
+fn merge_abort() -> ()! {
+    root = need_root()
+    g = repo.gdir(root)
+    if merge_head(g) == "" { return Err("没有正在进行的合并") }
+    h = work.flat_of_commit(g, repo.head_commit(g) ?? "")?
+    es = index.read(g)?
+    ps: [str] = []
+    for e in es {
+        if !has_str(ps, e.path) { ps.push(e.path.copy()) }
+    }
+    for p in ps {
+        if work.lookup(h, p) < 0 { remove_file(root, &es, p)? }
+    }
+    for i in 0..len(h.paths) { checkout_file(root, g, &es, h.paths[i], h.modes[i], h.ids[i])? }
+    index.write(g, es)?
+    clear_merge(g)
+}
+
+// lgit merge-file [-p] 当前 共同祖先 对方：三方合并三个文件（和 git merge-file 一样，冲突标记上写文件名）。
+// 不带 -p 时结果写回“当前”那个文件；退出码是冲突的个数
+fn cmd_merge_file(a: flag.Args) -> ()! {
+    if len(a.rest) != 3 { return Err("用法：lgit merge-file [-p] 当前 共同祖先 对方") }
+    cur = os.read(a.rest[0])?
+    base = os.read(a.rest[1])?
+    oth = os.read(a.rest[2])?
+    text, n = merge.merge_text(base, cur, oth, a.rest[0], a.rest[2])
+    if a.get_bool("stdout") {
+        out(text)
+    } else {
+        os.write(a.rest[0], text)?
+    }
+    code = if n < 127 { n } else { 127 }
+    if n > 0 { exit(code) }
+}
+
+// 每个命令一个子命令，说明里写着它的用法（lgit -h 时列出来）
+fn parser() -> flag.Parser {
+    p = flag.new("lgit", "用 Lark 写的简单 git")
+    c = flag.new("init", "新建仓库：lgit init [目录]")
+    p.add_command(c)
+    c = flag.new("hash-object", "算对象编号：lgit hash-object [-w] [-t 类型] 文件")
+    c.add_bool("write", "w", "同时写进对象库")
+    c.add_str("type", "t", "blob", "对象的类型")
+    p.add_command(c)
+    c = flag.new("cat-file", "看对象：lgit cat-file (-t | -s | -p) 对象")
+    c.add_bool("type", "t", "类型")
+    c.add_bool("size", "s", "大小")
+    c.add_bool("pretty", "p", "内容")
+    p.add_command(c)
+    c = flag.new("ls-tree", "列出 tree：lgit ls-tree [-r] 版本")
+    c.add_bool("recursive", "r", "递归到子目录")
+    p.add_command(c)
+    c = flag.new("write-tree", "由暂存区建 tree，打印编号")
+    p.add_command(c)
+    c = flag.new("add", "暂存文件或目录：lgit add 路径…（. 是全部）")
+    p.add_command(c)
+    c = flag.new("status", "要提交的、没暂存的变更和未跟踪的文件")
+    p.add_command(c)
+    c = flag.new("commit", "提交：lgit commit -m 说明")
+    c.add_str("message", "m", "", "提交说明")
+    p.add_command(c)
+    c = flag.new("log", "沿第一个父提交往回列：lgit log [--oneline] [-n 数量] [版本]")
+    c.add_bool("oneline", "", "每个提交一行")
+    c.add_int("max-count", "n", -1, "最多列几个（-1 是全部）")
+    p.add_command(c)
+    c = flag.new("diff", "差异：lgit diff [--cached] [版本 [版本]] [-- 路径…]")
+    c.add_bool("cached", "", "比较版本（默认 HEAD）和暂存区")
+    c.add_bool("staged", "", "和 --cached 一样")
+    p.add_command(c)
+    c = flag.new("branch", "列出、新建、删除分支：lgit branch [名字 [起点]] | (-d | -D) 名字…")
+    c.add_bool("delete", "d", "删除已经合并进当前分支的分支")
+    c.add_bool("force-delete", "D", "删除分支，不管合并了没有")
+    p.add_command(c)
+    c = flag.new("checkout", "切换：lgit checkout 分支 | -b 新分支 [起点] | 版本 | -- 路径…")
+    c.add_str("new-branch", "b", "", "新建这个分支并切换过去")
+    p.add_command(c)
+    c = flag.new("merge", "三方合并：lgit merge 分支 | --abort")
+    c.add_bool("abort", "", "放弃有冲突的合并")
+    p.add_command(c)
+    c = flag.new("merge-file", "三方合并三个文件：lgit merge-file [-p] 当前 共同祖先 对方")
+    c.add_bool("stdout", "p", "结果打印出来，不写回文件")
+    p.add_command(c)
+    p
+}
+
+fn main() {
+    p = parser()
+    a = p.parse_or_exit()
+    cmd = a.command.copy()
+    r = if cmd == "init" {
+        cmd_init(a)
+    } else if cmd == "hash-object" {
+        cmd_hash_object(a)
+    } else if cmd == "cat-file" {
+        cmd_cat_file(a)
+    } else if cmd == "ls-tree" {
+        cmd_ls_tree(a)
+    } else if cmd == "write-tree" {
+        cmd_write_tree()
+    } else if cmd == "add" {
+        cmd_add(a)
+    } else if cmd == "status" {
+        cmd_status()
+    } else if cmd == "commit" {
+        cmd_commit(a)
+    } else if cmd == "log" {
+        cmd_log(a)
+    } else if cmd == "diff" {
+        cmd_diff(a)
+    } else if cmd == "branch" {
+        cmd_branch(a)
+    } else if cmd == "checkout" {
+        cmd_checkout(a)
+    } else if cmd == "merge" {
+        cmd_merge(a)
+    } else {
+        cmd_merge_file(a)
+    }
+    match r {
+        Ok => {}
+        Err(e) => die(e)
+    }
+}

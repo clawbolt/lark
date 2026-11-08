@@ -1,0 +1,50 @@
+// ChaCha20-Poly1305（RFC 8439 第 2.8 节，TLS 1.3 的 TLS_CHACHA20_POLY1305_SHA256 用它）。
+// seal 返回 密文 + 16 字节标签；open 先核对标签（常数时间比较），对了才解密。
+// 先证明再写：对应 formal/Lark/Tls.lean 的 sealA / openA / macData / otk。证明了：seal 再 open 回到明文（open_seal）；
+// open 成功时输入正好是 seal(明文) 的结果（open_some）；(aad, 密文) 不同，交给 Poly1305 的数据就不同（macData_inj）。
+// 实验性：没有经过审计
+import "std/digest"
+import "tls/chacha20"
+import "tls/poly1305"
+
+// 加密并算标签：密文 + 16 字节标签
+pub fn seal(key: [u8], nonce: [u8], plain: [u8], aad: [u8]) -> [u8] {
+    ct = chacha20.xor(key, 1, nonce, plain)
+    tag = poly1305.mac(otk(key, nonce), mac_data(aad, ct))
+    for b in tag { ct.push(b) }
+    ct
+}
+
+// 核对标签再解密；比 16 字节还短，或者标签不对（密文、aad、nonce、密钥任何一个不对）时是错误
+pub fn open(key: [u8], nonce: [u8], sealed: [u8], aad: [u8]) -> [u8]! {
+    if len(sealed) < 16 { return Err("chacha20-poly1305：数据比 16 字节的标签还短") }
+    n = len(sealed) - 16
+    ct: [u8] = []
+    tag: [u8] = []
+    for i in 0..n { ct.push(sealed[i]) }
+    for i in n..len(sealed) { tag.push(sealed[i]) }
+    want = poly1305.mac(otk(key, nonce), mac_data(aad, ct))
+    if !digest.equal(tag, want) { return Err("chacha20-poly1305：认证失败") }
+    Ok(chacha20.xor(key, 1, nonce, ct))
+}
+
+// 一次性的 Poly1305 密钥：第 0 块密钥流的前 32 字节（第 2.6 节）
+fn otk(key: [u8], nonce: [u8]) -> [u8] {
+    ks = chacha20.block(key, 0, nonce)
+    out: [u8] = []
+    for i in 0..32 { out.push(ks[i]) }
+    out
+}
+
+// aad、补 0 到 16 的倍数、密文、补 0、两个长度（各 8 字节小端）
+fn mac_data(aad: [u8], ct: [u8]) -> [u8] {
+    out: [u8] = []
+    for b in aad { out.push(b) }
+    for _i in 0..(16 - len(aad) % 16) % 16 { out.push(0) }
+    for b in ct { out.push(b) }
+    for _i in 0..(16 - len(ct) % 16) % 16 { out.push(0) }
+    for n in [len(aad), len(ct)] {
+        for k in 0..8 { out.push(((n >>> (8 * k)) & 255).wrap_u8()) }
+    }
+    out
+}

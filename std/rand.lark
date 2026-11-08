@@ -1,0 +1,141 @@
+// Lark 标准库 · 伪随机数（用 Lark 自己写）
+// 用法：import "std/rand"
+//
+//   r = rand.new(42)                 // 同一个种子总是得到同一串数（可复现）；rand.from_time() 用当前毫秒数做种子
+//   r.range(0, 6)                    // [0, 6) 的整数，均匀分布（和 Python 的 randrange、Rust 的 gen_range 一样不含右端）
+//   r.range(-10, 10)                 // [-10, 10) 的整数
+//   r.next_float()                   // [0.0, 1.0) 的浮点数（53 位精度）
+//   r.next_bool(0.3)                 // 以 0.3 的概率为 true
+//   r.next_int()                     // 64 位随机数（所有位都随机，可能是负数）
+//   r.shuffle(&xs)                   // 原地打乱（Fisher–Yates）
+//   r.choice(xs)                     // T?：随机一个元素的副本，空列表时 None
+//   r.sample(xs, 3)                  // 不重复地随机取 3 个元素的副本（不足 3 个时全取），顺序也是随机的
+//
+// 算法是 xoshiro256**（256 位状态，周期 2^256 - 1），种子先经过 SplitMix64 展开成 4 个状态字。
+// 速度快、统计性质好、可复现，但不适合密码学用途。
+
+const MAX = 0x7FFF_FFFF_FFFF_FFFF
+
+pub type Rng {
+    s0: int
+    s1: int
+    s2: int
+    s3: int
+}
+
+pub fn new(seed: int) -> Rng {
+    x = seed
+    a = splitmix(&x)
+    b = splitmix(&x)
+    c = splitmix(&x)
+    d = splitmix(&x)
+    Rng(s0: a, s1: b, s2: c, s3: d)
+}
+
+pub fn from_time() -> Rng { new(now_ms()) }
+
+// SplitMix64：x 每次加一个常数，再把它打散
+fn splitmix(inout x: int) -> int {
+    x = x +% 0x9E37_79B9_7F4A_7C15
+    z = (x ^ (x >>> 30)) *% 0xBF58_476D_1CE4_E5B9
+    z = (z ^ (z >>> 27)) *% 0x94D0_49BB_1331_11EB
+    z ^ (z >>> 31)
+}
+
+fn rotl(x: int, k: int) -> int { (x << k) | (x >>> (64 - k)) }
+
+// xoshiro256** 的一步
+pub fn next_int(inout r: Rng) -> int {
+    out = rotl(r.s1 *% 5, 7) *% 9
+    t = r.s1 << 17
+    r.s2 = r.s2 ^ r.s0
+    r.s3 = r.s3 ^ r.s1
+    r.s1 = r.s1 ^ r.s2
+    r.s0 = r.s0 ^ r.s3
+    r.s2 = r.s2 ^ t
+    r.s3 = rotl(r.s3, 45)
+    out
+}
+
+// [0, n) 的均匀整数；n <= 0 时 panic。取 63 位的非负随机数 x（共 2^63 种），
+// 丢掉最后不满 n 个的那一段再取模，这样没有取模偏差
+fn below(inout r: Rng, n: int) -> int {
+    if n <= 0 { panic("rand.below：n 要大于 0，得到 #{n}") }
+    rem = (MAX % n + 1) % n         // 2^63 除以 n 的余数
+    x = next_int(&r) >>> 1
+    for x > MAX - rem { x = next_int(&r) >>> 1 }
+    x % n
+}
+
+// [lo, hi) 的均匀整数；hi <= lo 时 panic（调用方写错了）。区间比 MAX 还宽时（比如整个 int 的范围）hi - lo 会溢出，
+// 这时直接取 64 位随机数，落在区间里就用（每次至少有一半的机会）
+pub fn range(inout r: Rng, lo: int, hi: int) -> int {
+    if hi <= lo { panic("rand.range：区间 [#{lo}, #{hi}) 是空的") }
+    span = hi -% lo
+    if span > 0 { return lo + below(&r, span) }
+    for true {
+        x = next_int(&r)
+        if x >= lo && x < hi { return x }
+    }
+    lo
+}
+
+// 高 53 位除以 2^53
+pub fn next_float(inout r: Rng) -> float {
+    to_float(next_int(&r) >>> 11) / 9007199254740992.0
+}
+
+pub fn next_bool(inout r: Rng, p: float) -> bool { next_float(&r) < p }
+
+pub fn shuffle[T](inout r: Rng, inout xs: [T]) {
+    // 元素先换成 T? 放进 slots（这样才能两两交换），打乱后再放回 xs
+    tmp = replace(&xs, [])
+    slots: [T?] = []
+    slots.reserve(len(tmp))
+    for len(tmp) > 0 { slots.push(Some(tmp.pop())) }
+    i = len(slots) - 1
+    for i > 0 {
+        j = below(&r, i + 1)
+        if j != i {
+            e: T? = None
+            a = replace(&slots[i], e)
+            b = replace(&slots[j], a)
+            slots[i] = b
+        }
+        i -= 1
+    }
+    for k in 0..len(slots) {
+        e2: T? = None
+        v = replace(&slots[k], e2)
+        match take v {
+            Some(x) => xs.push(x)
+            None => panic("rand.shuffle：有空位")
+        }
+    }
+}
+
+pub fn choice[T](inout r: Rng, xs: [T]) -> T? {
+    if len(xs) == 0 { return None }
+    k = below(&r, len(xs))
+    Some(xs[k].copy())
+}
+
+pub fn sample[T](inout r: Rng, xs: [T], k: int) -> [T] {
+    n = len(xs)
+    m = if k < n { k } else { n }
+    idx: [int] = []
+    idx.reserve(n)
+    for i in 0..n { idx.push(i) }
+    out: [T] = []
+    for i in 0..m {
+        j = range(&r, i, n)
+        t = idx[i]
+        idx[i] = idx[j]
+        idx[j] = t
+        out.push(xs[idx[i]].copy())
+    }
+    out
+}
+
+// "#{r}"：Rng(…)。内部状态不显示：要复现结果，记下 new 时用的种子
+pub fn show(r: Rng) -> str { "Rng(…)" }

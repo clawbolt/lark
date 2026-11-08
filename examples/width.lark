@@ -1,0 +1,8 @@
+// 终端里的显示宽度：fmt.width 按字符（码点）算，中日韩文字、全角符号、表情两列，— … → 这类标点一列，
+// 组合用的附加符号（比如 e 后面的 \xcc\x81，合起来显示成 é）不占列
+import "std/fmt"
+
+fn main() {
+    cases = ["abc", "中文", "a—b…c", "→←", "e\xcc\x81", "ｱＡ", "한글", "😀!", "〈〉"]
+    for s in cases { print("#{fmt.width(s)}  [#{fmt.align_left(s, 6)}]") }
+}

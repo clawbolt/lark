@@ -1,0 +1,41 @@
+// 链式调用 std/iter（需要 lark1 及以后的版本）
+// x.f(…) 在 x 的类型所在的模块、当前模块和根模块里都找不到 f 时，会去 import 的模块里找第一个参数是
+// “任意来源”（带 Iter / Next 约束的类型参数）或列表的泛型函数，所以列表和自己的迭代器都能接着写下去。
+// 编译：lark1 examples/chain.lark -o out.c
+import "std/iter"
+
+type Countdown {
+    n: int
+}
+
+fn next(inout cd: Countdown) -> int? {
+    if cd.n == 0 { return None }
+    cd.n -= 1
+    Some(cd.n + 1)
+}
+
+fn main() {
+    squares = iter.count_from(1).map(|n| n * n).take_n(5).collect()
+    print("前 5 个平方数：#{squares}")
+
+    // 函数会拿走来源，所以要接着用的列表先 copy 一份
+    xs = [3, -1, 4, -1, 5, 9, -2, 6]
+    doubled = xs.copy().map(|x| x * 2).collect()
+    print("翻倍：#{doubled}")
+    total = xs.copy().fold(0, |acc, x| acc + x)
+    print("和：#{total}")
+
+    // 列表直接接着适配器写；zip 的第二个来源要是迭代器，列表先 each 一下
+    pos = xs.filter(|x| x > 0).enumerate().collect()
+    print("正数和序号：#{pos}")
+
+    words = ["一", "二", "三"]
+    pairs = Countdown(n: 3).zip(words.each()).collect()
+    print("配对：#{pairs}")
+
+    big = Countdown(n: 10).filter(|n| n % 3 == 0).find(|n| n < 7)
+    print("第一个小于 7 的 3 的倍数：#{big}")
+
+    rest = iter.range(0, 100).skip_n(90).count()
+    print("跳过 90 个后还剩：#{rest}")
+}

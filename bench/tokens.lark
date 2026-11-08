@@ -1,0 +1,42 @@
+// 基准：不递归的小枚举（像词法分析的 token），按值存放在列表里；
+// tokflat.lark 用结构体做同样的事，两者的差是枚举的标签和 match 的代价
+enum Tok {
+    Num(int)
+    Plus
+    Times
+}
+
+fn lex(n: int) -> [Tok] {
+    ts: [Tok] = []
+    for i in 0..n {
+        if i % 3 == 0 {
+            ts.push(Num(i))
+        } else if i % 3 == 1 {
+            ts.push(Plus)
+        } else {
+            ts.push(Times)
+        }
+    }
+    ts
+}
+
+fn score(ts: [Tok]) -> int {
+    s = 0
+    for t in ts {
+        match t {
+            Num(v) => { s += v % 7 }
+            Plus => { s += 1 }
+            Times => { s += 2 }
+        }
+    }
+    s
+}
+
+fn main() {
+    total = 0
+    for _ in 0..60 {
+        ts = lex(200000)
+        total += score(ts)
+    }
+    print("#{total}")
+}

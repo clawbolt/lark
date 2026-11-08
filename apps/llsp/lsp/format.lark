@@ -1,0 +1,107 @@
+// 格式化（LSP 规范的 “textDocument/formatting”）：交给现有的格式化工具（build/lark-fmt --stdout，不改它），
+// 只把中间不一样的那段换掉（不整个替换，编辑器里的光标不跳）。
+// 先证明再写：对应 formal/Lark/LspFmt.lean，函数和定义一一对应：pre_len ↔ preLen、suf_len ↔ sufLen、mid ↔ mid
+// 证明了：开头、结尾一样的字节两边确实一样、两段不重叠（pre_take、suf_ok、pre_suf）；换掉 [a, b) 以后正好是
+// 格式化的结果（fmt_edit）；a、b 在字符边界上时，换成 LSP 的位置、编辑器再按 Lsp.change 作用，结果也正好是它（fmt_change）。
+// a 是不超过 preLen 的最大的字符边界，b 是不小于 (长度 - sufLen) 的最小的字符边界，正好满足 fmt_change 的条件。
+// 没证：格式化工具本身（它只改空白，见 tools/fmt.lark 的说明）；运行它（std/proc）。
+import "std/os"
+import "std/proc"
+import "std/json"
+import "lsp/pos"
+import "lsp/docs"
+
+// 开头一样的字节数（preLen）
+pub fn pre_len(d: str, t: str) -> int {
+    n = if len(d) < len(t) { len(d) } else { len(t) }
+    k = 0
+    for k < n && byte_at(d, k) == byte_at(t, k) { k += 1 }
+    k
+}
+
+// 结尾一样的字节数，不和开头那段重叠（sufLen：最多 min(两边的长度) - preLen 个）
+pub fn suf_len(d: str, t: str) -> int {
+    n = (if len(d) < len(t) { len(d) } else { len(t) }) - pre_len(d, t)
+    k = 0
+    for k < n && byte_at(d, len(d) - 1 - k) == byte_at(t, len(t) - 1 - k) { k += 1 }
+    k
+}
+
+// t 里对应 d 的 [a, b) 的那段（mid）
+pub fn mid(d: str, t: str, a: int, b: int) -> str { slice(t, a, len(t) - (len(d) - b)) }
+
+pub type Edit {
+    pub a: int          // d 里要换的范围 [a, b)，都在字符边界上
+    pub b: int
+    pub text: str
+}
+
+// d 变成 t 要做的修改；一样时是 None
+pub fn diff(d: str, t: str) -> Edit? {
+    if d == t { return None }
+    p = pre_len(d, t)
+    q = len(d) - suf_len(d, t)
+    // 字符边界（阶段 1 的 pos.doc 的元素之间）：a 往前退，b 往后进
+    a = 0
+    b = len(d)
+    o = 0
+    for e in pos.doc(d) {
+        if o <= p { a = o }
+        if o >= q && o < b { b = o }
+        o += len(e)
+    }
+    if o <= p { a = o }
+    Some(Edit(a: a, b: b, text: mid(d, t, a, b)))
+}
+
+fn pos_json(p: pos.Pos) -> json.Json {
+    json.object([("line", json.Num(p.line)), ("character", json.Num(p.ch))])
+}
+
+// TextEdit 的列表：没有修改时是空的
+pub fn edits_json(enc: pos.Enc, d: str, t: str) -> json.Json {
+    out: [json.Json] = []
+    match take diff(d, t) {
+        Some(e) => {
+            xs = pos.doc(d)
+            r = json.object([("start", pos_json(pos.pos_of(enc, xs, e.a))), ("end", pos_json(pos.pos_of(enc, xs, e.b)))])
+            out.push(json.object([("range", r), ("newText", json.Str(e.text.copy()))]))
+        }
+        None => {}
+    }
+    json.Arr(out)
+}
+
+// ---------- 运行格式化工具（没证） ----------
+
+// 格式化以后的内容；格式化工具不在、或者出错时是 None
+pub fn run_fmt(home: str, text: str) -> str? {
+    tool = os.join_path(home, "build/lark-fmt")
+    if home == "" || !os.is_file(tool) { return None }
+    _c = os.chmod(tool, 493)     // 0o755：构建出来的程序有时会丢掉执行权限（见 apps/llsp/editors/README.md）
+    tmp = os.join_path(os.temp_dir(), "llsp_fmt.lark")
+    match os.write(tmp, text) {
+        Ok => {}
+        Err(_) => { return None }
+    }
+    r = proc.run([tool, "--stdout", tmp.copy()])
+    _d = os.remove(tmp)
+    match take r {
+        Ok(o) => if o.code == 0 { Some(o.out.copy()) } else { None }
+        Err(_) => None
+    }
+}
+
+// textDocument/formatting 的结果：TextEdit 的列表；文档没打开、或者格式化工具用不了时是 null
+pub fn formatting(home: str, enc: pos.Enc, files: [docs.Doc], params: json.Json) -> json.Json {
+    uri = json.path_str(params, "textDocument.uri") ?? ""
+    d = match take docs.get(files, uri) {
+        Some(x) => x.text.copy()
+        None => { return json.Null }
+    }
+    t = match take run_fmt(home, d) {
+        Some(x) => x
+        None => { return json.Null }
+    }
+    edits_json(enc, d, t)
+}

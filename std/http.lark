@@ -1,0 +1,941 @@
+// Lark 标准库 · HTTP/1.1（用 Lark 自己写，来自 apps/lhttp）。解析请求、拼回复、服务器的连接循环和路由、一个最小的客户端。
+// 用法：import "std/http"
+//
+// 服务器（keep-alive、流水线、连接 30 秒没有动静就关掉；每个连接一个任务）：
+//   r = http.new_router()
+//   r.handle("GET /items/{id}", |req| http.reply(200, [], "第 " + http.param(req, "id") + " 项"))
+//   r.handle("PUT /k/{key...}", put_key)        // {名字...} 是剩下的整段路径（可以有 /，可以是空的）
+//   l = net.listen("127.0.0.1", 8080)?
+//   http.serve(l, |req| http.route(r, req))?     // 一直接受连接；只有 accept 出错时才返回 Err
+//   http.serve_until(l, h, stop)?                // 一样，stop（sync.Cancel）取消以后优雅地停下来，返回 Ok
+// 路由按 Go 1.22 的 ServeMux：方法可以不写（什么方法都行），GET 也接 HEAD（serve 只发头部）；几条都能匹配时取最具体的
+// （写死的段比 {x} 具体，{x} 比 {x...} 具体，写了方法的比没写的具体）。路径对、方法不对时回 405 和 Allow，都不对时回 404。
+// handler 是 Fn(Request) -> Response，用 http.reply(状态码, 头部, 正文)、http.reply_error(状态码) 造回复。
+//
+// 自己写连接循环时用下面这些：
+//   req, next, code = http.parse_request(buf, pos)     从 buf 的 pos 处解析一个请求（流水线时 buf 里可能有好几个）：
+//                                                next 是 -1 表示数据还不完整，-2 表示请求有错、code 是该回的状态码
+//   http.header(req, "host") -> str?           名字用小写    http.is_keep_alive(req)    http.unescape_path(s) -> str?
+//   http.format_response(200, [("Content-Type", "text/plain")], body, head, conn, 现在的毫秒数) -> 完整的回复
+//   http.error_page(404)、http.status_text、http.format_date、http.mime_type(路径)、http.escape_html、http.escape_path
+// 客户端（只有 http://，没有 https；每次请求一个新连接，Connection: close）：
+//   r = http.get("http://127.0.0.1:8080/a?b=1")?      r.status、r.headers、r.body、http.header(r, "content-type")
+//   http.request("PUT", url, [("Content-Type", "text/plain")], body)?
+import "std/str"
+import "std/time"
+import "std/os"
+import "std/net"
+import "std/sync"
+
+// ---------- 解析请求 ----------
+// 只认识 Content-Length 的请求体（chunked 的请求体回 501）
+pub type Request {
+    pub method: str
+    pub target: str             // 请求行里原样的目标
+    pub path: str               // 解码以后的路径，不含查询串
+    pub query: str              // ? 后面的部分（不解码），没有时是 ""
+    pub version: str            // "HTTP/1.1" 或 "HTTP/1.0"
+    pub headers: [(str, str)]   // 名字都转成小写，值去掉了两边的空白
+    pub body: str
+    pub params: [(str, str)]    // 路由里 {名字} 匹配到的段（route 填上，见 param）
+}
+
+const MAX_HEAD = 16384          // 请求行加头部最多这么多字节
+const MAX_BODY = 8388608        // 请求体最多 8MB
+
+// buf 里从 pos 开始第一次出现 pat 的位置，没有是 -1
+fn find_from(buf: str, pos: int, pat: str) -> int { str.find_from(buf, pat, pos) ?? -1 }
+
+// 解析 buf 里从 pos 开始的一个请求，得到 (请求, 下一个请求的位置, 状态码)。
+// 位置是 -1 表示数据还不完整；-2 表示请求有错，状态码是该回的错误（400、413、431、501、505），回复以后关闭连接
+pub fn parse_request(buf: str, pos: int) -> (Request?, int, int) {
+    // 请求之间多出来的空行要跳过（RFC 9112 2.2）
+    p = pos
+    for p + 1 < len(buf) && byte_at(buf, p) == '\r' && byte_at(buf, p + 1) == '\n' { p += 2 }
+    end = find_from(buf, p, "\r\n\r\n")
+    if end < 0 {
+        if len(buf) - p > MAX_HEAD { return (None, -2, 431) }
+        return (None, -1, 0)
+    }
+    if end - p > MAX_HEAD { return (None, -2, 431) }
+    lines = split_crlf(slice(buf, p, end))
+    parts = str.split(lines[0], " ")
+    if len(parts) != 3 || !is_token(parts[0]) || len(parts[1]) == 0 { return (None, -2, 400) }
+    version = parts[2].copy()
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return (None, -2, if str.starts_with(version, "HTTP/") { 505 } else { 400 })
+    }
+    headers: [(str, str)] = []
+    for k in 1..len(lines) {
+        line = lines[k].copy()
+        colon = find_from(line, 0, ":")
+        if colon <= 0 { return (None, -2, 400) }
+        name = slice(line, 0, colon)
+        if !is_token(name) { return (None, -2, 400) }
+        headers.push((str.to_lower(name), trim_ows(slice(line, colon + 1, len(line)))))
+    }
+    // 请求体。好几个 Content-Length 而且值不一样时回 400：前后两跳对正文的边界理解不一样，就是请求走私（RFC 9112 6.3）
+    body_len = -1
+    for (k, v) in headers {
+        if k == "transfer-encoding" { return (None, -2, 501) }
+        if k == "content-length" {
+            n = content_length(v)
+            if n < 0 || (body_len >= 0 && n != body_len) { return (None, -2, 400) }
+            if n > MAX_BODY { return (None, -2, 413) }
+            body_len = n
+        }
+    }
+    if body_len < 0 { body_len = 0 }
+    start = end + 4
+    if start + body_len > len(buf) { return (None, -1, 0) }
+    // 目标：/路径?查询；也接受 http://主机/路径（absolute-form）；OPTIONS 可以是 *
+    raw = parts[1].copy()
+    if str.starts_with(raw, "http://") || str.starts_with(raw, "https://") {
+        slash = find_from(raw, find_from(raw, 0, "//") + 2, "/")
+        raw = if slash < 0 { "/" } else { slice(raw, slash, len(raw)) }
+    }
+    if byte_at(raw, 0) != '/' && raw != "*" { return (None, -2, 400) }
+    q = find_from(raw, 0, "?")
+    raw_path = if q < 0 { raw.copy() } else { slice(raw, 0, q) }
+    query = if q < 0 { "" } else { slice(raw, q + 1, len(raw)) }
+    path = match take unescape_path(raw_path) {
+        Some(x) => x
+        None => return (None, -2, 400)
+    }
+    req = Request(method: parts[0].copy(), target: parts[1].copy(), path: path, query: query, version: version,
+        headers: headers, body: slice(buf, start, start + body_len), params: [])
+    (Some(req), start + body_len, 0)
+}
+
+// 名字是 name 的头部（name 用小写）的值；有好几个时取第一个
+pub fn header(r: Request, name: str) -> str? {
+    for (k, v) in r.headers {
+        if k == name { return Some(v) }
+    }
+    None
+}
+
+// Content-Length 的值：只能是十进制数字（RFC 9110 8.6，"+5"、" 5"、"0x5" 都不行）；不对或者大得离谱时是 -1
+fn content_length(v: str) -> int {
+    if len(v) == 0 || len(v) > 18 { return -1 }
+    n = 0
+    for i in 0..len(v) {
+        c = byte_at(v, i)
+        if c < '0' || c > '9' { return -1 }
+        n = n * 10 + (c - '0')
+    }
+    n
+}
+
+// 回复以后要不要保持连接：HTTP/1.1 默认保持，除非 Connection 里有 close；HTTP/1.0 默认关闭，除非有 keep-alive（有 close 时 close 优先）
+pub fn is_keep_alive(r: Request) -> bool { keep_alive(r.headers, r.version == "HTTP/1.1") }
+
+// Connection 是逗号隔开的 token 列表（RFC 9110 7.6.1），按 token 比，"enclose" 不算 close；同名的头部可能有好几个
+fn keep_alive(hs: [(str, str)], v11: bool) -> bool {
+    close = false
+    keep = false
+    for (k, v) in hs {
+        if k != "connection" { continue }
+        for t in str.split(str.to_lower(v), ",") {
+            w = str.trim(t)
+            if w == "close" { close = true }
+            if w == "keep-alive" { keep = true }
+        }
+    }
+    if close { return false }
+    v11 || keep
+}
+
+// %XX 解码；% 后面不是两个十六进制数字，或者解出了 NUL 时 None
+pub fn unescape_path(s: str) -> str? {
+    if find_from(s, 0, "%") < 0 { return Some(s.copy()) }
+    out = ""
+    i = 0
+    for i < len(s) {
+        ch = byte_at(s, i)
+        if ch == '%' {
+            if i + 2 >= len(s) { return None }
+            hi = hex_val(byte_at(s, i + 1))
+            lo = hex_val(byte_at(s, i + 2))
+            if hi < 0 || lo < 0 || hi * 16 + lo == 0 { return None }
+            out += from_byte(hi * 16 + lo)
+            i += 3
+        } else {
+            out += slice(s, i, i + 1)
+            i += 1
+        }
+    }
+    Some(out)
+}
+
+fn hex_val(c: int) -> int {
+    if c >= '0' && c <= '9' { return c - '0' }
+    if c >= 'a' && c <= 'f' { return c - 'a' + 10 }
+    if c >= 'A' && c <= 'F' { return c - 'A' + 10 }
+    -1
+}
+
+// 按 \r\n 切开
+fn split_crlf(s: str) -> [str] {
+    out: [str] = []
+    start = 0
+    for true {
+        e = find_from(s, start, "\r\n")
+        if e < 0 { break }
+        out.push(slice(s, start, e))
+        start = e + 2
+    }
+    out.push(slice(s, start, len(s)))
+    out
+}
+
+// 去掉两边的空格和制表符
+fn trim_ows(s: str) -> str {
+    a = 0
+    b = len(s)
+    for a < b && (byte_at(s, a) == ' ' || byte_at(s, a) == '\t') { a += 1 }
+    for b > a && (byte_at(s, b - 1) == ' ' || byte_at(s, b - 1) == '\t') { b -= 1 }
+    slice(s, a, b)
+}
+
+// RFC 9110 的 token：方法名和头部名字只能由这些字符组成
+fn is_token(s: str) -> bool {
+    if len(s) == 0 { return false }
+    for i in 0..len(s) {
+        c = byte_at(s, i)
+        ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || str.contains("!#$%&'*+-.^_`|~", from_byte(c))
+        if !ok { return false }
+    }
+    true
+}
+
+// ---------- 拼回复 ----------
+
+pub fn status_text(code: int) -> str {
+    // RFC 9110 第 15 节登记的状态码，加上常用的 103、429、431、451
+    match code {
+        100 => "Continue"
+        101 => "Switching Protocols"
+        103 => "Early Hints"
+        200 => "OK"
+        201 => "Created"
+        202 => "Accepted"
+        203 => "Non-Authoritative Information"
+        204 => "No Content"
+        205 => "Reset Content"
+        206 => "Partial Content"
+        300 => "Multiple Choices"
+        301 => "Moved Permanently"
+        302 => "Found"
+        303 => "See Other"
+        304 => "Not Modified"
+        307 => "Temporary Redirect"
+        308 => "Permanent Redirect"
+        400 => "Bad Request"
+        401 => "Unauthorized"
+        402 => "Payment Required"
+        403 => "Forbidden"
+        404 => "Not Found"
+        405 => "Method Not Allowed"
+        406 => "Not Acceptable"
+        407 => "Proxy Authentication Required"
+        408 => "Request Timeout"
+        409 => "Conflict"
+        410 => "Gone"
+        411 => "Length Required"
+        412 => "Precondition Failed"
+        413 => "Content Too Large"
+        414 => "URI Too Long"
+        415 => "Unsupported Media Type"
+        416 => "Range Not Satisfiable"
+        417 => "Expectation Failed"
+        421 => "Misdirected Request"
+        422 => "Unprocessable Content"
+        426 => "Upgrade Required"
+        428 => "Precondition Required"
+        429 => "Too Many Requests"
+        431 => "Request Header Fields Too Large"
+        451 => "Unavailable For Legal Reasons"
+        500 => "Internal Server Error"
+        501 => "Not Implemented"
+        502 => "Bad Gateway"
+        503 => "Service Unavailable"
+        504 => "Gateway Timeout"
+        505 => "HTTP Version Not Supported"
+        _ => "Unknown"
+    }
+}
+
+// RFC 9110 的 IMF-fixdate，比如 Sun, 06 Nov 1994 08:49:37 GMT
+pub fn format_date(unix_ms: int) -> str {
+    d = time.date_utc(unix_ms)
+    days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    "#{days[d.weekday]}, #{two(d.day)} #{months[d.month - 1]} #{d.year} #{two(d.hour)}:#{two(d.minute)}:#{two(d.second)} GMT"
+}
+
+fn two(n: int) -> str { str.pad_start("#{n}", 2, "0") }
+
+// 按扩展名猜内容类型
+pub fn mime_type(path: str) -> str {
+    match str.to_lower(os.ext(path)) {
+        ".html" => "text/html; charset=utf-8"
+        ".htm" => "text/html; charset=utf-8"
+        ".css" => "text/css; charset=utf-8"
+        ".js" => "text/javascript; charset=utf-8"
+        ".json" => "application/json"
+        ".txt" => "text/plain; charset=utf-8"
+        ".md" => "text/plain; charset=utf-8"
+        ".lark" => "text/plain; charset=utf-8"
+        ".svg" => "image/svg+xml"
+        ".png" => "image/png"
+        ".jpg" => "image/jpeg"
+        ".jpeg" => "image/jpeg"
+        ".gif" => "image/gif"
+        ".ico" => "image/x-icon"
+        ".wasm" => "application/wasm"
+        ".pdf" => "application/pdf"
+        _ => "application/octet-stream"
+    }
+}
+
+// 一个完整的回复。head 为真时（HEAD 请求）只写头部，Content-Length 还是正文的长度。
+// conn 是 Connection 头的值，"" 表示不写：要关闭时写 close；HTTP/1.0 要保持连接时必须写 keep-alive，不然客户端会一直等连接关闭。
+// 头部的值常带着别人给的数据（Location、回显），所以和 Go 一样：值里的 \r \n 换成空格，名字不是 token 的头部不写（防响应拆分）
+pub fn format_response(code: int, headers: [(str, str)], body: str, head: bool, conn: str, now_ms: int) -> str {
+    out = "HTTP/1.1 #{code} #{status_text(code)}\r\n"
+    out += "Date: #{format_date(now_ms)}\r\n"
+    for (k, v) in headers {
+        if is_token(k) { out += "#{k}: #{one_line(v)}\r\n" }
+    }
+    // 1xx、204、304 没有正文，也不写 Content-Length
+    if code >= 200 && code != 204 && code != 304 { out += "Content-Length: #{len(body)}\r\n" }
+    if conn != "" { out += "Connection: #{conn}\r\n" }
+    out += "\r\n"
+    if !head { out += body }
+    out
+}
+
+// 头部的值：\r \n 换成空格
+fn one_line(v: str) -> str {
+    if !str.contains(v, "\r") && !str.contains(v, "\n") { return v.copy() }
+    str.replace_all(str.replace_all(v, "\r", " "), "\n", " ")
+}
+
+// 出错时的简单正文
+pub fn error_page(code: int) -> (str, [(str, str)]) {
+    ("#{code} #{status_text(code)}\n", [("Content-Type", "text/plain; charset=utf-8")])
+}
+
+// 放进 HTML 里的文字要转义
+pub fn escape_html(s: str) -> str {
+    out = ""
+    for i in 0..len(s) {
+        c = byte_at(s, i)
+        out += if c == '&' { "&amp;" } else if c == '<' { "&lt;" } else if c == '>' { "&gt;" } else if c == '"' { "&quot;" } else { slice(s, i, i + 1) }
+    }
+    out
+}
+
+// 放进 URL 路径里的名字要编码（字母、数字和 -._~/ 之外的字节都写成 %XX）
+pub fn escape_path(s: str) -> str {
+    hex = "0123456789ABCDEF"
+    out = ""
+    for i in 0..len(s) {
+        c = byte_at(s, i)
+        ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' || c == '/'
+        out += if ok { slice(s, i, i + 1) } else { "%" + slice(hex, c / 16, c / 16 + 1) + slice(hex, c % 16, c % 16 + 1) }
+    }
+    out
+}
+
+// ---------- 服务器：回复、路由、连接循环 ----------
+
+// 回复：handler 返回它，serve 补上 Date、Content-Length、Connection 再发出去。reason 按状态码填
+pub fn reply(status: int, headers: [(str, str)], body: str) -> Response {
+    Response(status: status, reason: status_text(status), headers: headers.copy(), body: body.copy())
+}
+
+// 出错的回复：正文是 "404 Not Found\n"
+pub fn reply_error(status: int) -> Response {
+    body, hs = error_page(status)
+    Response(status: status, reason: status_text(status), headers: hs, body: body)
+}
+
+// 路由里 {名字} 匹配到的值（已经解码过）；没有这个名字时是 ""
+pub fn param(r: Request, name: str) -> str {
+    for (k, v) in r.params {
+        if k == name { return v.copy() }
+    }
+    ""
+}
+
+type Route {
+    pattern: str                // 原文，报错用
+    method: str                 // "" 表示什么方法都行
+    segs: [str]                 // 路径按 / 切开（去掉开头的 /）：写死的段、"{名字}"、"{名字...}"
+    h: Fn(Request) -> Response
+}
+
+pub type Router {
+    routes: [Route]
+}
+
+pub fn new_router() -> Router { Router(routes: []) }
+
+// 加一条路由："GET /items/{id}"、"/health"（什么方法都行）、"POST /k/{key...}"。
+// 写错（不是 / 开头、{} 不完整、{x...} 不在最后、名字重复）或者和已有的一模一样时 panic：这是程序写错了
+pub fn handle(inout r: Router, pattern: str, h: Fn(Request) -> Response) {
+    sp = str.find(pattern, " ") ?? -1
+    method = if sp < 0 { "" } else { slice(pattern, 0, sp) }
+    path = if sp < 0 { pattern.copy() } else { str.trim(slice(pattern, sp + 1, len(pattern))) }
+    if !str.starts_with(path, "/") { panic("http：路由 \"#{pattern}\" 的路径要以 / 开头") }
+    segs = str.split(slice(path, 1, len(path)), "/")
+    names: [str] = []
+    for i in 0..len(segs) {
+        s = segs[i]
+        if str.starts_with(s, "{") || str.ends_with(s, "}") {
+            if !str.starts_with(s, "{") || !str.ends_with(s, "}") || len(s) < 3 { panic("http：路由 \"#{pattern}\" 里的 #{s} 不完整，要写成 {名字} 或 {名字...}") }
+            rest = str.ends_with(s, "...}")
+            nm = if rest { slice(s, 1, len(s) - 4) } else { slice(s, 1, len(s) - 1) }
+            if nm == "" { panic("http：路由 \"#{pattern}\" 里的 #{s} 没有名字") }
+            if rest && i != len(segs) - 1 { panic("http：路由 \"#{pattern}\" 里的 #{s} 只能写在最后") }
+            for o in names {
+                if o == nm { panic("http：路由 \"#{pattern}\" 里的名字 #{nm} 重复了") }
+            }
+            names.push(nm)
+        }
+    }
+    for o in r.routes {
+        if o.method == method && o.segs == segs { panic("http：路由 \"#{pattern}\" 和 \"#{o.pattern}\" 重复了") }
+    }
+    r.routes.push(Route(pattern: pattern.copy(), method: method, segs: segs, h: h.copy()))
+}
+
+// 把请求交给最具体的那条路由；没有匹配的回 404，路径匹配、方法不对的回 405（带 Allow）
+pub fn route(r: Router, req: Request) -> Response {
+    path = if str.starts_with(req.path, "/") { slice(req.path, 1, len(req.path)) } else { req.path.copy() }
+    segs = str.split(path, "/")
+    best = -1
+    best_score = ""
+    allow: [str] = []
+    for k in 0..len(r.routes) {
+        m = r.routes[k].method.copy()
+        score = match_score(r.routes[k].segs, segs)
+        if score == "" { continue }
+        if m != "" && m != req.method && !(m == "GET" && req.method == "HEAD") {
+            add_allow(&allow, m)
+            if m == "GET" { add_allow(&allow, "HEAD") }
+            continue
+        }
+        full = score + (if m == "" { "0" } else { "1" })
+        if best < 0 || full > best_score {
+            best = k
+            best_score = full
+        }
+    }
+    if best < 0 {
+        if len(allow) == 0 { return reply_error(404) }
+        resp = reply_error(405)
+        resp.headers.push(("Allow", join(allow, ", ")))
+        return resp
+    }
+    sub = req.copy()
+    sub.params = params_of(r.routes[best].segs, segs)
+    f = r.routes[best].h.copy()
+    f(sub)
+}
+
+fn add_allow(inout xs: [str], m: str) {
+    for x in xs {
+        if x == m { return }
+    }
+    xs.push(m.copy())
+}
+
+// 路由的段能不能匹配路径的段：不能时是 ""；能时每段一个字符（写死的 2、{x} 1、{x...} 0），没有 {x...} 的再加一个 3。
+// 字符串大的更具体：/a/b 是 "223"、/a/{x} 是 "213"、/a/{x...} 是 "20"
+fn match_score(rs: [str], ps: [str]) -> str {
+    out = ""
+    for i in 0..len(rs) {
+        s = rs[i]
+        if str.ends_with(s, "...}") && str.starts_with(s, "{") { return out + "0" }
+        if i >= len(ps) { return "" }
+        if str.starts_with(s, "{") && str.ends_with(s, "}") {
+            if ps[i] == "" { return "" }
+            out += "1"
+        } else {
+            if ps[i] != s { return "" }
+            out += "2"
+        }
+    }
+    if len(ps) != len(rs) { return "" }
+    out + "3"
+}
+
+fn params_of(rs: [str], ps: [str]) -> [(str, str)] {
+    out: [(str, str)] = []
+    for i in 0..len(rs) {
+        s = rs[i]
+        if !str.starts_with(s, "{") { continue }
+        if str.ends_with(s, "...}") {
+            rest: [str] = []
+            for j in i..len(ps) { rest.push(ps[j].copy()) }
+            out.push((slice(s, 1, len(s) - 4), join(rest, "/")))
+        } else {
+            out.push((slice(s, 1, len(s) - 1), ps[i].copy()))
+        }
+    }
+    out
+}
+
+const IDLE_MS = 30000           // 连接这么久没有动静就关掉
+const POLL_MS = 200             // 等连接、等请求时每隔这么久看一眼是不是该停了
+
+type Session {
+    c: net.Conn
+    h: Fn(Request) -> Response
+    stop: sync.Cancel
+}
+
+// 在 l 上一直接受连接，每个连接一个任务，每个请求交给 h。正常情况下不返回；accept 出错时等进行中的连接都结束，再返回 Err
+pub fn serve(l: net.Listener, h: Fn(Request) -> Response) -> ()! { serve_until(l, h, sync.new_cancel()) }
+
+// 和 serve 一样，stop 取消以后优雅地停下来再返回 Ok：
+//   - 不再接受新连接（最多再过 POLL_MS 毫秒）；
+//   - 正在处理的请求照常做完，回复里写 Connection: close；
+//   - 空闲的连接（在等下一个请求）直接关掉；读到一半的请求读完、回复以后再关。
+// 所以返回的时间取决于最慢的那个 handler；要有个上限时，让 handler 自己带超时（比如 http.Client 的 set_timeout_ms）
+pub fn serve_until(l: net.Listener, h: Fn(Request) -> Response, stop: sync.Cancel) -> ()! {
+    l.set_timeout_ms(POLL_MS)?
+    err = ""
+    scope {
+        for true {
+            c = match take l.accept() {
+                Ok(x) => x
+                Err(e) => {
+                    if net.is_timeout(e) {
+                        if stop.is_cancelled() { break }
+                        continue
+                    }
+                    err = e
+                    break
+                }
+            }
+            spawn(serve_conn, Session(c: c, h: h.copy(), stop: stop.copy()))
+        }
+    }
+    if err == "" { Ok() } else { Err(err) }
+}
+
+fn serve_conn(take s: Session) {
+    match session(&s) {
+        Ok => {}
+        Err(_) => {}        // 客户端断开、超时这些都不用管
+    }
+    _r = s.c.close()
+}
+
+// 读到的数据先攒在 buf 里，一次可能有好几个请求（流水线），逐个处理，回复攒起来一起写回去。
+// 读的时候每 POLL_MS 毫秒醒一次：停了并且手上没有读到一半的请求就关掉，连着 IDLE_MS 没有数据也关掉
+fn session(inout s: Session) -> ()! {
+    h = s.h.copy()
+    buf = ""
+    idle = 0
+    for true {
+        s.c.set_timeout_ms(POLL_MS)?
+        chunk = match take s.c.read(65536) {
+            Ok(x) => x
+            Err(e) => {
+                if !net.is_timeout(e) { return Err(e) }
+                idle += POLL_MS
+                if (s.stop.is_cancelled() && buf == "") || idle >= IDLE_MS { return Ok() }
+                continue
+            }
+        }
+        if chunk == "" { return Ok() }
+        idle = 0
+        buf += chunk
+        pos = 0
+        out = ""
+        done = false
+        for true {
+            r, at, code = parse_request(buf, pos)
+            if at == -1 { break }
+            if at == -2 {
+                body, hs = error_page(code)
+                out += format_response(code, hs, body, false, "close", time.unix_ms())
+                done = true
+                break
+            }
+            pos = at
+            req = match take r {
+                Some(x) => x
+                None => break
+            }
+            resp = h(req)
+            // 停了以后这个回复就是最后一个
+            close = !is_keep_alive(req) || s.stop.is_cancelled()
+            conn = if close { "close" } else if req.version == "HTTP/1.0" { "keep-alive" } else { "" }
+            out += format_response(resp.status, resp.headers, resp.body, req.method == "HEAD", conn, time.unix_ms())
+            if close {
+                done = true
+                break
+            }
+        }
+        if out != "" {
+            s.c.set_timeout_ms(IDLE_MS)?
+            s.c.write(out)?
+        }
+        if done { return Ok() }
+        buf = slice(buf, pos, len(buf))
+    }
+}
+
+// "#{r}"：Router(3 条路由)
+pub fn show(r: Router) -> str { "Router(#{len(r.routes)} 条路由)" }
+
+// ---------- 客户端 ----------
+
+pub type Response {
+    pub status: int
+    pub reason: str
+    pub headers: [(str, str)]   // 名字都转成小写
+    pub body: str               // chunked 的已经拼好
+}
+
+// 名字是 name 的头部（name 用小写）的值；有好几个时取第一个
+pub fn header(r: Response, name: str) -> str? {
+    for (k, v) in r.headers {
+        if k == name { return Some(v) }
+    }
+    None
+}
+
+// http://主机[:端口]/路径 → (主机, 端口, 路径)。没有写路径时是 /
+pub fn parse_url(url: str) -> (str, int, str)! {
+    if !str.starts_with(url, "http://") {
+        return Err(if str.starts_with(url, "https://") { "不支持 https：#{url}" } else { "URL 要以 http:// 开头：#{url}" })
+    }
+    rest = slice(url, 7, len(url))
+    slash = find_from(rest, 0, "/")
+    hostport = if slash < 0 { rest } else { slice(rest, 0, slash) }
+    path = if slash < 0 { "/" } else { slice(rest, slash, len(rest)) }
+    if hostport == "" { return Err("URL 里没有主机：#{url}") }
+    colon = find_from(hostport, 0, ":")
+    if colon < 0 { return Ok((hostport, 80, path)) }
+    port = try_parse_int(slice(hostport, colon + 1, len(hostport))) ?? -1
+    if port <= 0 || port > 65535 { return Err("端口不对：#{url}") }
+    Ok((slice(hostport, 0, colon), port, path))
+}
+
+// 一次性的请求：新建一个连接、发 Connection: close、读到对方关闭为止。不跟随重定向。超时 10 秒
+pub fn get(url: str) -> Response! { request("GET", url, [], "") }
+
+pub fn request(method: str, url: str, headers: [(str, str)], body: str) -> Response! {
+    host, port, path = parse_url(url)?
+    c = net.connect(host, port)?
+    c.set_timeout_ms(10000)?
+    c.write(request_text(method, host, port, path, headers, body, false))?
+    raw = c.read_all()?
+    c.close()?
+    parse_response(raw, method == "HEAD")
+}
+
+// 请求的原文。Host 带上不是 80 的端口；keep 为假时写 Connection: close
+fn request_text(method: str, host: str, port: int, path: str, headers: [(str, str)], body: str, keep: bool) -> str {
+    hp = if port == 80 { host.copy() } else { "#{host}:#{port}" }
+    out = "#{method} #{path} HTTP/1.1\r\nHost: #{hp}\r\n"
+    if !keep { out += "Connection: close\r\n" }
+    for (k, v) in headers {
+        if is_token(k) { out += "#{k}: #{one_line(v)}\r\n" }
+    }
+    if body != "" || method == "POST" || method == "PUT" { out += "Content-Length: #{len(body)}\r\n" }
+    out + "\r\n" + body
+}
+
+// 状态行和头部（不含最后的空行）→ (回复（正文是空的）, 这条连接还能不能接着用)
+fn parse_head(text: str) -> (Response, bool)! {
+    lines = split_crlf(text)
+    first = lines[0]
+    if !str.starts_with(first, "HTTP/1.") || len(first) < 12 { return Err("不是 HTTP 回复：#{first}") }
+    status = try_parse_int(slice(first, 9, 12)) ?? -1
+    if status < 100 { return Err("状态码不对：#{first}") }
+    reason = if len(first) > 13 { slice(first, 13, len(first)) } else { "" }
+    hs: [(str, str)] = []
+    for k in 1..len(lines) {
+        line = lines[k]
+        colon = find_from(line, 0, ":")
+        if colon <= 0 { return Err("头部不对：#{line}") }
+        hs.push((str.to_lower(slice(line, 0, colon)), trim_ows(slice(line, colon + 1, len(line)))))
+    }
+    keep = keep_alive(hs, str.starts_with(first, "HTTP/1.1"))
+    r = Response(status: status, reason: reason, headers: hs, body: "")
+    Ok((r, keep))
+}
+
+// 解析一个完整的回复（服务器已经关闭了连接）。正文按 Transfer-Encoding: chunked、Content-Length 或者读到的全部
+pub fn parse_response(raw: str, head: bool) -> Response! {
+    end = find_from(raw, 0, "\r\n\r\n")
+    if end < 0 { return Err("回复不完整：没有读到头部的结尾") }
+    r, _keep = parse_head(slice(raw, 0, end))?
+    rest = slice(raw, end + 4, len(raw))
+    if head || r.status == 204 || r.status == 304 { return Ok(r) }
+    te = str.to_lower(header(r, "transfer-encoding") ?? "")
+    if str.contains(te, "chunked") {
+        r.body = decode_chunked(rest)?
+    } else {
+        match header(r, "content-length") {
+            Some(v) => {
+                n = content_length(v)
+                if n < 0 { return Err("Content-Length 不对：#{v}") }
+                if n > len(rest) { return Err("回复不完整：正文应该有 #{n} 字节，只读到 #{len(rest)}") }
+                r.body = slice(rest, 0, n)
+            }
+            None => { r.body = rest }
+        }
+    }
+    Ok(r)
+}
+
+// ---------- 能复用连接的客户端 ----------
+
+// 一个客户端留着用完的连接（每个主机:端口可以有好几条，一共最多 MAX_IDLE 条），下一个请求先用它们。
+// 不能在几个任务之间共用：每个任务建自己的（lproxy 是每个进来的连接一个）
+pub type Client {
+    pub timeout_ms: int         // 每次读、写最多等这么久（连接本身照 net.connect 的方式等）；默认 10000，用 set_timeout_ms 改。模块外只读
+    pub max_redirects: int      // 最多跟随几次 301、302、303、307、308；0 表示不跟随，直接返回；默认 5，用 set_max_redirects 改。模块外只读
+    keys: [str]                 // 空闲的连接和它的 "主机:端口"，下标一一对应
+    conns: [net.Conn]
+}
+
+const MAX_IDLE = 4
+
+pub fn new_client() -> Client { Client(timeout_ms: 10000, max_redirects: 5, keys: [], conns: []) }
+
+// 读写的超时（毫秒）：之后新建的连接用它，已经留着的连接下次用时也改成它
+pub fn set_timeout_ms(inout cl: Client, ms: int) { cl.timeout_ms = ms }
+
+// 最多跟随几次重定向；0 表示不跟随
+pub fn set_max_redirects(inout cl: Client, n: int) { cl.max_redirects = if n < 0 { 0 } else { n } }
+
+pub fn get(inout cl: Client, url: str) -> Response! { request(&cl, "GET", url, [], "") }
+
+// 发一个请求，跟随重定向。303 以及 POST 等遇到 301、302 时改成不带正文的 GET（和浏览器、Go 一样），307、308 原样重发
+pub fn request(inout cl: Client, method: str, url: str, headers: [(str, str)], body: str) -> Response! {
+    m = method.copy()
+    u = url.copy()
+    b = body.copy()
+    hops = 0
+    for true {
+        r = send_once(&cl, m, u, headers, b)?
+        loc = header(r, "location") ?? ""
+        st = r.status
+        redirect = st == 301 || st == 302 || st == 303 || st == 307 || st == 308
+        if !redirect || loc == "" || hops >= cl.max_redirects { return Ok(r) }
+        u = resolve_url(u, loc)?
+        hops += 1
+        if st == 303 || ((st == 301 || st == 302) && m != "GET" && m != "HEAD") {
+            m = "GET"
+            b = ""
+        }
+    }
+    Err("http：重定向的循环不会走到这里")
+}
+
+// 把空闲的连接都关掉（不调用的话 Client 释放时也会关）
+pub fn close(inout cl: Client) {
+    cl.keys = []
+    cl.conns = []
+}
+
+// 重定向的 Location 相对于原来的 URL：完整的 http:// 地址、/ 开头的路径、相对的路径（换掉最后一段）
+fn resolve_url(base: str, loc: str) -> str! {
+    if str.starts_with(loc, "http://") { return Ok(loc.copy()) }
+    if str.starts_with(loc, "https://") { return Err("不支持 https：#{loc}") }
+    host, port, path = parse_url(base)?
+    hp = if port == 80 { host } else { "#{host}:#{port}" }
+    if str.starts_with(loc, "/") { return Ok("http://#{hp}#{loc}") }
+    q = str.find(path, "?") ?? len(path)
+    p = slice(path, 0, q)
+    cut = (str.rfind(p, "/") ?? 0) + 1
+    Ok("http://#{hp}#{slice(p, 0, cut)}#{loc}")
+}
+
+// 可以放心重发的方法：空闲的连接被对方关掉、请求可能没送到时，换一条新连接再发一次
+fn replayable(m: str) -> bool { m == "GET" || m == "HEAD" || m == "PUT" || m == "DELETE" || m == "OPTIONS" }
+
+fn idle_index(cl: Client, key: str) -> int {
+    for i in 0..len(cl.keys) {
+        if cl.keys[i] == key { return i }
+    }
+    -1
+}
+
+// 用完的连接留着；多了就关掉最早的
+fn keep_conn(inout cl: Client, take key: str, take c: net.Conn) {
+    cl.keys.push(key)
+    cl.conns.push(c)
+    if len(cl.conns) > MAX_IDLE {
+        _k = cl.keys.remove_at(0)
+        _old = cl.conns.remove_at(0)
+    }
+}
+
+// 发一个请求、读一个回复（不跟随重定向）。先用空闲的连接；那条连接已经被对方关掉（一个字节都没回）并且方法可以重发时，换新连接再来一次
+fn send_once(inout cl: Client, method: str, url: str, headers: [(str, str)], body: str) -> Response! {
+    host, port, path = parse_url(url)?
+    key = "#{host}:#{port}"
+    text = request_text(method, host, port, path, headers, body, true)
+    head = method == "HEAD"
+    k = idle_index(cl, key)
+    if k >= 0 {
+        _key = cl.keys.remove_at(k)
+        old = cl.conns.remove_at(k)
+        _t = old.set_timeout_ms(cl.timeout_ms)
+        reuse = false
+        got_any = false
+        match take exchange(&old, text, head, &reuse, &got_any) {
+            Ok(r) => {
+                if reuse { keep_conn(&cl, key.copy(), old) }
+                return Ok(r)
+            }
+            Err(e) => {
+                if got_any || !replayable(method) { return Err(e) }
+            }
+        }
+    }
+    c = net.connect(host, port)?
+    c.set_timeout_ms(cl.timeout_ms)?
+    reuse = false
+    got_any = false
+    r = exchange(&c, text, head, &reuse, &got_any)?
+    if reuse { keep_conn(&cl, key, c) }
+    Ok(r)
+}
+
+// 在 c 上发 text、读一个完整的回复。reuse：读完以后这条连接还能接着用；got_any：对方回过至少一个字节
+fn exchange(inout c: net.Conn, text: str, head: bool, inout reuse: bool, inout got_any: bool) -> Response! {
+    c.write(text)?
+    buf = ""
+    end = -1
+    for end < 0 {
+        chunk = c.read(65536)?
+        if chunk == "" {
+            return Err(if buf == "" { "连接被对方关掉了，没有收到回复" } else { "回复不完整：没有读到头部的结尾" })
+        }
+        got_any = true
+        buf += chunk
+        end = find_from(buf, 0, "\r\n\r\n")
+        if end < 0 && len(buf) > MAX_HEAD { return Err("回复的头部太长（超过 #{MAX_HEAD} 字节）") }
+    }
+    r, keep = parse_head(slice(buf, 0, end))?
+    rest = slice(buf, end + 4, len(buf))
+    if head || r.status == 204 || r.status == 304 || r.status < 200 {
+        reuse = keep && rest == ""
+        return Ok(r)
+    }
+    te = str.to_lower(header(r, "transfer-encoding") ?? "")
+    if str.contains(te, "chunked") {
+        n = chunked_end(rest)
+        for n < 0 {
+            chunk = c.read(65536)?
+            if chunk == "" { return Err("chunked 正文不完整") }
+            rest += chunk
+            n = chunked_end(rest)
+        }
+        r.body = decode_chunked(slice(rest, 0, n))?
+        reuse = keep && n == len(rest)
+        return Ok(r)
+    }
+    match header(r, "content-length") {
+        Some(v) => {
+            n = content_length(v)
+            if n < 0 { return Err("Content-Length 不对：#{v}") }
+            for len(rest) < n {
+                chunk = c.read(65536)?
+                if chunk == "" { return Err("回复不完整：正文应该有 #{n} 字节，只读到 #{len(rest)}") }
+                rest += chunk
+            }
+            r.body = slice(rest, 0, n)
+            reuse = keep && len(rest) == n
+        }
+        None => {
+            // 没有长度：读到对方关闭为止，这条连接不能再用
+            all = c.read_all()?
+            r.body = rest + all
+        }
+    }
+    Ok(r)
+}
+
+// chunked 正文在 s 里到哪里结束（最后的 0 块和尾部头部之后）；还不完整时是 -1。长度不是十六进制时返回 len(s)，让 decode_chunked 报错
+fn chunked_end(s: str) -> int {
+    pos = 0
+    for true {
+        e = find_from(s, pos, "\r\n")
+        if e < 0 { return -1 }
+        size_s = slice(s, pos, e)
+        semi = find_from(size_s, 0, ";")
+        if semi >= 0 { size_s = slice(size_s, 0, semi) }
+        size_s = trim_ows(size_s)
+        if size_s == "" { return len(s) }
+        n = 0
+        for i in 0..len(size_s) {
+            d = hex_val(byte_at(size_s, i))
+            if d < 0 { return len(s) }
+            n = n * 16 + d
+            if n > len(s) { return -1 }
+        }
+        if n == 0 {
+            p = e + 2
+            for true {
+                e2 = find_from(s, p, "\r\n")
+                if e2 < 0 { return -1 }
+                if e2 == p { return e2 + 2 }
+                p = e2 + 2
+            }
+        }
+        if e + 2 + n + 2 > len(s) { return -1 }
+        pos = e + 2 + n + 2
+    }
+    -1
+}
+
+// chunked 编码：十六进制的长度（后面可能有 ;扩展）\r\n 数据 \r\n …… 0\r\n（尾部头部）\r\n
+pub fn decode_chunked(s: str) -> str! {
+    out = ""
+    pos = 0
+    for true {
+        e = find_from(s, pos, "\r\n")
+        if e < 0 { return Err("chunked 正文不完整") }
+        size_s = slice(s, pos, e)
+        semi = find_from(size_s, 0, ";")
+        if semi >= 0 { size_s = slice(size_s, 0, semi) }
+        size_s = trim_ows(size_s)
+        if size_s == "" { return Err("chunked 的长度是空的") }
+        n = 0
+        for i in 0..len(size_s) {
+            d = hex_val(byte_at(size_s, i))
+            if d < 0 { return Err("chunked 的长度不是十六进制：#{size_s}") }
+            n = n * 16 + d
+            // 比整个正文还长的一定不完整；先挡住，长度的数字很长时乘法也不会溢出
+            if n > len(s) { return Err("chunked 正文不完整") }
+        }
+        if n == 0 { return Ok(out) }
+        start = e + 2
+        if start + n + 2 > len(s) { return Err("chunked 正文不完整") }
+        out += slice(s, start, start + n)
+        pos = start + n + 2
+    }
+    Ok(out)
+}
+
+// "#{req}"：请求行，GET /a?b=1 HTTP/1.1（头部和请求体在字段里）
+pub fn show(r: Request) -> str { "#{r.method} #{r.target} #{r.version}" }
+
+// "#{resp}"：状态行，200 OK（头部和回复体在字段里）
+pub fn show(r: Response) -> str { "#{r.status} #{r.reason}" }
+
+// "#{c}"：Client(2 条空闲连接)
+pub fn show(c: Client) -> str { "Client(#{len(c.conns)} 条空闲连接)" }

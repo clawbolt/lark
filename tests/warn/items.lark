@@ -1,0 +1,47 @@
+// 期望警告：没用到的函数和类型；pub 的、被隐式调用的（运算符、show、drop 等）、只在 test 块里用到的、
+// 以 _ 开头的，以及重载里有一个被用到的都不警告
+type Used {
+    n: int
+}
+
+type Unused {
+    n: int
+}
+
+enum Color {
+    Red
+    Green
+}
+
+enum Shape {
+    Dot
+}
+
+fn show(u: Used) -> str { "Used(#{u.n})" }
+
+fn add(a: Used, b: Used) -> Used { Used(n: a.n + b.n) }
+
+fn helper(x: int) -> int { x + 1 }
+
+fn helper(s: str) -> str { s + "!" }
+
+fn dead(x: int) -> int { x * 2 }
+
+fn _later() {}
+
+pub fn exported() {}
+
+fn only_in_tests() -> int { 42 }
+
+fn main() {
+    u = Used(n: 1) + Used(n: 2)
+    c = Red
+    match c {
+        Red => print("红 #{u} #{helper(1)}")
+        Green => print("绿")
+    }
+}
+
+test "只在测试里用到也算用到" {
+    assert_eq(only_in_tests(), 42)
+}

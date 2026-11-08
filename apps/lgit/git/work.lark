@@ -1,0 +1,150 @@
+// lgit · 工作区：路径、遍历文件、把 tree 展开成路径表、由暂存区建 tree
+import "std/os"
+import "std/str"
+import "repo"
+import "index"
+
+// 路径表：并列的三个列表，路径按字节序排好
+pub type Flat {
+    pub paths: [str]
+    pub modes: [str]
+    pub ids: [str]
+}
+
+pub fn empty_flat() -> Flat { Flat(paths: [], modes: [], ids: []) }
+
+// 去掉 "." 和 "x/.."
+pub fn normalize(path: str) -> str {
+    parts: [str] = []
+    for seg in str.split(path, "/") {
+        if seg == ".." && len(parts) > 0 && parts[len(parts) - 1] != ".." {
+            _x = parts.pop()
+        } else if seg != "." && seg != "" {
+            parts.push(seg.copy())
+        }
+    }
+    s = join(parts, "/")
+    if str.starts_with(path, "/") { "/" + s } else { s }
+}
+
+// 命令行给的路径（相对于当前目录）换成相对于工作区根目录的路径；"" 表示根目录本身
+pub fn rel_path(root: str, arg: str) -> str! {
+    cwd = os.cwd()?
+    joined = if str.starts_with(arg, "/") { arg.copy() } else { cwd + "/" + arg }
+    abs = normalize(joined)
+    if abs == root { return Ok("") }
+    if str.starts_with(abs, root + "/") { return Ok(slice(abs, len(root) + 1, len(abs))) }
+    Err("#{arg} 在仓库外面")
+}
+
+pub fn full_path(root: str, rel: str) -> str { if rel == "" { root.copy() } else { root + "/" + rel } }
+
+// path 是 rel 本身，或者在目录 rel 下面
+pub fn under(path: str, rel: str) -> bool { rel == "" || path == rel || str.starts_with(path, rel + "/") }
+
+// 工作区里 rel 下面的所有文件（相对路径），不进 .git
+pub fn walk(root: str, rel: str) -> [str]! {
+    out: [str] = []
+    walk_into(root, rel, &out)?
+    Ok(out)
+}
+
+fn walk_into(root: str, rel: str, inout out: [str]) -> ()! {
+    for n in os.read_dir(full_path(root, rel))? {
+        if n == ".git" { continue }
+        r = if rel == "" { n.copy() } else { rel + "/" + n }
+        k = file_kind(full_path(root, r))
+        if k == 2 {
+            walk_into(root, r, &out)?
+        } else if k == 1 {
+            out.push(r)
+        }
+    }
+}
+
+// ---------- tree 和路径表 ----------
+
+pub fn flatten(g: str, tree: str, prefix: str, inout f: Flat) -> ()! {
+    o = repo.read_obj(g, tree)?
+    for e in repo.parse_tree(o.body)? {
+        p = prefix + e.name
+        if e.mode == "40000" {
+            flatten(g, e.id, p + "/", &f)?
+        } else {
+            f.paths.push(p)
+            f.modes.push(e.mode.copy())
+            f.ids.push(e.id.copy())
+        }
+    }
+}
+
+// 提交 rev 的路径表；rev 为 "" 时是空的
+pub fn flat_of_commit(g: str, commit: str) -> Flat! {
+    f = empty_flat()
+    if commit == "" { return Ok(f) }
+    o = repo.read_obj(g, commit)?
+    c = repo.parse_commit(o.body)?
+    flatten(g, c.tree, "", &f)?
+    Ok(f)
+}
+
+pub fn lookup(f: Flat, path: str) -> int {
+    for i in 0..len(f.paths) {
+        if f.paths[i] == path { return i }
+    }
+    -1
+}
+
+// 0o100644 这样的数字写成 "100644"
+pub fn octal(n: int) -> str {
+    if n == 0 { return "0" }
+    s = ""
+    v = n
+    for v > 0 {
+        s = "#{v % 8}" + s
+        v = v / 8
+    }
+    s
+}
+
+// "100644" 这样的八进制写法换成数字；不认识的字符当 0
+pub fn from_octal(s: str) -> int {
+    v = 0
+    for i in 0..len(s) {
+        c = byte_at(s, i)
+        d = if c >= '0' && c <= '7' { c - '0' } else { 0 }
+        v = v * 8 + d
+    }
+    v
+}
+
+// 由暂存区建出各级目录的 tree 对象，得到根 tree 的编号
+pub fn write_tree(g: str, entries: [index.IEntry]) -> str! { build(g, entries, "") }
+
+fn build(g: str, entries: [index.IEntry], prefix: str) -> str! {
+    items: [repo.Entry] = []
+    dirs: [str] = []
+    for e in entries {
+        if !str.starts_with(e.path, prefix) { continue }
+        rest = slice(e.path, len(prefix), len(e.path))
+        k = str.find(rest, "/") ?? -1
+        if k < 0 {
+            items.push(repo.Entry(mode: octal(e.mode), name: rest, id: e.id.copy()))
+        } else {
+            d = slice(rest, 0, k)
+            if !has(dirs, d) { dirs.push(d) }
+        }
+    }
+    for d in dirs {
+        id = build(g, entries, prefix + d + "/")?
+        items.push(repo.Entry(mode: "40000", name: d.copy(), id: id))
+    }
+    repo.write_obj(g, "tree", repo.tree_body(items))
+}
+
+fn has(xs: [str], x: str) -> bool {
+    for v in xs {
+        if v == x { return true }
+    }
+    false
+}

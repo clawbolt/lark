@@ -1,0 +1,529 @@
+// lark-test：用 lark1 跑所有示例和用例，和记下来的预期结果逐字比较（用 Lark 自己写，取代 tests/run.sh）
+// 构建并运行：make test1（比较）、make expect（更新预期结果）
+//
+//   lark-test            比较；有不一致就打印差异，最后以 1 退出
+//   lark-test update     用这次的实际结果重写预期结果，并列出改了哪些
+//
+// 示例 examples/*.lark（另加 examples/modules、examples/multi）：编译、运行，
+//   结果是标准输出加标准错误，退出码不为 0 时最后一行记 [退出码 N]；预期结果在 tests/expected/名字.out。
+// 警告用例 tests/warn/*.lark：必须编译成功，警告在同目录的 名字.expected。
+// 单元测试 tests/unit/*.lark：用 lark1 --test 编译、运行，结果（记法同示例）在同目录的 名字.out。
+// 编译器自己的单元测试（compiler/*.lark 里的 test 块）：只要求全部通过，不记预期输出。
+// 格式化工具 tools/fmt.lark：tests/fmt/名字.lark 的格式化结果在 名字.expected，再格式化一次结果不变，
+//   另外检查编译器、标准库、工具和示例的源码都已格式化。
+// 错误用例 tests/err/*.lark、tests/err1/*.lark、tests/multi：必须编译失败，
+//   结果是编译器的报错（文件、行列和信息）；预期结果在同目录的 名字.expected。
+//
+// 环境变量 LARK（默认 ./build/lark1）、CC（默认 cc）、CFLAGS 和 Makefile 里的一样。中间文件放在 build/t。
+// 新增示例或用例、或者确认某个输出的变化是对的之后，运行 make expect，再看一遍它列出的文件。
+import "std/os"
+import "std/str"
+
+const B = "build/t"
+
+type Run {
+    update: bool
+    lark: str
+    cc: str
+    cflags: str
+    total: int
+    fails: int
+    updated: int
+    missing: [str]
+}
+
+// ---------- 工具 ----------
+
+// 给 sh 用的单引号字符串
+fn q(s: str) -> str { "'" + str.replace_all(s, "'", "'\\''") + "'" }
+
+fn qall(xs: [str]) -> str {
+    parts: [str] = []
+    for x in xs { parts.push(q(x)) }
+    join(parts, " ")
+}
+
+fn slurp(path: str) -> str { os.read(path) ?? "" }
+
+// 打印文件内容（末尾的换行不重复打印）；limit > 0 时最多打印这么多行
+fn show_file(path: str, limit: int) {
+    ls = str.lines(slurp(path))
+    for i in 0..len(ls) {
+        if limit > 0 && i >= limit {
+            print("…（还有 #{len(ls) - limit} 行）")
+            return
+        }
+        print(ls[i])
+    }
+}
+
+// dir 下以 suffix 结尾的文件，按名字排好（目录不存在时是空列表）
+fn glob(dir: str, suffix: str) -> [str] { os.glob(dir + "/*" + suffix) ?? [] }
+
+// "examples/foo.lark" → "foo"
+fn stem_of(path: str) -> str { os.stem(path) }
+
+// ---------- 差异 ----------
+
+// 按行比较，像 diff -u 一样打印：- 是预期，+ 是实际，前后各带 3 行上下文，最多打印 40 行
+fn print_diff(want: str, got: str) {
+    x = str.lines(want)
+    y = str.lines(got)
+    n = len(x)
+    m = len(y)
+    // lcs[i * w + j]：x[i..] 和 y[j..] 的最长公共子序列的长度
+    w = m + 1
+    size = (n + 1) * w
+    lcs: [int] = []
+    for _k in 0..size { lcs.push(0) }
+    i = n - 1
+    for i >= 0 {
+        j = m - 1
+        for j >= 0 {
+            v = if x[i] == y[j] {
+                lcs[(i + 1) * w + j + 1] + 1
+            } else if lcs[(i + 1) * w + j] >= lcs[i * w + j + 1] {
+                lcs[(i + 1) * w + j]
+            } else {
+                lcs[i * w + j + 1]
+            }
+            lcs[i * w + j] = v
+            j -= 1
+        }
+        i -= 1
+    }
+    // 按顺序列出每一行：0 相同，1 只在预期里，2 只在实际里
+    kinds: [int] = []
+    texts: [str] = []
+    i = 0
+    j = 0
+    for i < n || j < m {
+        if i < n && j < m && x[i] == y[j] {
+            kinds.push(0)
+            texts.push(x[i].copy())
+            i += 1
+            j += 1
+        } else if j >= m || (i < n && lcs[(i + 1) * w + j] >= lcs[i * w + j + 1]) {
+            kinds.push(1)
+            texts.push(x[i].copy())
+            i += 1
+        } else {
+            kinds.push(2)
+            texts.push(y[j].copy())
+            j += 1
+        }
+    }
+    changed = false
+    for k in kinds {
+        if k != 0 { changed = true }
+    }
+    if !changed {
+        print("（每一行都相同，只有文件末尾的换行不同）")
+        return
+    }
+    // 离改动不超过 3 行的才打印
+    near: [bool] = []
+    for p in 0..len(kinds) {
+        lo = if p >= 3 { p - 3 } else { 0 }
+        hi = if p + 4 <= len(kinds) { p + 4 } else { len(kinds) }
+        hit = false
+        for r in lo..hi {
+            if kinds[r] != 0 { hit = true }
+        }
+        near.push(hit)
+    }
+    shown = 0
+    gap = false
+    for p in 0..len(kinds) {
+        if near[p] {
+            if shown >= 40 {
+                print("…（差异太多，后面的省略）")
+                return
+            }
+            if gap { print("@@ …") }
+            gap = false
+            mark = if kinds[p] == 1 { "-" } else if kinds[p] == 2 { "+" } else { " " }
+            print(mark + texts[p])
+            shown += 1
+        } else {
+            gap = true
+        }
+    }
+}
+
+// ---------- 比较与更新 ----------
+
+fn compare(inout t: Run, name: str, got: str, exp: str) {
+    if t.update {
+        if !os.is_file(exp) || slurp(exp) != got {
+            match os.write(exp, got) {
+                Ok => {
+                    print("已更新 #{exp}")
+                    t.updated += 1
+                }
+                Err(e) => {
+                    print("写不进 #{exp}：#{e}")
+                    t.fails += 1
+                }
+            }
+        }
+        return
+    }
+    if !os.is_file(exp) {
+        t.missing.push(exp.copy())
+        t.fails += 1
+        return
+    }
+    want = slurp(exp)
+    if want != got {
+        print("结果不一致：#{name}（- 预期，+ 实际）")
+        print_diff(want, got)
+        t.fails += 1
+    }
+}
+
+// 编译 files，成功时为 true；报错（和警告）写进 err
+fn build(t: Run, files: [str], out_c: str, err: str) -> bool {
+    os.shell("#{t.lark} #{qall(files)} -o #{q(out_c)} 2> #{q(err)}") == 0
+}
+
+// ---------- 各类用例 ----------
+
+fn example(inout t: Run, name: str, files: [str]) {
+    t.total += 1
+    c = "#{B}/#{name}.c"
+    lerr = "#{B}/#{name}.lerr"
+    if !build(t, files, c, lerr) {
+        print("编译失败：#{name}")
+        show_file(lerr, 0)
+        t.fails += 1
+        return
+    }
+    run_c(&t, name, c, "tests/expected/#{name}.out", "")
+}
+
+// 加 -DLK_NOTRACE 再编译运行一次 examples/trace.lark：panic 时不打印调用栈
+fn notrace_case(inout t: Run) {
+    t.total += 1
+    c = "#{B}/trace_notrace.c"
+    lerr = "#{B}/trace_notrace.lerr"
+    if !build(t, ["examples/trace.lark"], c, lerr) {
+        print("编译失败：trace_notrace")
+        show_file(lerr, 0)
+        t.fails += 1
+        return
+    }
+    run_c(&t, "trace_notrace", c, "tests/expected/trace_notrace.out", "-DLK_NOTRACE")
+}
+
+// lark1 --release 等于加 -DLK_NOTRACE：输出应该和 trace_notrace 一样
+fn release_case(inout t: Run) {
+    t.total += 1
+    c = "#{B}/trace_release.c"
+    lerr = "#{B}/trace_release.lerr"
+    if os.shell("#{t.lark} -w --release examples/trace.lark -o #{q(c)} 2> #{q(lerr)}") != 0 {
+        print("编译失败：trace_release")
+        show_file(lerr, 0)
+        t.fails += 1
+        return
+    }
+    run_c(&t, "trace_release", c, "tests/expected/trace_notrace.out", "")
+}
+
+// 编译并运行 C 程序，结果（标准输出加标准错误，退出码不为 0 时最后一行记 [退出码 N]）和 exp 比较；
+// extra 是额外的 C 编译选项
+fn run_c(inout t: Run, name: str, c: str, exp: str, extra: str) {
+    exe = "#{B}/#{name}"
+    cerr = "#{B}/#{name}.cerr"
+    if os.shell("#{t.cc} #{t.cflags} #{extra} -Iruntime #{q(c)} -o #{q(exe)} -lm 2> #{q(cerr)}") != 0 {
+        print("C 编译失败：#{name}")
+        show_file(cerr, 20)
+        t.fails += 1
+        return
+    }
+    outp = "#{B}/#{name}.out"
+    code = os.shell("./#{q(exe)} > #{q(outp)} 2>&1")
+    got = slurp(outp)
+    if code != 0 { got = got + "[退出码 #{code}]\n" }
+    compare(&t, name, got, exp)
+}
+
+fn unit_case(inout t: Run, path: str) {
+    t.total += 1
+    n = "unit_" + stem_of(path)
+    c = "#{B}/#{n}.c"
+    lerr = "#{B}/#{n}.lerr"
+    if os.shell("#{t.lark} --test #{q(path)} -o #{q(c)} 2> #{q(lerr)}") != 0 {
+        print("编译失败：#{path}")
+        show_file(lerr, 0)
+        t.fails += 1
+        return
+    }
+    // 阶段 4 的验收：只用计算层和不碰系统的格式模块的测试，要在只带核心的运行时上编译、通过
+    if is_core_unit(stem_of(path)) && !str.contains(os.read(c) ?? "", "#define LK_CORE 1") {
+        print("没有只带运行时的核心：#{path}（它应该只用到计算层，见 runtime/lark_rt.h 开头的 LK_CORE）")
+        t.fails += 1
+        return
+    }
+    run_c(&t, n, c, "tests/unit/#{stem_of(path)}.out", "")
+}
+
+// 只用到计算层（以及不 import 系统层的格式模块）的单元测试
+fn is_core_unit(name: str) -> bool {
+    for n in ["base64", "basic", "bytes", "csv", "deque", "digest", "flag", "fmt", "heap", "iter", "json", "map", "math", "rand", "re", "set",
+        "sort", "str", "utf8"] {
+            if n == name { return true }
+        }
+    false
+}
+
+// 换成 tests/alloc/tagged.h 的分配器重新编译几个单元测试，结果要和平常一样：
+// 检查所有的申请和释放都经过 LK_MALLOC / LK_REALLOC / LK_FREE（只带核心的和带全部运行时的都有：proc、sync 用到子进程和通道）
+fn alloc_cases(inout t: Run) {
+    for name in ["map", "str", "json", "re", "proc", "sync"] {
+        t.total += 1
+        run_c(&t, "alloc_#{name}", "#{B}/unit_#{name}.c", "tests/unit/#{name}.out", "-include tests/alloc/tagged.h")
+    }
+}
+
+// 编译器自己的单元测试：compiler/*.lark 里的 test 块。只要求全部通过（不记预期输出），失败时打印结果
+fn compiler_unit(inout t: Run) {
+    if t.update { return }
+    t.total += 1
+    srcs: [str] = []
+    for n in ["ast", "lex", "parse", "types", "check", "own", "cg_types", "cg_expr", "cg_stmt", "main"] {
+        srcs.push("compiler/#{n}.lark")
+    }
+    c = "#{B}/compiler_unit.c"
+    lerr = "#{B}/compiler_unit.lerr"
+    if os.shell("#{t.lark} -w --test #{qall(srcs)} -o #{q(c)} 2> #{q(lerr)}") != 0 {
+        print("编译失败：编译器的单元测试")
+        show_file(lerr, 0)
+        t.fails += 1
+        return
+    }
+    exe = "#{B}/compiler_unit"
+    cerr = "#{B}/compiler_unit.cerr"
+    if os.shell("#{t.cc} #{t.cflags} -Iruntime #{q(c)} -o #{q(exe)} -lm 2> #{q(cerr)}") != 0 {
+        print("C 编译失败：编译器的单元测试")
+        show_file(cerr, 20)
+        t.fails += 1
+        return
+    }
+    outp = "#{B}/compiler_unit.out"
+    if os.shell("./#{q(exe)} > #{q(outp)} 2>&1") != 0 {
+        print("编译器的单元测试没有全部通过：")
+        show_file(outp, 0)
+        t.fails += 1
+    }
+}
+
+fn warn_case(inout t: Run, path: str) {
+    t.total += 1
+    n = stem_of(path)
+    err = "#{B}/warn_#{n}.err"
+    if build(t, [path.copy()], "#{B}/warn_#{n}.c", err) {
+        got = slurp(err)
+        compare(&t, path, got, "tests/warn/#{n}.expected")
+    } else {
+        print("编译失败（警告用例应该编译成功）：#{path}")
+        show_file(err, 0)
+        t.fails += 1
+    }
+}
+
+fn compile_error(inout t: Run, name: str, exp: str, files: [str]) {
+    t.total += 1
+    err = "#{B}/err.txt"
+    if build(t, files, "#{B}/err.c", err) {
+        print("没有报错：#{name}")
+        t.fails += 1
+        return
+    }
+    got = slurp(err)
+    compare(&t, name, got, exp)
+}
+
+// 构建工具 tools/lark.lark：先编译它，再在 tests/pkg 下的项目里运行 lark run / lark build，
+// 结果（记法同示例）在 tests/pkg/项目名.expected。项目的中间文件在各自的 build/ 里
+fn pkg_cases(inout t: Run) {
+    t.total += 1
+    c = "#{B}/lark-tool.c"
+    lerr = "#{B}/lark-tool.lerr"
+    exe = "#{B}/lark-tool"
+    if !build(t, ["tools/lark.lark"], c, lerr) || os.shell("#{t.cc} #{t.cflags} -Iruntime #{q(c)} -o #{q(exe)} -lm 2> #{q(lerr)}") != 0 {
+        print("构建工具编译失败")
+        show_file(lerr, 20)
+        t.fails += 1
+        return
+    }
+    here = os.cwd() ?? "."
+    env = "LARK_HOME=#{q(here)} LARK_CACHE=#{q(here + "/" + B + "/pkg_cache")}"
+    tool = q(here + "/" + exe)
+    pkg_run(&t, "app", "#{env} #{tool} run -- '有 空格' x")
+    pkg_run(&t, "bad", "#{env} #{tool} build")
+    // 运行时：栈溢出的报告（递归的层数和行号因机器而异，只留下最外层的函数名），任务读管道时不占着唯一的工作线程
+    trim = "grep -v -e '^  在 down' -e '^  …' | sed 's/（[^ ]*:[0-9]*）$//'"
+    pkg_run(&t, "rt", "#{env} #{tool} build > /dev/null && { ./build/rt deep; echo \"[退出码 $?]\"; ./build/rt deep-task; echo \"[退出码 $?]\"; (sleep 1; echo x) | LARK_PROCS=1 ./build/rt stdin; echo \"[退出码 $?]\"; } 2>&1 | #{trim}")
+    // apps/lgit 的单元测试（SHA-1、zlib、对象格式）
+    pkg_run_in(&t, "lgit_test", "apps/lgit", "#{env} #{tool} test")
+    // lgit 的端到端测试（见 apps/lgit/tests/e2e.sh），最后用真 git 检查仓库
+    pkg_run_in(&t, "lgit_e2e", "apps/lgit", "#{env} #{tool} build > /dev/null && sh tests/e2e.sh \"$PWD/build/lgit\"")
+    // apps/lredis：数据库和协议的单元测试；端到端测试启动服务器、用自带的客户端发命令（见 apps/lredis/tests/e2e.sh）
+    pkg_run_in(&t, "lredis_test", "apps/lredis", "#{env} #{tool} test")
+    pkg_run_in(&t, "lredis_e2e", "apps/lredis", "#{env} #{tool} build > /dev/null && sh tests/e2e.sh \"$PWD/build/lredis\"")
+    // apps/llua：Lua 解释器的单元测试（预期结果按真 Lua 5.4 的输出写；和真 lua 的逐字对照见 apps/llua/tests/compat.sh）
+    pkg_run_in(&t, "llua_test", "apps/llua", "#{env} #{tool} test")
+    // apps/lhttp：HTTP 解析和处理请求的单元测试；端到端测试启动服务器、用 curl 和 nc 发请求（见 apps/lhttp/tests/e2e.sh）
+    pkg_run_in(&t, "lhttp_test", "apps/lhttp", "#{env} #{tool} test")
+    pkg_run_in(&t, "lhttp_e2e", "apps/lhttp", "#{env} #{tool} build > /dev/null && sh tests/e2e.sh \"$PWD/build/lhttp\"")
+    // apps/lcache：键值缓存的单元测试和端到端测试（HTTP 用 std/http）
+    pkg_run_in(&t, "lcache_test", "apps/lcache", "#{env} #{tool} test")
+    pkg_run_in(&t, "lcache_e2e", "apps/lcache", "#{env} #{tool} build > /dev/null && sh tests/e2e.sh \"$PWD/build/lcache\"")
+    // apps/lgrep：grep 的单元测试和端到端测试（端到端测试会在编译器源码上和系统的 grep -E 对比）
+    pkg_run_in(&t, "lgrep_test", "apps/lgrep", "#{env} #{tool} test")
+    pkg_run_in(&t, "lgrep_e2e", "apps/lgrep", "#{env} #{tool} build > /dev/null && sh tests/e2e.sh \"$PWD/build/lgrep\"")
+    // apps/ledit：终端编辑器的单元测试和端到端测试（端到端测试用 --keys 按键脚本，不需要终端）
+    pkg_run_in(&t, "ledit_test", "apps/ledit", "#{env} #{tool} test")
+    pkg_run_in(&t, "ledit_e2e", "apps/ledit", "#{env} #{tool} build > /dev/null && sh tests/e2e.sh \"$PWD/build/ledit\"")
+    // apps/ltar：tar 格式的单元测试；端到端测试和系统的 tar 互相解开对方打的包（标准库阶段 1 的验收程序）
+    pkg_run_in(&t, "ltar_test", "apps/ltar", "#{env} #{tool} test")
+    pkg_run_in(&t, "ltar_e2e", "apps/ltar", "#{env} #{tool} build > /dev/null && sh tests/e2e.sh \"$PWD/build/ltar\"")
+    // apps/lproxy：转发的单元测试；端到端测试起两个 lhttp 当上游，最后发 SIGTERM 看它优雅退出（标准库阶段 2 的验收程序）
+    pkg_run_in(&t, "lproxy_test", "apps/lproxy", "#{env} #{tool} test")
+    pkg_run_in(&t, "lproxy_e2e", "apps/lproxy", "#{env} #{tool} build > /dev/null && (cd ../lhttp && #{env} #{tool} build > /dev/null) && sh tests/e2e.sh \"$PWD/build/lproxy\" \"$PWD/../lhttp/build/lhttp\"")
+    // apps/ltls：从零写的 TLS 1.3（实验性）。阶段 1 是加密原语，对照 RFC 8439、5869、7748 的测试向量
+    pkg_run_in(&t, "ltls_test", "apps/ltls", "#{env} #{tool} test")
+    // apps/llsp：Lark 的语言服务器（先证明再写）。阶段 1 是分帧、位置换算和修改文档
+    pkg_run_in(&t, "llsp_test", "apps/llsp", "#{env} #{tool} test")
+    // apps/lterm：从零写的终端仿真（先证明再写）。阶段 1 是转义序列的解析器
+    pkg_run_in(&t, "lterm_test", "apps/lterm", "#{env} #{tool} test")
+    // apps/lvm：从零写的轻量线程（先证明再写）。阶段 1 是虚拟机和时间片，阶段 2 是 M:N 调度器，之后是函数调用、偷一半、有界通道、select、公平
+    pkg_run_in(&t, "lvm_test", "apps/lvm", "#{env} #{tool} test")
+}
+
+fn pkg_run(inout t: Run, name: str, cmd: str) { pkg_run_in(&t, name, "tests/pkg/" + name, cmd) }
+
+// 在目录 dir 里运行 cmd，结果和 tests/pkg/名字.expected 比较
+fn pkg_run_in(inout t: Run, name: str, dir: str, cmd: str) {
+    t.total += 1
+    here = os.cwd() ?? "."
+    outp = "#{here}/#{B}/pkg_#{name}.out"
+    code = os.shell("cd #{q(dir)} && #{cmd} > #{q(outp)} 2>&1")
+    got = slurp(outp)
+    if code != 0 { got = got + "[退出码 #{code}]\n" }
+    compare(&t, "tests/pkg/#{name}", got, "tests/pkg/#{name}.expected")
+}
+
+// 格式化工具：先编译它，再测 tests/fmt，最后检查源码都已格式化
+fn fmt_cases(inout t: Run) {
+    t.total += 1
+    fc = "#{B}/lark-fmt.c"
+    ferr = "#{B}/fmt.lerr"
+    fexe = "#{B}/lark-fmt"
+    if !build(t, ["tools/fmt.lark"], fc, ferr) {
+        print("格式化工具编译失败")
+        show_file(ferr, 0)
+        t.fails += 1
+        return
+    }
+    fcerr = "#{B}/fmt.cerr"
+    if os.shell("#{t.cc} #{t.cflags} -Iruntime #{q(fc)} -o #{q(fexe)} 2> #{q(fcerr)}") != 0 {
+        print("格式化工具的 C 编译失败")
+        show_file(fcerr, 20)
+        t.fails += 1
+        return
+    }
+    for f in glob("tests/fmt", ".lark") {
+        n = stem_of(f)
+        exp = "tests/fmt/#{n}.expected"
+        t.total += 1
+        once = "#{B}/fmt_#{n}.out"
+        _c1 = os.shell("./#{q(fexe)} --stdout #{q(f)} > #{q(once)} 2>&1")
+        got = slurp(once)
+        compare(&t, "格式化 #{f}", got, exp)
+        if !t.update {
+            t.total += 1
+            again = "#{B}/fmt_#{n}.again"
+            _c2 = os.shell("./#{q(fexe)} --stdout #{q(exp)} > #{q(again)} 2>&1")
+            got2 = slurp(again)
+            compare(&t, "再格式化 #{exp}", got2, exp)
+        }
+    }
+    if !t.update {
+        t.total += 1
+        srcs: [str] = []
+        for d in ["compiler", "std", "tools", "examples"] {
+            for f in glob(d, ".lark") { srcs.push(f.copy()) }
+        }
+        match os.read_dir("examples") {
+            Ok(names) => {
+                for n in names {
+                    sub = os.join_path("examples", n)
+                    if os.is_dir(sub) {
+                        for f in glob(sub, ".lark") { srcs.push(f.copy()) }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        if os.shell("./#{q(fexe)} --check #{qall(srcs)}") != 0 {
+            print("上面这些源码还没格式化（可以运行 make fmt）")
+            t.fails += 1
+        }
+    }
+}
+
+fn main() {
+    av = args()
+    t = Run(update: len(av) > 1 && av[1] == "update",
+        lark: os.env("LARK") ?? "./build/lark1",
+        cc: os.env("CC") ?? "cc",
+        cflags: os.env("CFLAGS") ?? "-std=gnu11 -O2 -pthread",
+        total: 0, fails: 0, updated: 0, missing: [])
+    match os.mkdir_all(B) {
+        Ok => {}
+        Err(e) => {
+            print(e)
+            exit(1)
+        }
+    }
+
+    for f in glob("examples", ".lark") { example(&t, stem_of(f), [f.copy()]) }
+    example(&t, "modules", ["examples/modules/main.lark"])
+    example(&t, "multi", ["examples/multi/main.lark", "examples/multi/shape.lark"])
+    notrace_case(&t)
+    release_case(&t)
+
+    for f in glob("tests/warn", ".lark") { warn_case(&t, f) }
+    for f in glob("tests/unit", ".lark") { unit_case(&t, f) }
+    if !t.update { alloc_cases(&t) }
+    // 阶段 4：没有操作系统时的程序，平台函数和内存池在 examples/bare/plat.c（见 examples/bare/run.sh）
+    pkg_run_in(&t, "bare", ".", "sh examples/bare/run.sh #{q(t.lark)} #{q(t.cc)} #{q(t.cflags)}")
+    compiler_unit(&t)
+
+    fmt_cases(&t)
+    pkg_cases(&t)
+
+    errs = glob("tests/err", ".lark")
+    for f in glob("tests/err1", ".lark") { errs.push(f.copy()) }
+    for f in errs {
+        exp = slice(f, 0, len(f) - len(".lark")) + ".expected"
+        compile_error(&t, f, exp, [f.copy()])
+    }
+    compile_error(&t, "tests/multi", "tests/multi/bad.expected", ["tests/multi/ok.lark", "tests/multi/bad.lark"])
+
+    if t.update {
+        print("预期结果：共 #{t.total} 项，更新了 #{t.updated} 项")
+        return
+    }
+    if len(t.missing) > 0 {
+        ms = join(t.missing, " ")
+        print("缺少预期结果（确认实际结果无误后运行 make expect 生成）：#{ms}")
+    }
+    if t.fails != 0 {
+        print("失败 #{t.fails} 项（共 #{t.total} 项）")
+        exit(1)
+    }
+    print("全部通过：共 #{t.total} 项")
+}

@@ -1,0 +1,2073 @@
+// llua · 解释器：直接遍历语法树求值。
+// 状态都在 Vm 里（表、闭包、格子），各个函数以 inout 传它；语法树（Prog）只读，所以求值时能一边借着语法树、一边改 Vm。
+// Lua 的错误是任意的值，所以出错时的类型是 Value!Value，pcall 用 match 接住。
+import "std/io"
+import "std/str"
+import "std/time"
+import "ast"
+import "parse"
+import "value"
+
+pub type Clo {
+    pub proto: int
+    pub ups: [int]      // 每个上值的格子编号
+}
+
+pub type Vm {
+    pub tabs: [value.Table]
+    pub clos: [Clo]
+    pub cells: [value.Value]
+    pub stack: [value.Value]  // 所有 Lua 调用的参数、局部变量和返回值（见“调用”一节）
+    pub globals: int
+    pub strlib: int       // string 表：字符串的方法从这里找
+    pub line: int         // 正在执行的行，报错用
+    pub depth: int        // Lua 函数的调用深度
+    pub from_lua: bool    // 正要调用的函数是不是由 Lua 代码直接调用的（error 只在这时加上位置）
+    pub out: str          // 还没写出去的标准输出
+    pub chunk: str
+}
+
+// 一次 Lua 函数调用。参数和局部变量都在 vm.stack 上：第 s 个槽位是 vm.stack[base + s]
+type Frame {
+    base: int
+    varargs: [value.Value]
+    clo: int
+    pid: int
+    ret_at: int     // return 的值在 vm.stack 上从哪里开始、有几个
+    nret: int
+}
+
+// 调用深度的上限：解释器递归地求值，每层 Lua 调用要用掉好几层 C 函数的栈（主线程的栈是 8MB），所以比 Lua 的低得多
+const MAX_DEPTH = 200
+
+const SIG_NORMAL = 0
+const SIG_BREAK = 1
+const SIG_RETURN = 2
+
+// ---------- 报错 ----------
+
+pub fn rt_err(vm: Vm, msg: str) -> value.Value { value.Str("#{vm.chunk}:#{vm.line}: #{msg}") }
+
+// 出错的值是哪个变量（Lua 报错里括号中的那一段）
+fn describe(e: ast.Ex) -> str {
+    match e {
+        ast.ELocal(_, nm) => " (local '#{nm}')"
+        ast.EUp(_, nm) => " (upvalue '#{nm}')"
+        ast.EGlobal(nm) => " (global '#{nm}')"
+        ast.EIndex(_, ast.EStr(k), _) => " (field '#{k}')"
+        ast.EMethod(_, nm, _, _) => " (method '#{nm}')"
+        ast.EStr(s) => " (constant '#{s}')"
+        _ => ""
+    }
+}
+
+fn tname(v: value.Value) -> str { value.type_name(v) }
+
+// ---------- 输出 ----------
+
+pub fn write_out(inout vm: Vm, s: str) {
+    vm.out += s
+    if len(vm.out) > 65536 { flush_out(&vm) }
+}
+
+pub fn flush_out(inout vm: Vm) {
+    if vm.out == "" { return }
+    w = io.stdout()
+    _ = w.write(vm.out)
+    _ = w.flush()
+    vm.out = ""
+}
+
+// ---------- 槽位和上值 ----------
+
+fn get_slot(vm: Vm, fr: Frame, s: int) -> value.Value {
+    match vm.stack[fr.base + s] {
+        value.Cel(id) => vm.cells[id].copy()
+        v => v.copy()
+    }
+}
+
+fn set_slot(inout vm: Vm, fr: Frame, s: int, take v: value.Value) {
+    i = fr.base + s
+    c = match vm.stack[i] {
+        value.Cel(id) => id
+        _ => -1
+    }
+    if c >= 0 {
+        vm.cells[c] = v
+    } else {
+        vm.stack[i] = v
+    }
+}
+
+// 声明局部变量：每次执行声明都是一个新变量，被捕获的放进新的格子
+fn decl(inout vm: Vm, prog: parse.Prog, fr: Frame, s: int, take v: value.Value) {
+    i = fr.base + s
+    if prog.protos[fr.pid].boxed[s] {
+        vm.cells.push(v)
+        c = len(vm.cells) - 1
+        vm.stack[i] = value.Cel(c)
+    } else {
+        vm.stack[i] = v
+    }
+}
+
+fn make_closure(inout vm: Vm, prog: parse.Prog, fr: Frame, pid: int) -> value.Value {
+    pr_up_n = len(prog.protos[pid].up_idx)
+    ups: [int] = []
+    for i in 0..pr_up_n {
+        k = prog.protos[pid].up_idx[i]
+        if prog.protos[pid].up_local[i] {
+            c = match vm.stack[fr.base + k] {
+                value.Cel(id) => id
+                _ => -1
+            }
+            if c < 0 { panic("llua 内部错误：被捕获的变量不在格子里") }
+            ups.push(c)
+        } else {
+            ups.push(vm.clos[fr.clo].ups[k])
+        }
+    }
+    vm.clos.push(Clo(proto: pid, ups: ups))
+    value.Func(len(vm.clos) - 1)
+}
+
+// ---------- 元表 ----------
+
+pub fn metafield(vm: Vm, v: value.Value, name: str) -> value.Value {
+    m = match v {
+        value.Tab(id) => vm.tabs[id].meta
+        _ => -1
+    }
+    if m < 0 { return value.Nil }
+    value.raw_get_str(vm.tabs[m], name)
+}
+
+fn is_callable(vm: Vm, v: value.Value) -> bool {
+    match v {
+        value.Func(_) | value.Native(_) => true
+        value.Tab(_) => !value.is_nil(metafield(vm, v, "__call"))
+        _ => false
+    }
+}
+
+// t[k]，会看 __index
+pub fn index_get(inout vm: Vm, prog: parse.Prog, o: value.Value, k: value.Value) -> value.Value!value.Value {
+    id = match o {
+        value.Tab(i) => i
+        value.Str(_) => vm.strlib
+        _ => -1
+    }
+    if id < 0 { return Err(rt_err(vm, "attempt to index a #{tname(o)} value")) }
+    is_tab = match o {
+        value.Tab(_) => true
+        _ => false
+    }
+    if is_tab {
+        v = value.raw_get(vm.tabs[id], k)
+        if !value.is_nil(v) || vm.tabs[id].meta < 0 { return Ok(v) }
+        h = metafield(vm, o, "__index")
+        if value.is_nil(h) { return Ok(value.Nil) }
+        is_fn = match h {
+            value.Func(_) | value.Native(_) => true
+            _ => false
+        }
+        if is_fn {
+            rs = call(&vm, prog, h, [o.copy(), k.copy()])?
+            return Ok(first(rs))
+        }
+        return index_get(&vm, prog, h, k)
+    }
+    Ok(value.raw_get(vm.tabs[id], k))
+}
+
+// t[k] = v，会看 __newindex
+pub fn index_set(inout vm: Vm, prog: parse.Prog, o: value.Value, take k: value.Value, take v: value.Value) -> ()!value.Value {
+    id = match o {
+        value.Tab(i) => i
+        _ => -1
+    }
+    if id < 0 { return Err(rt_err(vm, "attempt to index a #{tname(o)} value")) }
+    if vm.tabs[id].meta >= 0 && value.is_nil(value.raw_get(vm.tabs[id], k)) {
+        h = metafield(vm, o, "__newindex")
+        if !value.is_nil(h) {
+            is_fn = match h {
+                value.Func(_) | value.Native(_) => true
+                _ => false
+            }
+            if is_fn {
+                _ = call(&vm, prog, h, [o.copy(), k, v])?
+                return Ok()
+            }
+            return index_set(&vm, prog, h, k, v)
+        }
+    }
+    raw_set_checked(&vm, id, k, v)
+}
+
+pub fn raw_set_checked(inout vm: Vm, id: int, take k: value.Value, take v: value.Value) -> ()!value.Value {
+    bad = match k {
+        value.Nil => "index is nil"
+        value.Num(f) => if f != f { "index is NaN" } else { "" }
+        _ => ""
+    }
+    if bad != "" { return Err(rt_err(vm, bad)) }
+    value.raw_set(&vm.tabs[id], k, v)
+    Ok()
+}
+
+// ---------- 调用 ----------
+// 调用约定：实参依次放在 vm.stack 上从 base 开始的位置；函数返回后，返回值放在从 base 开始的位置，栈顶是 base + 个数。
+// 参数和局部变量也在这个栈上（见 Frame），所以 Lua 函数的调用不用分配内存。
+
+fn truncate(inout vm: Vm, n: int) {
+    for len(vm.stack) > n { _ = vm.stack.pop() }
+}
+
+// 把 vm.stack[start..] 取出来放进列表，栈回到 start
+fn take_from(inout vm: Vm, start: int) -> [value.Value] {
+    out: [value.Value] = []
+    out.reserve(len(vm.stack) - start)
+    for i in start..len(vm.stack) { out.push(replace(&vm.stack[i], value.Nil)) }
+    truncate(&vm, start)
+    out
+}
+
+// 取出 base 处的第一个返回值（没有时是 nil），栈回到 base
+fn take_first(inout vm: Vm, base: int, n: int) -> value.Value {
+    v = if n > 0 { replace(&vm.stack[base], value.Nil) } else { value.Nil }
+    truncate(&vm, base)
+    v
+}
+
+pub fn first(take rs: [value.Value]) -> value.Value {
+    if len(rs) == 0 { return value.Nil }
+    replace(&rs[0], value.Nil)
+}
+
+// 调用 f，实参和返回值都是列表（内置函数和元方法用）
+pub fn call(inout vm: Vm, prog: parse.Prog, f: value.Value, take args: [value.Value]) -> [value.Value]!value.Value {
+    base = len(vm.stack)
+    for i in 0..len(args) { vm.stack.push(replace(&args[i], value.Nil)) }
+    _ = call_at(&vm, prog, f, base)?
+    Ok(take_from(&vm, base))
+}
+
+// 调用 f，实参是 vm.stack[base..]，得到返回值的个数
+fn call_at(inout vm: Vm, prog: parse.Prog, f: value.Value, base: int) -> int!value.Value {
+    match f {
+        value.Func(cid) => call_lua(&vm, prog, cid, base)
+        value.Native(id) => {
+            args = take_from(&vm, base)
+            rs = call_native(&vm, prog, id, args)?
+            n = len(rs)
+            for i in 0..n { vm.stack.push(replace(&rs[i], value.Nil)) }
+            Ok(n)
+        }
+        value.Tab(_) => {
+            h = metafield(vm, f, "__call")
+            if value.is_nil(h) { return Err(rt_err(vm, "attempt to call a table value")) }
+            // 表自己当第一个参数
+            args = take_from(&vm, base)
+            vm.stack.push(f.copy())
+            for i in 0..len(args) { vm.stack.push(replace(&args[i], value.Nil)) }
+            call_at(&vm, prog, h, base)
+        }
+        _ => Err(rt_err(vm, "attempt to call a #{tname(f)} value"))
+    }
+}
+
+fn call_lua(inout vm: Vm, prog: parse.Prog, cid: int, base: int) -> int!value.Value {
+    if vm.depth >= MAX_DEPTH { return Err(rt_err(vm, "stack overflow")) }
+    vm.from_lua = false
+    pid = vm.clos[cid].proto
+    np = prog.protos[pid].nparams
+    nargs = len(vm.stack) - base
+    fr = Frame(base: base, varargs: [], clo: cid, pid: pid, ret_at: 0, nret: 0)
+    // 多出来的实参：可变参数函数收进 varargs，否则丢掉
+    if nargs > np {
+        if prog.protos[pid].vararg {
+            for j in np..nargs { fr.varargs.push(replace(&vm.stack[base + j], value.Nil)) }
+        }
+        truncate(&vm, base + np)
+    }
+    top = base + prog.protos[pid].nslots
+    for len(vm.stack) < top { vm.stack.push(value.Nil) }
+    // 被内层函数捕获的参数放进格子
+    for i in 0..np {
+        if prog.protos[pid].boxed[i] {
+            v = replace(&vm.stack[base + i], value.Nil)
+            decl(&vm, prog, fr, i, v)
+        }
+    }
+    vm.depth += 1
+    r = exec_block(&vm, prog, &fr, prog.protos[pid].body)
+    vm.depth -= 1
+    sig = r?
+    n = if sig == SIG_RETURN { fr.nret } else { 0 }
+    if n > 0 && fr.ret_at != base {
+        for i in 0..n {
+            v = replace(&vm.stack[fr.ret_at + i], value.Nil)
+            vm.stack[base + i] = v
+        }
+    }
+    truncate(&vm, base + n)
+    Ok(n)
+}
+
+// 运行主程序
+pub fn run_main(inout vm: Vm, prog: parse.Prog, take script_args: [value.Value]) -> ()!value.Value {
+    vm.clos.push(Clo(proto: prog.main, ups: []))
+    cid = len(vm.clos) - 1
+    base = len(vm.stack)
+    for i in 0..len(script_args) { vm.stack.push(replace(&script_args[i], value.Nil)) }
+    _ = call_lua(&vm, prog, cid, base)?
+    truncate(&vm, base)
+    Ok()
+}
+
+// 求一个调用表达式：返回值留在栈上（从调用前的栈顶开始），得到个数
+fn call_push(inout vm: Vm, prog: parse.Prog, inout fr: Frame, e: ast.Ex) -> int!value.Value {
+    match e {
+        ast.ECall(fe, args, ln) => {
+            f = eval(&vm, prog, &fr, fe)?
+            base = len(vm.stack)
+            _ = push_list(&vm, prog, &fr, args)?
+            vm.line = ln
+            if !is_callable(vm, f) { return Err(rt_err(vm, "attempt to call a #{tname(f)} value#{describe(fe)}")) }
+            vm.from_lua = true
+            n = call_at(&vm, prog, f, base)?
+            vm.line = ln
+            Ok(n)
+        }
+        ast.EMethod(oe, nm, args, ln) => {
+            o = eval(&vm, prog, &fr, oe)?
+            vm.line = ln
+            if !is_indexable(o) { return Err(rt_err(vm, "attempt to index a #{tname(o)} value#{describe(oe)}")) }
+            f = index_get(&vm, prog, o, value.Str(nm))?
+            base = len(vm.stack)
+            vm.stack.push(o)
+            _ = push_list(&vm, prog, &fr, args)?
+            vm.line = ln
+            if !is_callable(vm, f) { return Err(rt_err(vm, "attempt to call a #{tname(f)} value (method '#{nm}')")) }
+            vm.from_lua = true
+            n = call_at(&vm, prog, f, base)?
+            vm.line = ln
+            Ok(n)
+        }
+        _ => {
+            v = eval(&vm, prog, &fr, e)?
+            vm.stack.push(v)
+            Ok(1)
+        }
+    }
+}
+
+fn is_indexable(v: value.Value) -> bool {
+    match v {
+        value.Tab(_) | value.Str(_) => true
+        _ => false
+    }
+}
+
+// 一个表达式的所有值放到栈上：调用和 ... 可以有多个，别的只有一个
+fn push_multi(inout vm: Vm, prog: parse.Prog, inout fr: Frame, e: ast.Ex) -> int!value.Value {
+    match e {
+        ast.ECall(_, _, _) | ast.EMethod(_, _, _, _) => call_push(&vm, prog, &fr, e)
+        ast.EVararg => {
+            for v in fr.varargs { vm.stack.push(v.copy()) }
+            Ok(len(fr.varargs))
+        }
+        _ => {
+            v = eval(&vm, prog, &fr, e)?
+            vm.stack.push(v)
+            Ok(1)
+        }
+    }
+}
+
+// 表达式列表的值依次放到栈上（最后一个展开成所有的值），得到个数
+fn push_list(inout vm: Vm, prog: parse.Prog, inout fr: Frame, es: [ast.Ex]) -> int!value.Value {
+    n = len(es)
+    if n == 0 { return Ok(0) }
+    for i in 0..n - 1 {
+        v = eval(&vm, prog, &fr, es[i])?
+        vm.stack.push(v)
+    }
+    last = push_multi(&vm, prog, &fr, es[n - 1])?
+    Ok(n - 1 + last)
+}
+
+// 表达式列表的所有值
+fn eval_list(inout vm: Vm, prog: parse.Prog, inout fr: Frame, es: [ast.Ex]) -> [value.Value]!value.Value {
+    start = len(vm.stack)
+    _ = push_list(&vm, prog, &fr, es)?
+    Ok(take_from(&vm, start))
+}
+
+// 恰好 n 个值：多了丢掉，少了补 nil
+fn eval_n(inout vm: Vm, prog: parse.Prog, inout fr: Frame, es: [ast.Ex], n: int) -> [value.Value]!value.Value {
+    vs = eval_list(&vm, prog, &fr, es)?
+    for len(vs) < n { vs.push(value.Nil) }
+    Ok(vs)
+}
+
+// ---------- 表达式 ----------
+
+fn eval(inout vm: Vm, prog: parse.Prog, inout fr: Frame, e: ast.Ex) -> value.Value!value.Value {
+    match e {
+        ast.ENil => Ok(value.Nil)
+        ast.ETrue => Ok(value.Bool(true))
+        ast.EFalse => Ok(value.Bool(false))
+        ast.EInt(n) => Ok(value.Int(n))
+        ast.ENum(f) => Ok(value.Num(f))
+        ast.EStr(s) => Ok(value.Str(s))
+        ast.EVararg => {
+            if len(fr.varargs) == 0 { return Ok(value.Nil) }
+            Ok(fr.varargs[0].copy())
+        }
+        ast.ELocal(s, _) => Ok(get_slot(vm, fr, s))
+        ast.EUp(i, _) => {
+            c = vm.clos[fr.clo].ups[i]
+            Ok(vm.cells[c].copy())
+        }
+        ast.EGlobal(nm) => Ok(value.raw_get_str(vm.tabs[vm.globals], nm))
+        ast.EIndex(oe, ke, ln) => {
+            o = eval(&vm, prog, &fr, oe)?
+            k = eval(&vm, prog, &fr, ke)?
+            // 数组部分里有值的整数下标直接取（有值时不用看元表）
+            match o {
+                value.Tab(id) => match k {
+                    value.Int(n) => {
+                        if n >= 1 && n <= len(vm.tabs[id].arr) && !value.is_nil(vm.tabs[id].arr[n - 1]) {
+                            return Ok(vm.tabs[id].arr[n - 1].copy())
+                        }
+                    }
+                    _ => {}
+                }
+                _ => {}
+            }
+            vm.line = ln
+            if !is_indexable(o) { return Err(rt_err(vm, "attempt to index a #{tname(o)} value#{describe(oe)}")) }
+            index_get(&vm, prog, o, k)
+        }
+        ast.ECall(_, _, _) | ast.EMethod(_, _, _, _) => {
+            base = len(vm.stack)
+            n = call_push(&vm, prog, &fr, e)?
+            Ok(take_first(&vm, base, n))
+        }
+        ast.EFunc(pid) => Ok(make_closure(&vm, prog, fr, pid))
+        ast.EBin(op, ae, be, ln) => {
+            a = eval(&vm, prog, &fr, ae)?
+            b = eval(&vm, prog, &fr, be)?
+            // 两个整数的常见运算直接算，不经过 binary（不会出错，也就不用记行号）
+            match a {
+                value.Int(x) => match b {
+                    value.Int(y) => {
+                        if op == ast.OP_ADD { return Ok(value.Int(x +% y)) }
+                        if op == ast.OP_SUB { return Ok(value.Int(x -% y)) }
+                        if op == ast.OP_MUL { return Ok(value.Int(x *% y)) }
+                        if op == ast.OP_LT { return Ok(value.Bool(x < y)) }
+                        if op == ast.OP_LE { return Ok(value.Bool(x <= y)) }
+                        if op == ast.OP_GT { return Ok(value.Bool(x > y)) }
+                        if op == ast.OP_GE { return Ok(value.Bool(x >= y)) }
+                        if op == ast.OP_EQ { return Ok(value.Bool(x == y)) }
+                        if op == ast.OP_NE { return Ok(value.Bool(x != y)) }
+                    }
+                    _ => {}
+                }
+                _ => {}
+            }
+            vm.line = ln
+            binary(&vm, prog, op, a, b, ae, be)
+        }
+        ast.EAnd(ae, be) => {
+            a = eval(&vm, prog, &fr, ae)?
+            if !value.truthy(a) { return Ok(a) }
+            eval(&vm, prog, &fr, be)
+        }
+        ast.EOr(ae, be) => {
+            a = eval(&vm, prog, &fr, ae)?
+            if value.truthy(a) { return Ok(a) }
+            eval(&vm, prog, &fr, be)
+        }
+        ast.EUn(op, ae, ln) => {
+            a = eval(&vm, prog, &fr, ae)?
+            vm.line = ln
+            unary(&vm, prog, op, a, ae)
+        }
+        ast.ETable(items, keys, vals, ln) => {
+            vm.tabs.push(value.new_table())
+            id = len(vm.tabs) - 1
+            vs = eval_list(&vm, prog, &fr, items)?
+            for i in 0..len(vs) { value.raw_set(&vm.tabs[id], value.Int(i + 1), vs[i].copy()) }
+            for j in 0..len(keys) {
+                k = eval(&vm, prog, &fr, keys[j])?
+                v = eval(&vm, prog, &fr, vals[j])?
+                vm.line = ln
+                raw_set_checked(&vm, id, k, v)?
+            }
+            Ok(value.Tab(id))
+        }
+        ast.EParen(x) => eval(&vm, prog, &fr, x)
+    }
+}
+
+// ---------- 运算 ----------
+
+fn mm_name(op: int) -> str {
+    match op {
+        1 => "__add"
+        2 => "__sub"
+        3 => "__mul"
+        4 => "__div"
+        5 => "__idiv"
+        6 => "__mod"
+        7 => "__pow"
+        8 => "__concat"
+        15 => "__band"
+        16 => "__bor"
+        17 => "__bxor"
+        18 => "__shl"
+        19 => "__shr"
+        20 => "__unm"
+        23 => "__bnot"
+        _ => ""
+    }
+}
+
+// 二元运算的元方法：先看 a 的，再看 b 的；都没有时 None
+fn try_mm(inout vm: Vm, prog: parse.Prog, ev: str, a: value.Value, b: value.Value) -> value.Value?!value.Value {
+    h = metafield(vm, a, ev)
+    if value.is_nil(h) { h = metafield(vm, b, ev) }
+    if value.is_nil(h) { return Ok(None) }
+    rs = call(&vm, prog, h, [a.copy(), b.copy()])?
+    Ok(Some(first(rs)))
+}
+
+fn is_num(v: value.Value) -> bool {
+    match v {
+        value.Int(_) | value.Num(_) => true
+        _ => false
+    }
+}
+
+// 算术里的自动转换：数字原样，能读成数字的字符串转成数字，别的得到 nil
+pub fn to_number(v: value.Value) -> value.Value {
+    match v {
+        value.Int(n) => value.Int(n)
+        value.Num(f) => value.Num(f)
+        value.Str(s) => value.str_to_num(s)
+        _ => value.Nil
+    }
+}
+
+pub fn flt(v: value.Value) -> float {
+    match v {
+        value.Int(n) => to_float(n)
+        value.Num(f) => f
+        _ => 0.0
+    }
+}
+
+fn lua_fmod(a: float, b: float) -> float {
+    m = a % b
+    if (m > 0.0 && b < 0.0) || (m < 0.0 && b > 0.0) { m += b }
+    m
+}
+
+fn int_arith(vm: Vm, op: int, x: int, y: int) -> value.Value!value.Value {
+    if op == ast.OP_ADD { return Ok(value.Int(x +% y)) }
+    if op == ast.OP_SUB { return Ok(value.Int(x -% y)) }
+    if op == ast.OP_MUL { return Ok(value.Int(x *% y)) }
+    if op == ast.OP_IDIV {
+        if y == 0 { return Err(rt_err(vm, "attempt to perform 'n//0'")) }
+        if y == -1 { return Ok(value.Int(0 -% x)) }
+        q = x / y
+        if x % y != 0 && ((x < 0) != (y < 0)) { q -= 1 }
+        return Ok(value.Int(q))
+    }
+    if op == ast.OP_MOD {
+        if y == 0 { return Err(rt_err(vm, "attempt to perform 'n%%0'")) }
+        if y == -1 { return Ok(value.Int(0)) }
+        r = x % y
+        if r != 0 && ((r < 0) != (y < 0)) { r += y }
+        return Ok(value.Int(r))
+    }
+    Ok(flt_arith(op, to_float(x), to_float(y)))
+}
+
+fn flt_arith(op: int, x: float, y: float) -> value.Value {
+    if op == ast.OP_ADD { return value.Num(x + y) }
+    if op == ast.OP_SUB { return value.Num(x - y) }
+    if op == ast.OP_MUL { return value.Num(x * y) }
+    if op == ast.OP_DIV { return value.Num(x / y) }
+    if op == ast.OP_POW { return value.Num(float_pow(x, y)) }
+    if op == ast.OP_IDIV { return value.Num(floor(x / y)) }
+    value.Num(lua_fmod(x, y))
+}
+
+// 两个数（Int 或 Num）的算术
+fn num_arith(vm: Vm, op: int, a: value.Value, b: value.Value) -> value.Value!value.Value {
+    match a {
+        value.Int(x) => match b {
+            value.Int(y) => return int_arith(vm, op, x, y)
+            _ => {}
+        }
+        _ => {}
+    }
+    Ok(flt_arith(op, flt(a), flt(b)))
+}
+
+// 位运算的操作数：整数，或者能精确表示成整数的浮点数（字符串先转成数）
+fn bit_operand(vm: Vm, v: value.Value) -> int?!value.Value {
+    n = to_number(v)
+    match n {
+        value.Int(i) => Ok(Some(i))
+        value.Num(f) => match value.float_to_int(f) {
+            Some(i) => Ok(Some(i))
+            None => Err(rt_err(vm, "number has no integer representation"))
+        }
+        _ => Ok(None)
+    }
+}
+
+fn shift_left(x: int, n: int) -> int {
+    if n <= -64 || n >= 64 { return 0 }
+    if n >= 0 { x << n } else { x >>> (0 - n) }
+}
+
+fn bit_arith(op: int, x: int, y: int) -> int {
+    if op == ast.OP_BAND { return x & y }
+    if op == ast.OP_BOR { return x | y }
+    if op == ast.OP_BXOR { return x ^ y }
+    if op == ast.OP_SHL { return shift_left(x, y) }
+    if y == -9223372036854775807 - 1 { return 0 }
+    shift_left(x, 0 - y)
+}
+
+fn binary(inout vm: Vm, prog: parse.Prog, op: int, a: value.Value, b: value.Value, ae: ast.Ex, be: ast.Ex) -> value.Value!value.Value {
+    if op <= ast.OP_POW && is_num(a) && is_num(b) { return num_arith(vm, op, a, b) }
+    if op == ast.OP_EQ || op == ast.OP_NE {
+        r = equals(&vm, prog, a, b)?
+        return Ok(value.Bool(r == (op == ast.OP_EQ)))
+    }
+    if op == ast.OP_LT { return Ok(value.Bool(less(&vm, prog, a, b, false)?)) }
+    if op == ast.OP_LE { return Ok(value.Bool(less(&vm, prog, a, b, true)?)) }
+    if op == ast.OP_GT { return Ok(value.Bool(less(&vm, prog, b, a, false)?)) }
+    if op == ast.OP_GE { return Ok(value.Bool(less(&vm, prog, b, a, true)?)) }
+    if op == ast.OP_CONCAT { return concat(&vm, prog, a, b, ae, be) }
+    if op >= ast.OP_BAND && op <= ast.OP_SHR {
+        x = bit_operand(vm, a)?
+        y = bit_operand(vm, b)?
+        match (x, y) {
+            (Some(i), Some(j)) => return Ok(value.Int(bit_arith(op, i, j)))
+            _ => {}
+        }
+        mm = try_mm(&vm, prog, mm_name(op), a, b)?
+        match take mm {
+            Some(v) => return Ok(v)
+            None => {}
+        }
+        bad_b = is_num(to_number(a))
+        bad = if bad_b { b.copy() } else { a.copy() }
+        d = if bad_b { describe(be) } else { describe(ae) }
+        return Err(rt_err(vm, "attempt to perform bitwise operation on a #{tname(bad)} value#{d}"))
+    }
+    // 算术：字符串先转成数
+    na = to_number(a)
+    nb = to_number(b)
+    if is_num(na) && is_num(nb) { return num_arith(vm, op, na, nb) }
+    mm = try_mm(&vm, prog, mm_name(op), a, b)?
+    match take mm {
+        Some(v) => return Ok(v)
+        None => {}
+    }
+    bad_b = is_num(na)
+    bad = if bad_b { b.copy() } else { a.copy() }
+    d = if bad_b { describe(be) } else { describe(ae) }
+    Err(rt_err(vm, "attempt to perform arithmetic on a #{tname(bad)} value#{d}"))
+}
+
+pub fn raw_equal(a: value.Value, b: value.Value) -> bool {
+    match a {
+        value.Nil => value.is_nil(b)
+        value.Bool(x) => match b {
+            value.Bool(y) => x == y
+            _ => false
+        }
+        value.Int(x) => match b {
+            value.Int(y) => x == y
+            value.Num(g) => to_float(x) == g
+            _ => false
+        }
+        value.Num(f) => match b {
+            value.Int(y) => f == to_float(y)
+            value.Num(g) => f == g
+            _ => false
+        }
+        value.Str(s) => match b {
+            value.Str(t) => s == t
+            _ => false
+        }
+        value.Tab(i) => match b {
+            value.Tab(j) => i == j
+            _ => false
+        }
+        value.Func(i) => match b {
+            value.Func(j) => i == j
+            _ => false
+        }
+        value.Native(i) => match b {
+            value.Native(j) => i == j
+            _ => false
+        }
+        value.Cel(_) => false
+    }
+}
+
+fn both_tables(a: value.Value, b: value.Value) -> bool {
+    match a {
+        value.Tab(_) => match b {
+            value.Tab(_) => true
+            _ => false
+        }
+        _ => false
+    }
+}
+
+pub fn equals(inout vm: Vm, prog: parse.Prog, a: value.Value, b: value.Value) -> bool!value.Value {
+    if raw_equal(a, b) { return Ok(true) }
+    if !both_tables(a, b) { return Ok(false) }
+    r = try_mm(&vm, prog, "__eq", a, b)?
+    match r {
+        Some(v) => Ok(value.truthy(v))
+        None => Ok(false)
+    }
+}
+
+// a < b（or_eq 时是 a <= b）
+pub fn less(inout vm: Vm, prog: parse.Prog, a: value.Value, b: value.Value, or_eq: bool) -> bool!value.Value {
+    match a {
+        value.Int(x) => match b {
+            value.Int(y) => return Ok(if or_eq { x <= y } else { x < y })
+            _ => {}
+        }
+        value.Str(s) => match b {
+            value.Str(t) => return Ok(if or_eq { s <= t } else { s < t })
+            _ => {}
+        }
+        _ => {}
+    }
+    if is_num(a) && is_num(b) {
+        x = flt(a)
+        y = flt(b)
+        return Ok(if or_eq { x <= y } else { x < y })
+    }
+    ev = if or_eq { "__le" } else { "__lt" }
+    r = try_mm(&vm, prog, ev, a, b)?
+    match r {
+        Some(v) => return Ok(value.truthy(v))
+        None => {}
+    }
+    ta = tname(a)
+    tb = tname(b)
+    if ta == tb { return Err(rt_err(vm, "attempt to compare two #{ta} values")) }
+    Err(rt_err(vm, "attempt to compare #{ta} with #{tb}"))
+}
+
+// 字符串或数字转成 .. 用的字符串
+fn concat_part(v: value.Value) -> str? {
+    match v {
+        value.Str(s) => Some(s)
+        _ => value.num_to_str(v)
+    }
+}
+
+fn concat(inout vm: Vm, prog: parse.Prog, a: value.Value, b: value.Value, ae: ast.Ex, be: ast.Ex) -> value.Value!value.Value {
+    x = concat_part(a)
+    y = concat_part(b)
+    match (x, y) {
+        (Some(s), Some(t)) => return Ok(value.Str(s + t))
+        _ => {}
+    }
+    mm = try_mm(&vm, prog, "__concat", a, b)?
+    match take mm {
+        Some(v) => return Ok(v)
+        None => {}
+    }
+    bad_b = match concat_part(a) {
+        Some(_) => true
+        None => false
+    }
+    bad = if bad_b { b.copy() } else { a.copy() }
+    d = if bad_b { describe(be) } else { describe(ae) }
+    Err(rt_err(vm, "attempt to concatenate a #{tname(bad)} value#{d}"))
+}
+
+fn unary(inout vm: Vm, prog: parse.Prog, op: int, a: value.Value, ae: ast.Ex) -> value.Value!value.Value {
+    if op == ast.OP_NOT { return Ok(value.Bool(!value.truthy(a))) }
+    if op == ast.OP_LEN {
+        match a {
+            value.Str(s) => return Ok(value.Int(len(s)))
+            value.Tab(id) => {
+                h = metafield(vm, a, "__len")
+                if value.is_nil(h) { return Ok(value.Int(value.length(vm.tabs[id]))) }
+                rs = call(&vm, prog, h, [a.copy()])?
+                return Ok(first(rs))
+            }
+            _ => return Err(rt_err(vm, "attempt to get length of a #{tname(a)} value#{describe(ae)}"))
+        }
+    }
+    if op == ast.OP_NEG {
+        n = to_number(a)
+        match n {
+            value.Int(i) => return Ok(value.Int(0 -% i))
+            value.Num(f) => return Ok(value.Num(f * (0.0 - 1.0)))
+            _ => {}
+        }
+        mm = try_mm(&vm, prog, "__unm", a, a)?
+        match take mm {
+            Some(v) => return Ok(v)
+            None => {}
+        }
+        return Err(rt_err(vm, "attempt to perform arithmetic on a #{tname(a)} value#{describe(ae)}"))
+    }
+    // ~x
+    x = bit_operand(vm, a)?
+    match x {
+        Some(i) => return Ok(value.Int(!i))
+        None => {}
+    }
+    mm = try_mm(&vm, prog, "__bnot", a, a)?
+    match take mm {
+        Some(v) => return Ok(v)
+        None => {}
+    }
+    Err(rt_err(vm, "attempt to perform bitwise operation on a #{tname(a)} value#{describe(ae)}"))
+}
+
+// ---------- 语句 ----------
+
+fn exec_block(inout vm: Vm, prog: parse.Prog, inout fr: Frame, body: [ast.St]) -> int!value.Value {
+    for s in body {
+        sig = exec(&vm, prog, &fr, s)?
+        if sig != SIG_NORMAL { return Ok(sig) }
+    }
+    Ok(SIG_NORMAL)
+}
+
+fn assign(inout vm: Vm, prog: parse.Prog, inout fr: Frame, target: ast.Ex, take v: value.Value) -> ()!value.Value {
+    match target {
+        ast.ELocal(s, _) => set_slot(&vm, fr, s, v)
+        ast.EUp(i, _) => {
+            c = vm.clos[fr.clo].ups[i]
+            vm.cells[c] = v
+        }
+        ast.EGlobal(nm) => {
+            g = vm.globals
+            value.raw_set(&vm.tabs[g], value.Str(nm), v)
+        }
+        ast.EIndex(oe, ke, ln) => {
+            o = eval(&vm, prog, &fr, oe)?
+            k = eval(&vm, prog, &fr, ke)?
+            // 数组部分里已经有值的位置、写入的也不是 nil：直接改（键已经存在，不会触发 __newindex）
+            at = match o {
+                value.Tab(id) => match k {
+                    value.Int(n) => if n >= 1 && n <= len(vm.tabs[id].arr) && !value.is_nil(vm.tabs[id].arr[n - 1]) { id } else { -1 }
+                    _ => -1
+                }
+                _ => -1
+            }
+            if at >= 0 && !value.is_nil(v) {
+                i = match k {
+                    value.Int(n) => n - 1
+                    _ => 0
+                }
+                vm.tabs[at].arr[i] = v
+                return Ok()
+            }
+            vm.line = ln
+            if !is_tab(o) { return Err(rt_err(vm, "attempt to index a #{tname(o)} value#{describe(oe)}")) }
+            index_set(&vm, prog, o, k, v)?
+        }
+        _ => panic("llua 内部错误：不能赋值的目标")
+    }
+    Ok()
+}
+
+fn is_tab(v: value.Value) -> bool {
+    match v {
+        value.Tab(_) => true
+        _ => false
+    }
+}
+
+// 两个无符号数比较：a < b
+fn ult(a: int, b: int) -> bool {
+    m = -9223372036854775807 - 1
+    (a ^ m) < (b ^ m)
+}
+
+fn for_num(vm: Vm, v: value.Value, what: str) -> value.Value!value.Value {
+    if is_num(v) { return Ok(v.copy()) }
+    Err(rt_err(vm, "'for' #{what} must be a number"))
+}
+
+// 整数循环的上限：浮点数的上限按步长的方向取整，超出 int 范围时截到两端。第二项为 false 表示一次都不执行
+fn int_limit(lim: value.Value, init: int, step: int) -> (int, bool) {
+    l = 0
+    match lim {
+        value.Int(n) => { l = n }
+        value.Num(f) => {
+            g = if step > 0 { floor(f) } else { ceil(f) }
+            if g != g { return (0, false) }
+            if g >= 9.2233720368547758e18 {
+                if step < 0 { return (0, false) }
+                l = 9223372036854775807
+            } else if g < -9.2233720368547758e18 {
+                if step > 0 { return (0, false) }
+                l = -9223372036854775807 - 1
+            } else {
+                l = to_int(g)
+            }
+        }
+        _ => {}
+    }
+    if step > 0 && init > l { return (l, false) }
+    if step < 0 && init < l { return (l, false) }
+    (l, true)
+}
+
+fn exec_num_for(inout vm: Vm, prog: parse.Prog, inout fr: Frame, slot: int, a: value.Value, b: value.Value, c: value.Value,
+    body: [ast.St]) -> int!value.Value {
+        i0: int? = match a {
+            value.Int(n) => Some(n)
+            _ => None
+        }
+        st0: int? = match c {
+            value.Int(n) => Some(n)
+            _ => None
+        }
+        match (i0, st0) {
+            (Some(i), Some(step)) => {
+                if step == 0 { return Err(rt_err(vm, "'for' step is zero")) }
+                lim, run = int_limit(b, i, step)
+                if !run { return Ok(SIG_NORMAL) }
+                // 剩下的距离按无符号数算，不会溢出
+                abs_step = if step > 0 { step } else { 0 -% step }
+                k = i
+                for true {
+                    decl(&vm, prog, fr, slot, value.Int(k))
+                    sig = exec_block(&vm, prog, &fr, body)?
+                    if sig == SIG_BREAK { break }
+                    if sig == SIG_RETURN { return Ok(sig) }
+                    d = if step > 0 { lim -% k } else { k -% lim }
+                    if ult(d, abs_step) { break }
+                    k = k +% step
+                }
+                return Ok(SIG_NORMAL)
+            }
+            _ => {}
+        }
+        x = flt(a)
+        l = flt(b)
+        s = flt(c)
+        if s == 0.0 { return Err(rt_err(vm, "'for' step is zero")) }
+        for (s > 0.0 && x <= l) || (s < 0.0 && x >= l) {
+            decl(&vm, prog, fr, slot, value.Num(x))
+            sig = exec_block(&vm, prog, &fr, body)?
+            if sig == SIG_BREAK { break }
+            if sig == SIG_RETURN { return Ok(sig) }
+            x += s
+        }
+        Ok(SIG_NORMAL)
+    }
+
+fn exec(inout vm: Vm, prog: parse.Prog, inout fr: Frame, s: ast.St) -> int!value.Value {
+    match s {
+        ast.SLocal(slots, vals, ln) => {
+            vm.line = ln
+            if len(slots) == 1 && len(vals) == 1 {
+                v = eval(&vm, prog, &fr, vals[0])?
+                decl(&vm, prog, fr, slots[0], v)
+                return Ok(SIG_NORMAL)
+            }
+            vs = eval_n(&vm, prog, &fr, vals, len(slots))?
+            for i in 0..len(slots) { decl(&vm, prog, fr, slots[i], replace(&vs[i], value.Nil)) }
+            Ok(SIG_NORMAL)
+        }
+        ast.SLocalFn(slot, pid) => {
+            // 先声明再造闭包，函数里才能递归地引用自己
+            decl(&vm, prog, fr, slot, value.Nil)
+            f = make_closure(&vm, prog, fr, pid)
+            set_slot(&vm, fr, slot, f)
+            Ok(SIG_NORMAL)
+        }
+        ast.SAssign(targets, vals, ln) => {
+            vm.line = ln
+            if len(targets) == 1 && len(vals) == 1 {
+                v = eval(&vm, prog, &fr, vals[0])?
+                assign(&vm, prog, &fr, targets[0], v)?
+                return Ok(SIG_NORMAL)
+            }
+            vs = eval_n(&vm, prog, &fr, vals, len(targets))?
+            for i in 0..len(targets) { assign(&vm, prog, &fr, targets[i], replace(&vs[i], value.Nil))? }
+            Ok(SIG_NORMAL)
+        }
+        ast.SCall(e, ln) => {
+            vm.line = ln
+            base = len(vm.stack)
+            _ = call_push(&vm, prog, &fr, e)?
+            truncate(&vm, base)
+            Ok(SIG_NORMAL)
+        }
+        ast.SDo(body) => exec_block(&vm, prog, &fr, body)
+        ast.SWhile(cond, body) => {
+            for true {
+                c = eval(&vm, prog, &fr, cond)?
+                if !value.truthy(c) { break }
+                sig = exec_block(&vm, prog, &fr, body)?
+                if sig == SIG_BREAK { break }
+                if sig == SIG_RETURN { return Ok(sig) }
+            }
+            Ok(SIG_NORMAL)
+        }
+        ast.SRepeat(body, cond) => {
+            for true {
+                sig = exec_block(&vm, prog, &fr, body)?
+                if sig == SIG_BREAK { break }
+                if sig == SIG_RETURN { return Ok(sig) }
+                c = eval(&vm, prog, &fr, cond)?
+                if value.truthy(c) { break }
+            }
+            Ok(SIG_NORMAL)
+        }
+        ast.SIf(conds, blocks, els) => {
+            for i in 0..len(conds) {
+                c = eval(&vm, prog, &fr, conds[i])?
+                if value.truthy(c) { return exec_block(&vm, prog, &fr, blocks[i]) }
+            }
+            exec_block(&vm, prog, &fr, els)
+        }
+        ast.SNumFor(slot, ae, be, ce, body, ln) => {
+            vm.line = ln
+            a0 = eval(&vm, prog, &fr, ae)?
+            b0 = eval(&vm, prog, &fr, be)?
+            c0 = eval(&vm, prog, &fr, ce)?
+            a = for_num(vm, a0, "initial value")?
+            b = for_num(vm, b0, "limit")?
+            c = for_num(vm, c0, "step")?
+            exec_num_for(&vm, prog, &fr, slot, a, b, c, body)
+        }
+        ast.SGenFor(slots, exprs, body, ln) => {
+            vm.line = ln
+            vs = eval_n(&vm, prog, &fr, exprs, 3)?
+            f = replace(&vs[0], value.Nil)
+            state = replace(&vs[1], value.Nil)
+            ctl = replace(&vs[2], value.Nil)
+            // pairs 的常见情况（迭代函数是 next、状态是表）：直接在表上找下一对，不经过函数调用
+            is_next = match f {
+                value.Native(id) => id == N_NEXT
+                _ => false
+            }
+            tab = match state {
+                value.Tab(id) => if is_next { id } else { -1 }
+                _ => -1
+            }
+            for true {
+                vm.line = ln
+                if tab >= 0 {
+                    r = value.next_pair(vm.tabs[tab], ctl)
+                    found = match take r {
+                        Ok(x) => x
+                        Err(e) => return Err(rt_err(vm, e))
+                    }
+                    match take found {
+                        Some(kv) => {
+                            k, v = kv
+                            ctl = k.copy()
+                            decl(&vm, prog, fr, slots[0], k)
+                            if len(slots) >= 2 { decl(&vm, prog, fr, slots[1], v) }
+                            for i in 2..len(slots) { decl(&vm, prog, fr, slots[i], value.Nil) }
+                        }
+                        None => break
+                    }
+                } else {
+                    base = len(vm.stack)
+                    vm.stack.push(state.copy())
+                    vm.stack.push(ctl.copy())
+                    _ = call_at(&vm, prog, f, base)?
+                    for len(vm.stack) < base + len(slots) { vm.stack.push(value.Nil) }
+                    if value.is_nil(vm.stack[base]) {
+                        truncate(&vm, base)
+                        break
+                    }
+                    ctl = vm.stack[base].copy()
+                    for i in 0..len(slots) {
+                        v = replace(&vm.stack[base + i], value.Nil)
+                        decl(&vm, prog, fr, slots[i], v)
+                    }
+                    truncate(&vm, base)
+                }
+                sig = exec_block(&vm, prog, &fr, body)?
+                if sig == SIG_BREAK { break }
+                if sig == SIG_RETURN { return Ok(sig) }
+            }
+            Ok(SIG_NORMAL)
+        }
+        ast.SReturn(vals, ln) => {
+            vm.line = ln
+            start = len(vm.stack)
+            n = push_list(&vm, prog, &fr, vals)?
+            fr.ret_at = start
+            fr.nret = n
+            Ok(SIG_RETURN)
+        }
+        ast.SBreak => Ok(SIG_BREAK)
+    }
+}
+
+// ---------- 内置函数 ----------
+
+const N_PRINT = 0
+const N_TYPE = 1
+const N_TOSTRING = 2
+const N_TONUMBER = 3
+const N_PAIRS = 4
+const N_IPAIRS = 5
+const N_NEXT = 6
+const N_SELECT = 7
+const N_ERROR = 8
+const N_PCALL = 9
+const N_ASSERT = 10
+const N_RAWGET = 11
+const N_RAWSET = 12
+const N_RAWEQUAL = 13
+const N_RAWLEN = 14
+const N_SETMT = 15
+const N_GETMT = 16
+const N_IPAIRS_ITER = 17
+const N_XPCALL = 18
+
+const N_S_LEN = 20
+const N_S_SUB = 21
+const N_S_UPPER = 22
+const N_S_LOWER = 23
+const N_S_REP = 24
+const N_S_REVERSE = 25
+const N_S_BYTE = 26
+const N_S_CHAR = 27
+const N_S_FORMAT = 28
+const N_S_FIND = 29
+
+const N_T_INSERT = 40
+const N_T_REMOVE = 41
+const N_T_CONCAT = 42
+const N_T_UNPACK = 43
+const N_T_SORT = 44
+const N_T_PACK = 45
+
+const N_M_FLOOR = 60
+const N_M_CEIL = 61
+const N_M_ABS = 62
+const N_M_SQRT = 63
+const N_M_MAX = 64
+const N_M_MIN = 65
+const N_M_FMOD = 66
+const N_M_MODF = 67
+const N_M_TOINT = 68
+const N_M_TYPE = 69
+const N_M_SIN = 70
+const N_M_COS = 71
+const N_M_TAN = 72
+const N_M_EXP = 73
+const N_M_LOG = 74
+const N_M_RANDOM = 75
+const N_M_SEED = 76
+const N_M_ULT = 77
+const N_M_ASIN = 78
+const N_M_ACOS = 79
+const N_M_ATAN = 80
+
+const N_OS_TIME = 90
+const N_OS_CLOCK = 91
+const N_OS_EXIT = 92
+const N_IO_WRITE = 95
+
+fn new_tab(inout vm: Vm) -> int {
+    vm.tabs.push(value.new_table())
+    len(vm.tabs) - 1
+}
+
+fn reg(inout vm: Vm, t: int, name: str, id: int) { value.raw_set(&vm.tabs[t], value.Str(name), value.Native(id)) }
+
+fn put(inout vm: Vm, t: int, name: str, take v: value.Value) { value.raw_set(&vm.tabs[t], value.Str(name), v) }
+
+pub fn new_vm(chunk: str) -> Vm {
+    vm = Vm(tabs: [], clos: [], cells: [], stack: [], globals: 0, strlib: 0, line: 0, depth: 0, from_lua: false, out: "", chunk: chunk)
+    g = new_tab(&vm)
+    vm.globals = g
+    put(&vm, g, "_G", value.Tab(g))
+    put(&vm, g, "_VERSION", value.Str("Lua 5.4"))
+    names = ["print", "type", "tostring", "tonumber", "pairs", "ipairs", "next", "select", "error", "pcall", "assert", "rawget",
+        "rawset", "rawequal", "rawlen", "setmetatable", "getmetatable"]
+    for i in 0..len(names) { reg(&vm, g, names[i], i) }
+    reg(&vm, g, "xpcall", N_XPCALL)
+
+    s = new_tab(&vm)
+    vm.strlib = s
+    put(&vm, g, "string", value.Tab(s))
+    snames = ["len", "sub", "upper", "lower", "rep", "reverse", "byte", "char", "format", "find"]
+    for i in 0..len(snames) { reg(&vm, s, snames[i], N_S_LEN + i) }
+
+    t = new_tab(&vm)
+    put(&vm, g, "table", value.Tab(t))
+    tnames = ["insert", "remove", "concat", "unpack", "sort", "pack"]
+    for i in 0..len(tnames) { reg(&vm, t, tnames[i], N_T_INSERT + i) }
+
+    m = new_tab(&vm)
+    put(&vm, g, "math", value.Tab(m))
+    mnames = ["floor", "ceil", "abs", "sqrt", "max", "min", "fmod", "modf", "tointeger", "type", "sin", "cos", "tan", "exp", "log",
+        "random", "randomseed", "ult", "asin", "acos", "atan"]
+    for i in 0..len(mnames) { reg(&vm, m, mnames[i], N_M_FLOOR + i) }
+    put(&vm, m, "pi", value.Num(3.141592653589793))
+    put(&vm, m, "huge", value.Num(1.0 / 0.0))
+    put(&vm, m, "maxinteger", value.Int(9223372036854775807))
+    put(&vm, m, "mininteger", value.Int(-9223372036854775807 - 1))
+
+    o = new_tab(&vm)
+    put(&vm, g, "os", value.Tab(o))
+    reg(&vm, o, "time", N_OS_TIME)
+    reg(&vm, o, "clock", N_OS_CLOCK)
+    reg(&vm, o, "exit", N_OS_EXIT)
+
+    io_t = new_tab(&vm)
+    put(&vm, g, "io", value.Tab(io_t))
+    reg(&vm, io_t, "write", N_IO_WRITE)
+    vm
+}
+
+// ---------- 参数 ----------
+
+fn arg(args: [value.Value], i: int) -> value.Value {
+    if i < len(args) { args[i].copy() } else { value.Nil }
+}
+
+fn got(args: [value.Value], i: int) -> str {
+    if i < len(args) { tname(args[i]) } else { "no value" }
+}
+
+fn bad_arg(vm: Vm, i: int, fname: str, msg: str) -> value.Value { rt_err(vm, "bad argument ##{i + 1} to '#{fname}' (#{msg})") }
+
+fn check_any(vm: Vm, args: [value.Value], i: int, fname: str) -> ()!value.Value {
+    if i >= len(args) { return Err(bad_arg(vm, i, fname, "value expected")) }
+}
+
+fn check_str(vm: Vm, args: [value.Value], i: int, fname: str) -> str!value.Value {
+    if i < len(args) {
+        match args[i] {
+            value.Str(s) => return Ok(s)
+            value.Int(_) | value.Num(_) => return Ok(value.num_to_str(args[i]) ?? "")
+            _ => {}
+        }
+    }
+    Err(bad_arg(vm, i, fname, "string expected, got #{got(args, i)}"))
+}
+
+fn check_int(vm: Vm, args: [value.Value], i: int, fname: str) -> int!value.Value {
+    v = if i < len(args) { to_number(args[i]) } else { value.Nil }
+    match v {
+        value.Int(n) => Ok(n)
+        value.Num(f) => match value.float_to_int(f) {
+            Some(n) => Ok(n)
+            None => Err(bad_arg(vm, i, fname, "number has no integer representation"))
+        }
+        _ => Err(bad_arg(vm, i, fname, "number expected, got #{got(args, i)}"))
+    }
+}
+
+fn opt_int(vm: Vm, args: [value.Value], i: int, fname: str, def: int) -> int!value.Value {
+    if i >= len(args) || value.is_nil(args[i]) { return Ok(def) }
+    check_int(vm, args, i, fname)
+}
+
+fn check_num(vm: Vm, args: [value.Value], i: int, fname: str) -> value.Value!value.Value {
+    v = if i < len(args) { to_number(args[i]) } else { value.Nil }
+    if is_num(v) { return Ok(v) }
+    Err(bad_arg(vm, i, fname, "number expected, got #{got(args, i)}"))
+}
+
+fn check_flt(vm: Vm, args: [value.Value], i: int, fname: str) -> float!value.Value {
+    v = check_num(vm, args, i, fname)?
+    Ok(flt(v))
+}
+
+fn check_tab(vm: Vm, args: [value.Value], i: int, fname: str) -> int!value.Value {
+    if i < len(args) {
+        match args[i] {
+            value.Tab(id) => return Ok(id)
+            _ => {}
+        }
+    }
+    Err(bad_arg(vm, i, fname, "table expected, got #{got(args, i)}"))
+}
+
+// ---------- tostring ----------
+
+fn hex(n: int) -> str {
+    digits = "0123456789abcdef"
+    s = ""
+    k = n
+    for _i in 0..8 {
+        d = k & 15
+        s = slice(digits, d, d + 1) + s
+        k = k >>> 4
+    }
+    s
+}
+
+pub fn tostring(inout vm: Vm, prog: parse.Prog, v: value.Value) -> str!value.Value {
+    h = metafield(vm, v, "__tostring")
+    if !value.is_nil(h) {
+        rs = call(&vm, prog, h, [v.copy()])?
+        r = first(rs)
+        match r {
+            value.Str(s) => return Ok(s)
+            _ => return Err(rt_err(vm, "'__tostring' must return a string"))
+        }
+    }
+    match v {
+        value.Nil => Ok("nil")
+        value.Bool(b) => Ok(if b { "true" } else { "false" })
+        value.Int(n) => Ok("#{n}")
+        value.Num(f) => Ok(value.num_str(f))
+        value.Str(s) => Ok(s)
+        value.Tab(id) => Ok("table: 0x" + hex(0x10000000 + id * 64))
+        value.Func(id) => Ok("function: 0x" + hex(0x20000000 + id * 64))
+        value.Native(id) => Ok("function: builtin: 0x" + hex(0x30000000 + id * 64))
+        value.Cel(_) => Ok("cell")
+    }
+}
+
+// ---------- 分派 ----------
+
+fn call_native(inout vm: Vm, prog: parse.Prog, id: int, take args: [value.Value]) -> [value.Value]!value.Value {
+    by_lua = vm.from_lua
+    vm.from_lua = false
+    if id == N_ERROR { return lua_error(&vm, prog, args, by_lua) }
+    if id < 20 { return base_fn(&vm, prog, id, args) }
+    if id < 40 { return string_fn(&vm, prog, id, args) }
+    if id < 60 { return table_fn(&vm, prog, id, args) }
+    if id < 90 { return math_fn(&vm, prog, id, args) }
+    other_fn(&vm, prog, id, args)
+}
+
+fn base_fn(inout vm: Vm, prog: parse.Prog, id: int, take args: [value.Value]) -> [value.Value]!value.Value {
+    if id == N_PRINT {
+        line = ""
+        for i in 0..len(args) {
+            if i > 0 { line += "\t" }
+            s = tostring(&vm, prog, args[i])?
+            line += s
+        }
+        write_out(&vm, line + "\n")
+        return Ok([])
+    }
+    if id == N_TYPE {
+        check_any(vm, args, 0, "type")?
+        return Ok([value.Str(tname(args[0]))])
+    }
+    if id == N_TOSTRING {
+        check_any(vm, args, 0, "tostring")?
+        s = tostring(&vm, prog, args[0])?
+        return Ok([value.Str(s)])
+    }
+    if id == N_TONUMBER {
+        if len(args) >= 2 && !value.is_nil(args[1]) { return tonumber_base(vm, args) }
+        check_any(vm, args, 0, "tonumber")?
+        return Ok([to_number(args[0])])
+    }
+    if id == N_PAIRS {
+        check_any(vm, args, 0, "pairs")?
+        h = metafield(vm, args[0], "__pairs")
+        if !value.is_nil(h) {
+            rs = call(&vm, prog, h, [args[0].copy()])?
+            for len(rs) < 3 { rs.push(value.Nil) }
+            return Ok([replace(&rs[0], value.Nil), replace(&rs[1], value.Nil), replace(&rs[2], value.Nil)])
+        }
+        _ = check_tab(vm, args, 0, "pairs")?
+        return Ok([value.Native(N_NEXT), args[0].copy(), value.Nil])
+    }
+    if id == N_IPAIRS {
+        check_any(vm, args, 0, "ipairs")?
+        return Ok([value.Native(N_IPAIRS_ITER), args[0].copy(), value.Int(0)])
+    }
+    if id == N_IPAIRS_ITER {
+        i = check_int(vm, args, 1, "ipairs")? + 1
+        v = index_get(&vm, prog, arg(args, 0), value.Int(i))?
+        if value.is_nil(v) { return Ok([value.Nil]) }
+        return Ok([value.Int(i), v])
+    }
+    if id == N_NEXT {
+        t = check_tab(vm, args, 0, "next")?
+        r = value.next_pair(vm.tabs[t], arg(args, 1))
+        match take r {
+            Ok(found) => match take found {
+                Some(kv) => {
+                    k, v = kv
+                    return Ok([k, v])
+                }
+                None => return Ok([value.Nil])
+            }
+            Err(e) => return Err(rt_err(vm, e))
+        }
+    }
+    if id == N_SELECT {
+        n = len(args) - 1
+        is_count = match arg(args, 0) {
+            value.Str(s) => s == "#"
+            _ => false
+        }
+        if is_count { return Ok([value.Int(n)]) }
+        k = check_int(vm, args, 0, "select")?
+        if k < 0 { k = n + k + 1 }
+        if k < 1 { return Err(bad_arg(vm, 0, "select", "index out of range")) }
+        out: [value.Value] = []
+        for j in k..n + 1 { out.push(replace(&args[j], value.Nil)) }
+        return Ok(out)
+    }
+    if id == N_PCALL || id == N_XPCALL {
+        fname = if id == N_PCALL { "pcall" } else { "xpcall" }
+        check_any(vm, args, 0, fname)?
+        f = replace(&args[0], value.Nil)
+        skip = if id == N_PCALL { 1 } else { 2 }
+        handler = arg(args, 1)
+        rest: [value.Value] = []
+        for j in skip..len(args) { rest.push(replace(&args[j], value.Nil)) }
+        d = vm.depth
+        top = len(vm.stack)
+        ln = vm.line
+        r = call(&vm, prog, f, rest)
+        match take r {
+            Ok(rs) => {
+                out = [value.Bool(true)]
+                for x in rs { out.push(x.copy()) }
+                return Ok(out)
+            }
+            Err(e) => {
+                vm.depth = d
+                truncate(&vm, top)
+                vm.line = ln
+                if id == N_XPCALL {
+                    hs = call(&vm, prog, handler, [e])?
+                    return Ok([value.Bool(false), first(hs)])
+                }
+                return Ok([value.Bool(false), e])
+            }
+        }
+    }
+    if id == N_ASSERT {
+        check_any(vm, args, 0, "assert")?
+        if value.truthy(args[0]) { return Ok(args) }
+        if len(args) >= 2 { return Err(replace(&args[1], value.Nil)) }
+        return Err(value.Str("assertion failed!"))
+    }
+    if id == N_RAWGET {
+        t = check_tab(vm, args, 0, "rawget")?
+        return Ok([value.raw_get(vm.tabs[t], arg(args, 1))])
+    }
+    if id == N_RAWSET {
+        t = check_tab(vm, args, 0, "rawset")?
+        raw_set_checked(&vm, t, arg(args, 1), arg(args, 2))?
+        return Ok([value.Tab(t)])
+    }
+    if id == N_RAWEQUAL { return Ok([value.Bool(raw_equal(arg(args, 0), arg(args, 1)))]) }
+    if id == N_RAWLEN {
+        match arg(args, 0) {
+            value.Tab(t) => return Ok([value.Int(value.length(vm.tabs[t]))])
+            value.Str(s) => return Ok([value.Int(len(s))])
+            _ => return Err(bad_arg(vm, 0, "rawlen", "table or string expected"))
+        }
+    }
+    if id == N_SETMT {
+        t = check_tab(vm, args, 0, "setmetatable")?
+        mt = match arg(args, 1) {
+            value.Tab(m) => m
+            value.Nil => -1
+            _ => -2
+        }
+        if mt == -2 { return Err(bad_arg(vm, 1, "setmetatable", "nil or table expected")) }
+        if !value.is_nil(metafield(vm, value.Tab(t), "__metatable")) { return Err(rt_err(vm, "cannot change a protected metatable")) }
+        vm.tabs[t].meta = mt
+        return Ok([value.Tab(t)])
+    }
+    // getmetatable
+    v = arg(args, 0)
+    m = match v {
+        value.Tab(t) => vm.tabs[t].meta
+        _ => -1
+    }
+    if m < 0 { return Ok([value.Nil]) }
+    protected = metafield(vm, v, "__metatable")
+    if !value.is_nil(protected) { return Ok([protected]) }
+    Ok([value.Tab(m)])
+}
+
+// error(v, level)：字符串加上位置，但只在 error 是由 Lua 代码直接调用的时候（pcall(error, "x") 不加，和 Lua 一样）
+fn lua_error(inout vm: Vm, prog: parse.Prog, args: [value.Value], by_lua: bool) -> [value.Value]!value.Value {
+    level = opt_int(vm, args, 1, "error", 1)?
+    v = arg(args, 0)
+    is_str = match v {
+        value.Str(_) => true
+        _ => false
+    }
+    if is_str && level > 0 && by_lua {
+        s = tostring(&vm, prog, v)?
+        return Err(rt_err(vm, s))
+    }
+    Err(v)
+}
+
+fn tonumber_base(vm: Vm, args: [value.Value]) -> [value.Value]!value.Value {
+    base = check_int(vm, args, 1, "tonumber")?
+    if base < 2 || base > 36 { return Err(bad_arg(vm, 1, "tonumber", "base out of range")) }
+    s = match args[0] {
+        value.Str(x) => x
+        _ => return Err(bad_arg(vm, 0, "tonumber", "string expected, got #{got(args, 0)}"))
+    }
+    a = 0
+    b = len(s)
+    for a < b && (byte_at(s, a) == ' ' || byte_at(s, a) == '\t' || byte_at(s, a) == '\n') { a += 1 }
+    for b > a && (byte_at(s, b - 1) == ' ' || byte_at(s, b - 1) == '\t' || byte_at(s, b - 1) == '\n') { b -= 1 }
+    neg = a < b && byte_at(s, a) == '-'
+    if neg { a += 1 }
+    if a == b { return Ok([value.Nil]) }
+    n = 0
+    for i in a..b {
+        c = byte_at(s, i)
+        d = if c >= '0' && c <= '9' {
+            c - '0'
+        } else if c >= 'a' && c <= 'z' {
+            c - 'a' + 10
+        } else if c >= 'A' && c <= 'Z' {
+            c - 'A' + 10
+        } else {
+            99
+        }
+        if d >= base { return Ok([value.Nil]) }
+        n = n *% base +% d
+    }
+    Ok([value.Int(if neg { 0 -% n } else { n })])
+}
+
+// ---------- string ----------
+
+// 字符串下标的规范化（Lua 的 posrelat）：负数从末尾数
+fn str_pos(i: int, n: int) -> int {
+    if i >= 0 { return i }
+    if 0 - i > n { return 0 }
+    n + i + 1
+}
+
+fn has_specials(p: str) -> bool {
+    for i in 0..len(p) {
+        c = byte_at(p, i)
+        if c == '^' || c == '$' || c == '*' || c == '+' || c == '?' || c == '.' || c == '(' || c == ')' || c == '[' || c == ']' ||
+            c == '%' || c == '-' {
+            return true
+        }
+    }
+    false
+}
+
+fn string_fn(inout vm: Vm, prog: parse.Prog, id: int, take args: [value.Value]) -> [value.Value]!value.Value {
+    if id == N_S_FORMAT { return format(&vm, prog, args) }
+    if id == N_S_CHAR {
+        out = ""
+        for i in 0..len(args) {
+            c = check_int(vm, args, i, "char")?
+            if c < 0 || c > 255 { return Err(bad_arg(vm, i, "char", "value out of range")) }
+            out += from_byte(c)
+        }
+        return Ok([value.Str(out)])
+    }
+    fname = match id {
+        20 => "len"
+        21 => "sub"
+        22 => "upper"
+        23 => "lower"
+        24 => "rep"
+        25 => "reverse"
+        26 => "byte"
+        _ => "find"
+    }
+    s = check_str(vm, args, 0, fname)?
+    n = len(s)
+    if id == N_S_LEN { return Ok([value.Int(n)]) }
+    if id == N_S_UPPER { return Ok([value.Str(str.to_upper(s))]) }
+    if id == N_S_LOWER { return Ok([value.Str(str.to_lower(s))]) }
+    if id == N_S_REVERSE {
+        out = ""
+        i = n - 1
+        for i >= 0 {
+            out += slice(s, i, i + 1)
+            i -= 1
+        }
+        return Ok([value.Str(out)])
+    }
+    if id == N_S_SUB {
+        i = str_pos(opt_int(vm, args, 1, fname, 1)?, n)
+        j = str_pos(opt_int(vm, args, 2, fname, -1)?, n)
+        if i < 1 { i = 1 }
+        if j > n { j = n }
+        if i > j { return Ok([value.Str("")]) }
+        return Ok([value.Str(slice(s, i - 1, j))])
+    }
+    if id == N_S_BYTE {
+        i = str_pos(opt_int(vm, args, 1, fname, 1)?, n)
+        j = str_pos(opt_int(vm, args, 2, fname, i)?, n)
+        if i < 1 { i = 1 }
+        if j > n { j = n }
+        out: [value.Value] = []
+        for k in i..j + 1 { out.push(value.Int(byte_at(s, k - 1))) }
+        return Ok(out)
+    }
+    if id == N_S_REP {
+        k = check_int(vm, args, 1, fname)?
+        sep = if len(args) >= 3 { check_str(vm, args, 2, fname)? } else { "" }
+        if k <= 0 { return Ok([value.Str("")]) }
+        if len(s) + len(sep) > 0 && k > (1 << 31) / (len(s) + len(sep)) { return Err(rt_err(vm, "resulting string too large")) }
+        parts: [str] = []
+        for _i in 0..k { parts.push(s) }
+        return Ok([value.Str(join(parts, sep))])
+    }
+    // find：只支持普通字符串（模式匹配还没做）
+    p = check_str(vm, args, 1, fname)?
+    init = str_pos(opt_int(vm, args, 2, fname, 1)?, n)
+    if init < 1 { init = 1 }
+    if init > n + 1 { return Ok([value.Nil]) }
+    plain = len(args) >= 4 && value.truthy(args[3])
+    if !plain && has_specials(p) { return Err(rt_err(vm, "llua 还不支持 Lua 的模式匹配（string.find 的第 4 个参数给 true 可以按普通字符串找）")) }
+    rest = slice(s, init - 1, n)
+    match str.find(rest, p) {
+        Some(at) => Ok([value.Int(init + at), value.Int(init + at + len(p) - 1)])
+        None => Ok([value.Nil])
+    }
+}
+
+fn quote_str(s: str) -> str {
+    out = "\""
+    for i in 0..len(s) {
+        c = byte_at(s, i)
+        if c == '"' || c == '\\' {
+            out += "\\" + from_byte(c)
+        } else if c == '\n' {
+            out += "\\\n"
+        } else if c == '\r' {
+            out += "\\r"
+        } else if c == 0 {
+            next_digit = i + 1 < len(s) && byte_at(s, i + 1) >= '0' && byte_at(s, i + 1) <= '9'
+            out += if next_digit { "\\000" } else { "\\0" }
+        } else if c < 32 || c == 127 {
+            out += "\\#{c}"
+        } else {
+            out += from_byte(c)
+        }
+    }
+    out + "\""
+}
+
+// %s 的宽度和精度（%-10.3s 这样的写法）
+fn pad_str(spec: str, s: str) -> str {
+    left = false
+    k = 1
+    for k < len(spec) && (byte_at(spec, k) == '-' || byte_at(spec, k) == ' ' || byte_at(spec, k) == '+' || byte_at(spec, k) == '#' ||
+        byte_at(spec, k) == '0') {
+        if byte_at(spec, k) == '-' { left = true }
+        k += 1
+    }
+    width = 0
+    for k < len(spec) && byte_at(spec, k) >= '0' && byte_at(spec, k) <= '9' {
+        width = width * 10 + byte_at(spec, k) - '0'
+        k += 1
+    }
+    t = s
+    if k < len(spec) && byte_at(spec, k) == '.' {
+        k += 1
+        prec = 0
+        for k < len(spec) && byte_at(spec, k) >= '0' && byte_at(spec, k) <= '9' {
+            prec = prec * 10 + byte_at(spec, k) - '0'
+            k += 1
+        }
+        if prec < len(t) { t = slice(t, 0, prec) }
+    }
+    if len(t) >= width { return t }
+    if left { t + str.repeat(" ", width - len(t)) } else { str.repeat(" ", width - len(t)) + t }
+}
+
+fn format(inout vm: Vm, prog: parse.Prog, take args: [value.Value]) -> [value.Value]!value.Value {
+    f = check_str(vm, args, 0, "format")?
+    out = ""
+    ai = 1
+    i = 0
+    n = len(f)
+    for i < n {
+        c = byte_at(f, i)
+        if c != '%' {
+            start = i
+            for i < n && byte_at(f, i) != '%' { i += 1 }
+            out += slice(f, start, i)
+            continue
+        }
+        if i + 1 < n && byte_at(f, i + 1) == '%' {
+            out += "%"
+            i += 2
+            continue
+        }
+        start = i
+        i += 1
+        for i < n && (byte_at(f, i) == '-' || byte_at(f, i) == '+' || byte_at(f, i) == ' ' || byte_at(f, i) == '#' || byte_at(f, i) == '0') {
+            i += 1
+        }
+        digits = 0
+        for i < n && byte_at(f, i) >= '0' && byte_at(f, i) <= '9' {
+            i += 1
+            digits += 1
+        }
+        if i < n && byte_at(f, i) == '.' {
+            i += 1
+            for i < n && byte_at(f, i) >= '0' && byte_at(f, i) <= '9' {
+                i += 1
+                digits += 1
+            }
+        }
+        if i >= n { return Err(rt_err(vm, "invalid conversion '#{slice(f, start, n)}' to 'format'")) }
+        conv = byte_at(f, i)
+        i += 1
+        spec = slice(f, start, i)
+        if digits > 4 { return Err(rt_err(vm, "invalid conversion '#{spec}' to 'format'")) }
+        if ai >= len(args) { return Err(bad_arg(vm, ai, "format", "no value")) }
+        if conv == 'd' || conv == 'i' {
+            k = check_int(vm, args, ai, "format")?
+            out += value.llua_fmt_int(slice(spec, 0, len(spec) - 1) + "d", k)
+        } else if conv == 'x' || conv == 'X' || conv == 'o' {
+            k = check_int(vm, args, ai, "format")?
+            out += value.llua_fmt_int(spec, k)
+        } else if conv == 'c' {
+            k = check_int(vm, args, ai, "format")?
+            out += from_byte(k & 255)
+        } else if conv == 'e' || conv == 'E' || conv == 'f' || conv == 'F' || conv == 'g' || conv == 'G' || conv == 'a' || conv == 'A' {
+            x = check_flt(vm, args, ai, "format")?
+            out += value.llua_fmt_num(spec, x)
+        } else if conv == 's' {
+            s = tostring(&vm, prog, args[ai])?
+            out += if spec == "%s" { s } else { pad_str(spec, s) }
+        } else if conv == 'q' {
+            q = match args[ai] {
+                value.Str(s) => quote_str(s)
+                value.Int(k) => "#{k}"
+                value.Nil => "nil"
+                value.Bool(b) => if b { "true" } else { "false" }
+                _ => ""
+            }
+            out += q
+        } else {
+            return Err(rt_err(vm, "invalid conversion '#{spec}' to 'format'"))
+        }
+        ai += 1
+    }
+    Ok([value.Str(out)])
+}
+
+// ---------- table ----------
+
+fn tget(vm: Vm, t: int, i: int) -> value.Value { value.raw_get(vm.tabs[t], value.Int(i)) }
+
+fn tset(inout vm: Vm, t: int, i: int, take v: value.Value) { value.raw_set(&vm.tabs[t], value.Int(i), v) }
+
+fn table_fn(inout vm: Vm, prog: parse.Prog, id: int, take args: [value.Value]) -> [value.Value]!value.Value {
+    if id == N_T_PACK {
+        t = new_tab(&vm)
+        n = len(args)
+        for i in 0..n { tset(&vm, t, i + 1, replace(&args[i], value.Nil)) }
+        put(&vm, t, "n", value.Int(n))
+        return Ok([value.Tab(t)])
+    }
+    fname = match id {
+        40 => "insert"
+        41 => "remove"
+        42 => "concat"
+        43 => "unpack"
+        _ => "sort"
+    }
+    t = check_tab(vm, args, 0, fname)?
+    n = value.length(vm.tabs[t])
+    if id == N_T_INSERT {
+        if len(args) == 2 {
+            tset(&vm, t, n + 1, replace(&args[1], value.Nil))
+            return Ok([])
+        }
+        if len(args) != 3 { return Err(rt_err(vm, "wrong number of arguments to 'insert'")) }
+        pos = check_int(vm, args, 1, fname)?
+        if pos < 1 || pos > n + 1 { return Err(bad_arg(vm, 1, fname, "position out of bounds")) }
+        k = n
+        for k >= pos {
+            v = tget(vm, t, k)
+            tset(&vm, t, k + 1, v)
+            k -= 1
+        }
+        tset(&vm, t, pos, replace(&args[2], value.Nil))
+        return Ok([])
+    }
+    if id == N_T_REMOVE {
+        pos = opt_int(vm, args, 1, fname, n)?
+        if len(args) >= 2 && pos != n && (pos < 1 || pos > n + 1) { return Err(bad_arg(vm, 1, fname, "position out of bounds")) }
+        v = tget(vm, t, pos)
+        k = pos
+        for k < n {
+            w = tget(vm, t, k + 1)
+            tset(&vm, t, k, w)
+            k += 1
+        }
+        tset(&vm, t, k, value.Nil)
+        return Ok([v])
+    }
+    if id == N_T_CONCAT {
+        sep = if len(args) >= 2 && !value.is_nil(args[1]) { check_str(vm, args, 1, fname)? } else { "" }
+        i = opt_int(vm, args, 2, fname, 1)?
+        j = opt_int(vm, args, 3, fname, n)?
+        parts: [str] = []
+        for k in i..j + 1 {
+            v = tget(vm, t, k)
+            match concat_part(v) {
+                Some(s) => parts.push(s)
+                None => return Err(rt_err(vm, "invalid value (at index #{k}) in table for 'concat'"))
+            }
+        }
+        return Ok([value.Str(join(parts, sep))])
+    }
+    if id == N_T_UNPACK {
+        i = opt_int(vm, args, 1, fname, 1)?
+        j = opt_int(vm, args, 2, fname, n)?
+        if j - i >= 1000000 { return Err(rt_err(vm, "too many results to unpack")) }
+        out: [value.Value] = []
+        for k in i..j + 1 { out.push(tget(vm, t, k)) }
+        return Ok(out)
+    }
+    // sort：取出来排好再放回去
+    cmp = arg(args, 1)
+    if !value.is_nil(cmp) && !is_callable(vm, cmp) { return Err(bad_arg(vm, 1, fname, "function expected, got #{got(args, 1)}")) }
+    xs: [value.Value] = []
+    for k in 1..n + 1 { xs.push(tget(vm, t, k)) }
+    sorted = merge_sort(&vm, prog, cmp, xs)?
+    for k in 0..len(sorted) { tset(&vm, t, k + 1, replace(&sorted[k], value.Nil)) }
+    Ok([])
+}
+
+fn sort_less(inout vm: Vm, prog: parse.Prog, cmp: value.Value, a: value.Value, b: value.Value) -> bool!value.Value {
+    if value.is_nil(cmp) { return less(&vm, prog, a, b, false) }
+    rs = call(&vm, prog, cmp, [a.copy(), b.copy()])?
+    Ok(value.truthy(first(rs)))
+}
+
+// 归并排序（自己写是因为比较函数是 Lua 函数，可能出错）
+fn merge_sort(inout vm: Vm, prog: parse.Prog, cmp: value.Value, take xs: [value.Value]) -> [value.Value]!value.Value {
+    n = len(xs)
+    if n <= 1 { return Ok(xs) }
+    mid = n / 2
+    left: [value.Value] = []
+    right: [value.Value] = []
+    for i in 0..n {
+        v = replace(&xs[i], value.Nil)
+        if i < mid { left.push(v) } else { right.push(v) }
+    }
+    a = merge_sort(&vm, prog, cmp, left)?
+    b = merge_sort(&vm, prog, cmp, right)?
+    out: [value.Value] = []
+    out.reserve(n)
+    i = 0
+    j = 0
+    for i < len(a) && j < len(b) {
+        // b[j] < a[i] 时先放 b[j]，相等时保持原来的顺序
+        if sort_less(&vm, prog, cmp, b[j], a[i])? {
+            out.push(b[j].copy())
+            j += 1
+        } else {
+            out.push(a[i].copy())
+            i += 1
+        }
+    }
+    for i < len(a) {
+        out.push(a[i].copy())
+        i += 1
+    }
+    for j < len(b) {
+        out.push(b[j].copy())
+        j += 1
+    }
+    Ok(out)
+}
+
+// ---------- math、os、io ----------
+
+fn float_or_int(f: float) -> value.Value {
+    match value.float_to_int(f) {
+        Some(n) => value.Int(n)
+        None => value.Num(f)
+    }
+}
+
+fn math_fn(inout vm: Vm, prog: parse.Prog, id: int, take args: [value.Value]) -> [value.Value]!value.Value {
+    fname = match id {
+        60 => "floor"
+        61 => "ceil"
+        62 => "abs"
+        63 => "sqrt"
+        64 => "max"
+        65 => "min"
+        66 => "fmod"
+        67 => "modf"
+        68 => "tointeger"
+        69 => "type"
+        74 => "log"
+        75 => "random"
+        76 => "randomseed"
+        77 => "ult"
+        80 => "atan"
+        _ => "math"
+    }
+    if id == N_M_TYPE {
+        check_any(vm, args, 0, fname)?
+        r = match args[0] {
+            value.Int(_) => value.Str("integer")
+            value.Num(_) => value.Str("float")
+            _ => value.Nil
+        }
+        return Ok([r])
+    }
+    if id == N_M_TOINT {
+        r = match arg(args, 0) {
+            value.Int(n) => value.Int(n)
+            value.Num(f) => match value.float_to_int(f) {
+                Some(n) => value.Int(n)
+                None => value.Nil
+            }
+            _ => value.Nil
+        }
+        return Ok([r])
+    }
+    if id == N_M_MAX || id == N_M_MIN {
+        best = check_num(vm, args, 0, fname)?
+        for i in 1..len(args) {
+            v = check_num(vm, args, i, fname)?
+            better = if id == N_M_MAX { less(&vm, prog, best, v, false)? } else { less(&vm, prog, v, best, false)? }
+            if better { best = v }
+        }
+        return Ok([best])
+    }
+    if id == N_M_RANDOM || id == N_M_SEED {
+        return Err(rt_err(vm, "llua 还没有 math.#{fname}"))
+    }
+    if id == N_M_ULT {
+        a = check_int(vm, args, 0, fname)?
+        b = check_int(vm, args, 1, fname)?
+        return Ok([value.Bool(ult(a, b))])
+    }
+    x = check_num(vm, args, 0, fname)?
+    if id == N_M_FLOOR || id == N_M_CEIL {
+        match x {
+            value.Int(n) => return Ok([value.Int(n)])
+            _ => {}
+        }
+        f = flt(x)
+        return Ok([float_or_int(if id == N_M_FLOOR { floor(f) } else { ceil(f) })])
+    }
+    if id == N_M_ABS {
+        match x {
+            value.Int(n) => return Ok([value.Int(if n < 0 { 0 -% n } else { n })])
+            _ => {}
+        }
+        f = flt(x)
+        return Ok([value.Num(if f < 0.0 { 0.0 - f } else { f })])
+    }
+    if id == N_M_FMOD {
+        y = check_num(vm, args, 1, fname)?
+        match x {
+            value.Int(a) => match y {
+                value.Int(b) => {
+                    if b == 0 { return Err(bad_arg(vm, 1, fname, "zero")) }
+                    if b == -1 { return Ok([value.Int(0)]) }
+                    return Ok([value.Int(a % b)])
+                }
+                _ => {}
+            }
+            _ => {}
+        }
+        return Ok([value.Num(flt(x) % flt(y))])
+    }
+    if id == N_M_MODF {
+        match x {
+            value.Int(n) => return Ok([value.Int(n), value.Num(0.0)])
+            _ => {}
+        }
+        f = flt(x)
+        ip = if f < 0.0 { ceil(f) } else { floor(f) }
+        frac = if ip == f { 0.0 } else { f - ip }
+        return Ok([value.Num(ip), value.Num(frac)])
+    }
+    f = flt(x)
+    r = if id == N_M_SQRT {
+        sqrt(f)
+    } else if id == N_M_SIN {
+        sin(f)
+    } else if id == N_M_COS {
+        cos(f)
+    } else if id == N_M_TAN {
+        tan(f)
+    } else if id == N_M_ASIN {
+        asin(f)
+    } else if id == N_M_ACOS {
+        acos(f)
+    } else if id == N_M_EXP {
+        exp(f)
+    } else if id == N_M_ATAN {
+        atan2(f, if len(args) >= 2 { check_flt(vm, args, 1, fname)? } else { 1.0 })
+    } else {
+        // log
+        if len(args) >= 2 {
+            b = check_flt(vm, args, 1, fname)?
+            if b == 10.0 { log10(f) } else { ln(f) / ln(b) }
+        } else {
+            ln(f)
+        }
+    }
+    Ok([value.Num(r)])
+}
+
+fn other_fn(inout vm: Vm, prog: parse.Prog, id: int, take args: [value.Value]) -> [value.Value]!value.Value {
+    if id == N_OS_TIME { return Ok([value.Int(time.unix_ms() / 1000)]) }
+    if id == N_OS_CLOCK { return Ok([value.Num(value.llua_clock())]) }
+    if id == N_OS_EXIT {
+        code = match arg(args, 0) {
+            value.Nil => 0
+            value.Bool(b) => if b { 0 } else { 1 }
+            value.Int(n) => n
+            _ => 1
+        }
+        flush_out(&vm)
+        exit(code)
+    }
+    if id == N_IO_WRITE {
+        // 和 print 不同，io.write 直接用 %.14g 写浮点数：io.write(1.0) 写出 1
+        for i in 0..len(args) {
+            s = match args[i] {
+                value.Num(f) => value.llua_fmt_num("%.14g", f)
+                _ => check_str(vm, args, i, "write")?
+            }
+            write_out(&vm, s)
+        }
+        return Ok([])
+    }
+    Err(rt_err(vm, "llua 内部错误：没有编号为 #{id} 的内置函数"))
+}

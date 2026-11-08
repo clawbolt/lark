@@ -1,0 +1,34 @@
+// std/term 的测试：转义序列和 strip。测试的输出写进文件，所以标准输出不是终端，原始模式这些在 apps/ledit 里手动试
+import "std/term"
+
+test "转义序列" {
+    assert_eq(term.move_to(3, 7), "\e[3;7H")
+    assert_eq(term.color("x", term.RED), "\e[31mx\e[0m")
+    assert_eq(term.color("x", 9), "\e[91mx\e[0m")
+    assert_eq(term.color("x", 208), "\e[38;5;208mx\e[0m")
+    assert_eq(term.bold("云雀"), "\e[1m云雀\e[0m")
+    assert_eq(term.style("u", "4;7"), "\e[4;7mu\e[0m")
+    assert_eq(term.CLEAR + term.HOME, "\e[2J\e[H")
+}
+
+test "去掉转义序列" {
+    assert_eq(term.strip_ansi(term.color("红", term.RED) + " 和 " + term.bold("粗")), "红 和 粗")
+    assert_eq(term.strip_ansi(term.move_to(1, 1) + term.CLEAR_LINE + "a" + term.HIDE_CURSOR), "a")
+    assert_eq(term.strip_ansi("没有转义"), "没有转义")
+    assert_eq(term.strip_ansi("a\e7b\e8c"), "abc")
+    // 半截的序列：吃到字符串末尾为止
+    assert_eq(term.strip_ansi("ok\e[12"), "ok")
+    assert_eq(term.strip_ansi("ok\e"), "ok")
+}
+
+test "不是终端" {
+    assert(!term.is_tty(1))
+    assert(!term.is_tty(-1))
+    assert(!term.supports_color(1))
+    // 没进入过原始模式时恢复什么都不做
+    match term.restore() {
+        Ok(_) => {}
+        Err(e) => panic(e)
+    }
+    assert(!term.was_resized())
+}

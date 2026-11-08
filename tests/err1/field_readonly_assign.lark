@@ -1,0 +1,8 @@
+// 期望错误：模块里定义的结构体，字段在别的模块里不能赋值（下标赋值和 += 也一样）
+import "std/map"
+
+fn main() {
+    m: map.Map[str, int] = map.new()
+    m.insert("a", 1)
+    m.vals[0] += 1
+}

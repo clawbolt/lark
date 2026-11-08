@@ -1,0 +1,10 @@
+// 期望错误：遍历 m.keys 时不能删除（m 正被 for 借用）
+import "std/map"
+
+fn main() {
+    m: map.Map[int, int] = map.new()
+    m.insert(1, 10)
+    for k in m.keys {
+        old = m.remove(k)
+    }
+}

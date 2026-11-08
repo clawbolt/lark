@@ -1,0 +1,3 @@
+tests/multi/bad.lark:4:7: 错误：运算两侧类型不同：str 与 int
+ 4 |     s + 1
+   |       ^

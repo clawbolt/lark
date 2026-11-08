@@ -1,0 +1,147 @@
+// lvm 的汇编：把文本写的程序变成指令（没有证明，tests.lark 里测）。
+// 一行一条指令，; 或 # 后面是注释；"名字:" 是标签（可以和指令写在同一行），跳转和 spawn 用标签或者数字。
+//   push n  pop  dup  swap  add  sub  mul  lt  eq  load i  store i  jmp L  jz L  halt
+//   call L  ret         （函数调用：参数和返回值放在栈上，被调用的函数有一份新的局部变量）
+//   yield  spawn L  newch [容量]  send  recv  select n  sleep  join  self  print     （要调度器做的事，见 vm/sched；newch 不写容量是不限）
+//   select n：栈上是 n 个通道，同时等它们，哪个先有东西收哪个；收到以后栈上是值、再上面是第几个通道（从 0 数）
+//   tselect n：栈上是 n 个通道、最上面是最多等几毫秒；超时的时候栈上是 0、再上面是 -1
+//   .locals n     每个线程几个局部变量（默认 16；写在用到局部变量的指令前面）
+// 第一条指令是主线程开始的地方。
+import "std/str"
+import "vm/core"
+
+pub type Prog {
+    pub code: [core.Ins]
+    pub nloc: int
+}
+
+fn is_space(c: int) -> bool { c == 0x20 || c == 0x09 || c == 0x0D }
+
+// 去掉注释，按空白切开
+fn words(line: str) -> [str] {
+    out: [str] = []
+    cur = ""
+    for i in 0..len(line) {
+        c = byte_at(line, i)
+        if c == 0x3B || c == 0x23 { break }
+        if is_space(c) {
+            if cur != "" { out.push(cur.copy()) }
+            cur = ""
+        } else {
+            cur += from_byte(c)
+        }
+    }
+    if cur != "" { out.push(cur.copy()) }
+    out
+}
+
+fn is_label(w: str) -> bool { len(w) > 1 && byte_at(w, len(w) - 1) == 0x3A }
+
+fn label_name(w: str) -> str { slice(w, 0, len(w) - 1) }
+
+// 一行去掉开头的标签以后剩下的词
+fn body(ws: [str]) -> [str] {
+    out: [str] = []
+    k = 0
+    for k < len(ws) && is_label(ws[k]) { k += 1 }
+    for i in k..len(ws) { out.push(ws[i].copy()) }
+    out
+}
+
+fn find(names: [str], n: str) -> int {
+    for i in 0..len(names) {
+        if names[i] == n { return i }
+    }
+    -1
+}
+
+fn no_arg(m: str) -> core.Ins? {
+    if m == "pop" { return Some(core.Pop) }
+    if m == "dup" { return Some(core.Dup) }
+    if m == "swap" { return Some(core.Swap) }
+    if m == "add" { return Some(core.Add) }
+    if m == "sub" { return Some(core.Sub) }
+    if m == "mul" { return Some(core.Mul) }
+    if m == "lt" { return Some(core.Lt) }
+    if m == "eq" { return Some(core.Eq) }
+    if m == "halt" { return Some(core.Halt) }
+    if m == "yield" { return Some(core.Sys(core.SYS_YIELD, 0)) }
+    if m == "ret" { return Some(core.RetF) }
+    if m == "send" { return Some(core.Sys(core.SYS_SEND, 0)) }
+    if m == "recv" { return Some(core.Sys(core.SYS_RECV, 0)) }
+    if m == "sleep" { return Some(core.Sys(core.SYS_SLEEP, 0)) }
+    if m == "join" { return Some(core.Sys(core.SYS_JOIN, 0)) }
+    if m == "self" { return Some(core.Sys(core.SYS_SELF, 0)) }
+    if m == "print" { return Some(core.Sys(core.SYS_PRINT, 0)) }
+    None
+}
+
+pub fn parse(src: str) -> Prog! {
+    lines = str.split(src, "\n")
+    // 第一遍：标签在第几条指令
+    names: [str] = []
+    addrs: [int] = []
+    n = 0
+    for li in 0..len(lines) {
+        ws = words(lines[li])
+        for w in ws {
+            if !is_label(w) { break }
+            if find(names, label_name(w)) >= 0 { return Err("第 #{li + 1} 行：标签 #{label_name(w)} 重复了") }
+            names.push(label_name(w))
+            addrs.push(n)
+        }
+        b = body(ws)
+        if len(b) > 0 && b[0] != ".locals" { n += 1 }
+    }
+    // 第二遍：指令
+    code: [core.Ins] = []
+    nloc = 16
+    for li in 0..len(lines) {
+        b = body(words(lines[li]))
+        if len(b) == 0 { continue }
+        at = "第 #{li + 1} 行"
+        m = b[0].copy()
+        if m == ".locals" {
+            if len(b) != 2 { return Err("#{at}：.locals 后面要一个数") }
+            nloc = try_parse_int(b[1]) ?? -1
+            if nloc < 0 { return Err("#{at}：.locals 后面要一个不小于 0 的数") }
+            continue
+        }
+        if m == "newch" {
+            if len(b) > 2 { return Err("#{at}：newch 后面最多一个数（容量）") }
+            lim = if len(b) == 2 { try_parse_int(b[1]) ?? -2 } else { -1 }
+            if lim < -1 { return Err("#{at}：newch 的容量要是不小于 0 的数") }
+            code.push(core.Sys(core.SYS_NEWCH, lim))
+            continue
+        }
+        match no_arg(m) {
+            Some(ins) => {
+                if len(b) != 1 { return Err("#{at}：#{m} 后面不要参数") }
+                code.push(ins.copy())
+                continue
+            }
+            None => {}
+        }
+        if m != "push" && m != "load" && m != "store" && m != "jmp" && m != "jz" && m != "spawn" && m != "call" && m != "select" && m != "tselect" { return Err("#{at}：不认识的指令 #{m}") }
+        if len(b) != 2 { return Err("#{at}：#{m} 后面要一个参数") }
+        arg = b[1].copy()
+        if m == "push" || m == "load" || m == "store" || m == "select" || m == "tselect" {
+            v = match try_parse_int(arg) {
+                Ok(x) => x
+                Err(_e) => { return Err("#{at}：#{m} 的参数要是数，不是 #{arg}") }
+            }
+            if (m == "load" || m == "store") && (v < 0 || v >= nloc) { return Err("#{at}：局部变量 #{v} 不在 0 到 #{nloc - 1} 里") }
+            if (m == "select" || m == "tselect") && v < 1 { return Err("#{at}：#{m} 至少等 1 个通道") }
+            code.push(if m == "push" { core.Push(v) } else if m == "load" { core.Load(v) } else if m == "select" { core.Sys(core.SYS_SELECT, v) } else if m == "tselect" { core.Sys(core.SYS_TSELECT, v) } else { core.Store(v) })
+        } else if m == "jmp" || m == "jz" || m == "spawn" || m == "call" {
+            k = find(names, arg)
+            a = if k >= 0 { addrs[k] } else { try_parse_int(arg) ?? -1 }
+            if a < 0 { return Err("#{at}：没有标签 #{arg}") }
+            code.push(if m == "jmp" { core.Jmp(a) } else if m == "jz" { core.Jz(a) } else if m == "call" { core.CallF(a) } else { core.Sys(core.SYS_SPAWN, a) })
+        } else {
+            return Err("#{at}：不认识的指令 #{m}")
+        }
+    }
+    if len(code) == 0 { return Err("程序是空的") }
+    Ok(Prog(code: code, nloc: nloc))
+}

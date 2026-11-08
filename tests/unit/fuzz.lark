@@ -1,0 +1,432 @@
+// 解析外部输入的函数的乱输入测试：在合法的样本上随机改几处（换字节、插入、删一段、截断、复制一段、翻一位），
+// 再加上完全随机的短串。种子固定，每次跑的输入都一样。要求只返回错误、不 panic；能读进来的还要满足来回不变这类性质
+import "std/base64"
+import "std/csv"
+import "std/http"
+import "std/json"
+import "std/rand"
+import "std/re"
+import "std/str"
+import "std/time"
+import "std/zlib"
+
+// 一半从 alpha 里取一个字节，一半是任意字节
+fn pick(inout r: rand.Rng, alpha: str) -> str {
+    if rand.next_bool(&r, 0.5) {
+        k = rand.range(&r, 0, len(alpha))
+        return slice(alpha, k, k + 1)
+    }
+    from_byte(rand.range(&r, 0, 256))
+}
+
+fn noise(inout r: rand.Rng, alpha: str, max: int) -> str {
+    out = ""
+    n = rand.range(&r, 0, max + 1)
+    for _k in 0..n { out += pick(&r, alpha) }
+    out
+}
+
+// 随机改 0 到 3 处
+fn mutate(inout r: rand.Rng, s: str, alpha: str) -> str {
+    out = s.copy()
+    times = rand.range(&r, 0, 4)
+    for _k in 0..times {
+        n = len(out)
+        p = rand.range(&r, 0, n + 1)
+        op = if n == 0 { 1 } else { rand.range(&r, 0, 6) }
+        q = if p == n { p - 1 } else { p }
+        if op == 0 {
+            out = slice(out, 0, q) + pick(&r, alpha) + slice(out, q + 1, n)
+        } else if op == 1 {
+            out = slice(out, 0, p) + pick(&r, alpha) + slice(out, p, n)
+        } else if op == 2 {
+            e = p + rand.range(&r, 0, n - p + 1)
+            out = slice(out, 0, p) + slice(out, e, n)
+        } else if op == 3 {
+            out = slice(out, 0, p)
+        } else if op == 4 {
+            e = p + rand.range(&r, 0, n - p + 1)
+            out = slice(out, 0, e) + slice(out, p, n)
+        } else {
+            b = byte_at(out, q) ^ (1 << rand.range(&r, 0, 8))
+            out = slice(out, 0, q) + from_byte(b) + slice(out, q + 1, n)
+        }
+    }
+    out
+}
+
+// 四分之一是随机串，其余是改过的样本（改 0 处的就是样本本身）
+fn input(inout r: rand.Rng, seeds: [str], alpha: str, max: int) -> str {
+    if rand.range(&r, 0, 4) == 0 { return noise(&r, alpha, max) }
+    k = rand.range(&r, 0, len(seeds))
+    mutate(&r, seeds[k], alpha)
+}
+
+fn json_again(t: str) -> str {
+    match take json.parse(t) {
+        Ok(j) => json.format(j)
+        Err(e) => panic(e)
+    }
+}
+
+test "json" {
+    r = rand.new(1)
+    seeds = ["{\"a\":[1,2.5e3,-0.1,true,false,null],\"b\":{\"c\":\"\\u4e91\\ud83d\\ude00\\n\"}}", "[[],{},\"x\",-0]", "-12.5E+3", "\"云雀\\\\\""]
+    alpha = "{}[]:,\"\\/-+.eE0123456789tfnrlsu \n"
+    ok = 0
+    bad = 0
+    for _i in 0..3000 {
+        s = input(&r, seeds, alpha, 30)
+        match take json.parse(s) {
+            Ok(j) => {
+                ok += 1
+                // 读得进来的，写出去再读回来不变
+                t = json.format(j)
+                assert_eq(json_again(t), t)
+            }
+            Err(e) => {
+                bad += 1
+                assert(str.starts_with(e, "JSON 第 "))
+            }
+        }
+    }
+    assert(ok > 0 && bad > 0)
+}
+
+fn csv_again(t: str) -> str {
+    match take csv.parse(t) {
+        Ok(rows) => csv.format(rows)
+        Err(e) => panic(e)
+    }
+}
+
+test "csv" {
+    r = rand.new(2)
+    seeds = ["a,b,c\n1,\"x,y\",3\r\n\"q\"\"q\",,\n", "\"多\n行\",\"\"\n\n末尾", "x;y\t\"z\"\r\n"]
+    alpha = ",\"\r\n a;\t"
+    ok = 0
+    bad = 0
+    for _i in 0..3000 {
+        s = input(&r, seeds, alpha, 20)
+        match take csv.parse(s) {
+            Ok(rows) => {
+                ok += 1
+                t = csv.format(rows)
+                assert_eq(csv_again(t), t)
+            }
+            Err(e) => {
+                bad += 1
+                assert(str.starts_with(e, "CSV 第 "))
+            }
+        }
+        for sep in [';', '\t'] {
+            match csv.parse_sep(s, sep) {
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+    }
+    assert(ok > 0 && bad > 0)
+}
+
+// 找到的匹配从左到右、不重叠、都在 s 里面；is_match、split 和 find_all 说的一致
+fn check_re(rx: re.Re, s: str) {
+    ms = re.find_all(rx, s)
+    last = 0
+    nonempty = 0
+    for (a, b) in ms {
+        assert(a >= last && a <= b && b <= len(s))
+        if b > a { nonempty += 1 }
+        last = b
+    }
+    assert(re.is_match(rx, s) == (len(ms) > 0))
+    assert_eq(len(re.split(rx, s)), nonempty + 1)
+    _rep = re.replace_all(rx, s, "<>")
+}
+
+test "re" {
+    r = rand.new(3)
+    seeds = ["^a[b-d]*\\d+$", "x?y|[^a-c]z", "\\w+\\s\\.", "[A-Z_]+|\\D", "(a|b)+c{1,3}", "(?:x|y)*?(z)|a{2,}$"]
+    alpha = "ab.*+?|^$[]-\\dwsDA(){}1,:"
+    subj = "abAB01 -_.\n\t"
+    ok = 0
+    bad = 0
+    for _i in 0..3000 {
+        p = input(&r, seeds, alpha, 10)
+        // Pike VM 是线性时间，长模式也不怕；截到 40 个字节只是为了少花点时间
+        if len(p) > 40 { p = slice(p, 0, 40) }
+        fold = rand.next_bool(&r, 0.3)
+        match take re.compile(if fold { "(?i)" + p } else { p.copy() }) {
+            Ok(rx) => {
+                ok += 1
+                for _k in 0..3 {
+                    s = noise(&r, subj, 12)
+                    check_re(rx, s)
+                    at = rand.range(&r, 0, len(s) + 2)
+                    a, b = re.find_at(rx, s, at) ?? (-1, -1)
+                    assert((a == -1 && b == -1) || (a >= at && a <= b && b <= len(s)))
+                    // 带分组找到的整个匹配和 find_at 的一样，每个分组都在整个匹配里面
+                    cs = re.captures_at(rx, s, at) ?? []
+                    if a < 0 { assert_eq(len(cs), 0) } else {
+                        assert_eq(len(cs), rx.groups + 1)
+                        assert(cs[0] == (a, b))
+                        for (ga, gb) in cs {
+                            assert((ga == -1 && gb == -1) || (ga >= a && ga <= gb && gb <= b))
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                bad += 1
+                assert(len(e) > 0)
+            }
+        }
+    }
+    assert(ok > 0 && bad > 0)
+}
+
+test "http" {
+    r = rand.new(4)
+    reqs = ["GET /a%20b?x=1 HTTP/1.1\r\nHost: a\r\n\r\n", "POST /up HTTP/1.0\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhelloGET / HTTP/1.1\r\n\r\n", "\r\n\r\nOPTIONS * HTTP/1.1\r\nX-A:  b \r\n\r\n", "GET http://h/p HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"]
+    alpha = "GETPOS /?%2fA HTTP/1.01\r\n:-Content-Length: 09"
+    done = 0
+    partial = 0
+    bad = 0
+    for _i in 0..3000 {
+        s = input(&r, reqs, alpha, 40)
+        // 流水线：一个个往后解，每解出一个都要往前走
+        pos = 0
+        for true {
+            q, nx, code = http.parse_request(s, pos)
+            if nx == -1 {
+                assert_eq(code, 0)
+                partial += 1
+                break
+            }
+            if nx == -2 {
+                assert(code == 400 || code == 413 || code == 431 || code == 501 || code == 505)
+                bad += 1
+                break
+            }
+            assert(nx > pos && nx <= len(s))
+            match q {
+                Some(_) => {}
+                None => panic("有下一个位置却没有请求")
+            }
+            done += 1
+            pos = nx
+        }
+    }
+    assert(done > 0 && partial > 0 && bad > 0)
+    resps = ["HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;x\r\nhello\r\n0\r\n\r\n", "HTTP/1.0 404 Not Found\r\n\r\nnope"]
+    chunks = ["5\r\nhello\r\n0\r\n\r\n", "a;ext=1\r\n0123456789\r\n3\r\nabc\r\n0\r\n"]
+    ok = 0
+    errs = 0
+    for _i in 0..3000 {
+        s = input(&r, resps, alpha, 40)
+        head = rand.next_bool(&r, 0.2)
+        match http.parse_response(s, head) {
+            Ok(_) => { ok += 1 }
+            Err(_) => { errs += 1 }
+        }
+        c = input(&r, chunks, "0123456789abcdefF;\r\n x", 20)
+        match http.decode_chunked(c) {
+            Ok(_) => { ok += 1 }
+            Err(_) => { errs += 1 }
+        }
+        match http.unescape_path(c) {
+            Some(_) => {}
+            None => {}
+        }
+        match http.parse_url("http://" + c) {
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert(ok > 0 && errs > 0)
+}
+
+fn back(x: [u8]!) -> [u8] {
+    match x {
+        Ok(b) => b.copy()
+        Err(e) => panic(e)
+    }
+}
+
+// 解得开时返回解出的长度，解不开时 -1；错误以格式的名字开头
+fn unz(x: [u8]!) -> int {
+    match x {
+        Ok(b) => len(b)
+        Err(e) => {
+            assert(str.starts_with(e, "zlib") || str.starts_with(e, "gzip") || str.starts_with(e, "deflate"))
+            -1
+        }
+    }
+}
+
+test "zlib" {
+    r = rand.new(5)
+    text = ""
+    for i in 0..200 { text += "第 #{i % 17} 行：the quick brown fox #{i * 7 % 13}\n" }
+    d = text.to_bytes()
+    zs = from_bytes(zlib.compress(d))
+    gs = from_bytes(zlib.gzip(d))
+    fs = from_bytes(zlib.deflate(d))
+    alpha = from_byte(0) + from_byte(1) + from_byte(0x80) + from_byte(255)
+    ok = 0
+    bad = 0
+    for _i in 0..1000 {
+        z = mutate(&r, zs, alpha)
+        n = unz(zlib.decompress(z.to_bytes()))
+        if z == zs { assert_eq(n, len(d)) }
+        g = mutate(&r, gs, alpha)
+        m = unz(zlib.gunzip(g.to_bytes()))
+        if g == gs { assert_eq(m, len(d)) }
+        f = mutate(&r, fs, alpha)
+        k = unz(zlib.inflate(f.to_bytes()))
+        if f == fs { assert_eq(k, len(d)) }
+        for x in [n, m, k] {
+            if x < 0 { bad += 1 } else { ok += 1 }
+        }
+        // 完全随机的字节
+        _x = unz(zlib.inflate(noise(&r, alpha, 40).to_bytes()))
+    }
+    assert(ok > 0 && bad > 0)
+    // 随机的数据（一半只用 3 种字节，容易有重复）压缩再解开不变
+    for _i in 0..200 {
+        n = rand.range(&r, 0, 3000)
+        small = rand.next_bool(&r, 0.5)
+        raw: [u8] = []
+        for _k in 0..n {
+            v = if small { rand.range(&r, 0, 3) } else { rand.range(&r, 0, 256) }
+            raw.push(v.wrap_u8())
+        }
+        assert(back(zlib.decompress(zlib.compress(raw))) == raw)
+        assert(back(zlib.gunzip(zlib.gzip(raw))) == raw)
+        assert(back(zlib.inflate(zlib.deflate(raw))) == raw)
+    }
+}
+
+fn no_pad(s: str) -> str {
+    n = len(s)
+    for n > 0 && byte_at(s, n - 1) == '=' { n -= 1 }
+    slice(s, 0, n)
+}
+
+test "base64" {
+    r = rand.new(6)
+    seeds = ["QUJD", "QQ==", "QUI=", "5LqR6ZuA", "-_8", "Zm9vYmFy"]
+    alpha = "AQgwBZz09+/-_= \n"
+    ok = 0
+    bad = 0
+    for _i in 0..3000 {
+        s = input(&r, seeds, alpha, 12)
+        // 解码很严格，所以解得开的输入只有一种写法：再编码回去和原来一样
+        match take base64.decode(s) {
+            Ok(b) => {
+                ok += 1
+                assert_eq(base64.encode(b), s)
+            }
+            Err(_) => { bad += 1 }
+        }
+        match take base64.decode_url(s) {
+            Ok(b) => {
+                assert_eq(base64.encode_url(b), no_pad(s))
+            }
+            Err(_) => {}
+        }
+        match base64.decode_str(s) {
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert(ok > 0 && bad > 0)
+    none: [u8] = []
+    for _i in 0..300 {
+        raw = noise(&r, alpha, 50).to_bytes()
+        assert((base64.decode(base64.encode(raw)) ?? none.copy()) == raw)
+        assert((base64.decode_url(base64.encode_url(raw)) ?? none.copy()) == raw)
+    }
+}
+
+fn iso_ms(s: str) -> int {
+    match take time.parse_iso(s) {
+        Ok(n) => n
+        Err(e) => panic(e)
+    }
+}
+
+fn dur_ns(s: str) -> int {
+    match take time.parse_dur(s) {
+        Ok(n) => n
+        Err(e) => panic(e)
+    }
+}
+
+test "time" {
+    r = rand.new(7)
+    isos = ["2026-10-26T07:52:00.123Z", "1999-12-31 23:59:59+08:00", "2024-02-29", "0001-01-01T00:00:00-0530"]
+    durs = ["1h2m3.5s", "-300ms", "1.5us", "0", "+2µs", "0.000000001s"]
+    ok = 0
+    bad = 0
+    for _i in 0..3000 {
+        s = input(&r, isos, "0123456789-:+TZ. ", 30)
+        match time.parse_iso(s) {
+            Ok(_) => { ok += 1 }
+            Err(e) => {
+                bad += 1
+                assert(len(e) > 0)
+            }
+        }
+        d = input(&r, durs, "0123456789.hmsun-+", 12)
+        match time.parse_dur(d) {
+            Ok(_) => { ok += 1 }
+            Err(e) => {
+                bad += 1
+                assert(len(e) > 0)
+            }
+        }
+    }
+    assert(ok > 0 && bad > 0)
+    // 0001 年到 9999 年里随机的时刻、随机的时差：写出去再读回来不变
+    lo = iso_ms("0001-01-01")
+    hi = iso_ms("9999-01-01")
+    for _i in 0..2000 {
+        ms = lo + rand.range(&r, 0, hi - lo)
+        off = rand.range(&r, 0, 2879) - 1439
+        assert_eq(iso_ms(time.format_iso_at(ms, off)), ms)
+        assert_eq(iso_ms(time.format_iso(time.date_utc(ms))), ms)
+    }
+    // format_dur 写的时长只保留一位小数（或者丢掉秒），读回来不比原来多，少的不超过十分之一
+    for _i in 0..2000 {
+        k = 1 + rand.range(&r, 0, 15)
+        top = 1
+        for _j in 0..k { top *= 10 }
+        x = rand.range(&r, 0, top)
+        got = dur_ns(time.format_dur(x))
+        assert(got <= x && x - got <= x / 10)
+        assert_eq(dur_ns(time.format_dur(0 - x)), 0 - got)
+    }
+}
+
+fn err_str(x: str!) -> str {
+    match x {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}
+
+fn dur_err(s: str) -> str {
+    match take time.parse_dur(s) {
+        Ok(n) => "<成功：#{n}>"
+        Err(e) => e
+    }
+}
+
+test "以前会 panic 的输入" {
+    // chunked 的长度数字很长：以前乘法溢出
+    assert_eq(err_str(http.decode_chunked("ffffffffffffffffffffffff\r\nx\r\n0\r\n")), "chunked 正文不完整")
+    // 每一段都在范围里，加起来超出 int：以前加法溢出
+    assert_eq(dur_err("2000000h2000000h"), "时长太大：2000000h2000000h")
+    assert_eq(dur_ns("2000000h"), 7_200_000_000_000_000_000)
+}

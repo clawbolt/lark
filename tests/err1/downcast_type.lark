@@ -1,0 +1,15 @@
+// 期望错误：downcast 要转成的类型由标注给出
+interface Shape {
+    fn area(s: Self) -> int
+}
+
+type Rect {
+    w: int
+}
+
+fn area(s: Rect) -> int { s.w }
+
+fn main() {
+    s: dyn Shape = Rect(w: 1)
+    r = s.downcast()
+}

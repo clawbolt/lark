@@ -1,0 +1,112 @@
+// ledit · 按键：把终端发来的字节解码成按键，以及测试用的按键脚本
+//
+// 按键脚本：普通的字照原样“打”进去，换行被忽略（脚本可以分很多行写），尖括号里是特殊键：
+//   <Enter> <Tab> <BS> <Del> <Left> <Right> <Up> <Down> <Home> <End> <PgUp> <PgDn> <Esc>
+//   <C-s> 这样的是 Ctrl 加一个字母，<lt> 是 < 本身
+pub enum Key {
+    Ch(s: str)       // 一个字符（UTF-8 的中文是一个字符）
+    Enter
+    Tab
+    Backspace
+    Delete
+    Left
+    Right
+    Up
+    Down
+    Home
+    End
+    PageUp
+    PageDown
+    Esc
+    Ctrl(c: int)     // c 是小写字母
+}
+
+// buf 从 i 开始的一个按键和它用掉的字节数。字节还不够（转义序列或者字符只来了一半）时用掉 0 个，
+// 调用方等下一批字节；等不到时，单独的 ESC 就是 Esc 键
+pub fn decode(buf: str, i: int) -> (Key, int) {
+    b = byte_at(buf, i)
+    if b == 27 { return decode_esc(buf, i) }
+    if b == 13 || b == 10 { return (Enter, 1) }
+    if b == 9 { return (Tab, 1) }
+    if b == 127 || b == 8 { return (Backspace, 1) }
+    if b >= 1 && b <= 26 { return (Ctrl(b + 96), 1) }
+    if b < 32 { return (Esc, 1) }
+    n = if b >= 240 { 4 } else if b >= 224 { 3 } else if b >= 192 { 2 } else { 1 }
+    if i + n > len(buf) { return (Esc, 0) }
+    (Ch(slice(buf, i, i + n)), n)
+}
+
+// ESC [ A 这类：方向键 A B C D，Home / End 是 H F 或者 1~ 4~ 7~ 8~，Delete 3~，PgUp / PgDn 5~ 6~
+fn decode_esc(buf: str, i: int) -> (Key, int) {
+    if i + 1 >= len(buf) { return (Esc, 0) }
+    c1 = byte_at(buf, i + 1)
+    if c1 != '[' && c1 != 'O' { return (Esc, 1) }
+    j = i + 2
+    for j < len(buf) && ((byte_at(buf, j) >= '0' && byte_at(buf, j) <= '9') || byte_at(buf, j) == ';') { j += 1 }
+    if j >= len(buf) { return (Esc, 0) }
+    f = byte_at(buf, j)
+    used = j - i + 1
+    if f == 'A' { return (Up, used) }
+    if f == 'B' { return (Down, used) }
+    if f == 'C' { return (Right, used) }
+    if f == 'D' { return (Left, used) }
+    if f == 'H' { return (Home, used) }
+    if f == 'F' { return (End, used) }
+    if f == '~' {
+        num = slice(buf, i + 2, j)
+        if num == "1" || num == "7" { return (Home, used) }
+        if num == "4" || num == "8" { return (End, used) }
+        if num == "3" { return (Delete, used) }
+        if num == "5" { return (PageUp, used) }
+        if num == "6" { return (PageDown, used) }
+    }
+    // 不认识的序列（F1 之类）：整个吞掉，当作 Esc
+    (Esc, used)
+}
+
+pub fn parse_script(s: str) -> [Key]! {
+    out: [Key] = []
+    i = 0
+    for i < len(s) {
+        b = byte_at(s, i)
+        if b == '\n' || b == '\r' {
+            i += 1
+            continue
+        }
+        if b == '<' {
+            e = i + 1
+            for e < len(s) && byte_at(s, e) != '>' { e += 1 }
+            if e >= len(s) { return Err("按键脚本第 #{i + 1} 个字节的 < 没有配对的 >（< 本身写成 <lt>）") }
+            out.push(named(slice(s, i + 1, e))?)
+            i = e + 1
+            continue
+        }
+        k, n = decode(s, i)
+        if n == 0 { return Err("按键脚本最后一个字符不完整") }
+        out.push(k)
+        i += n
+    }
+    Ok(out)
+}
+
+fn named(n: str) -> Key! {
+    if n == "Enter" { return Ok(Enter) }
+    if n == "Tab" { return Ok(Tab) }
+    if n == "BS" { return Ok(Backspace) }
+    if n == "Del" { return Ok(Delete) }
+    if n == "Left" { return Ok(Left) }
+    if n == "Right" { return Ok(Right) }
+    if n == "Up" { return Ok(Up) }
+    if n == "Down" { return Ok(Down) }
+    if n == "Home" { return Ok(Home) }
+    if n == "End" { return Ok(End) }
+    if n == "PgUp" { return Ok(PageUp) }
+    if n == "PgDn" { return Ok(PageDown) }
+    if n == "Esc" { return Ok(Esc) }
+    if n == "lt" { return Ok(Ch("<")) }
+    if len(n) == 3 && slice(n, 0, 2) == "C-" {
+        c = byte_at(n, 2)
+        if c >= 'a' && c <= 'z' { return Ok(Ctrl(c)) }
+    }
+    Err("不认识的按键 <#{n}>")
+}

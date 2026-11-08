@@ -1,0 +1,53 @@
+// std/deque 的边界：空队列、环形缓冲绕回、绕回时扩容、只从一头放
+import "std/deque"
+
+test "空队列和一个元素" {
+    d: deque.Deque[int] = deque.new()
+    assert(d.is_empty())
+    assert_eq(d.pop_front() ?? -1, -1)
+    assert_eq(d.pop_back() ?? -1, -1)
+    assert_eq(d.front() ?? -1, -1)
+    assert_eq(d.back() ?? -1, -1)
+    assert_eq(d.get(0) ?? -1, -1)
+    d.push_back(1)
+    assert_eq(d.front() ?? -1, 1)
+    assert_eq(d.back() ?? -1, 1)
+    assert_eq(d.pop_back() ?? -1, 1)
+    assert(d.is_empty())
+    d.push_front(5)
+    assert_eq(d.pop_front() ?? -1, 5)
+    s = deque.of(["a", "b"])
+    assert_eq(s.pop_front() ?? "", "a")
+    assert_eq(s.pop_back() ?? "", "b")
+    assert(s.is_empty())
+}
+
+test "绕回和扩容" {
+    d: deque.Deque[int] = deque.new()
+    // 正好填满第一次分配的 8 个位置，再从前面取走 3 个，后面放的就写到缓冲区开头
+    for i in 0..8 { d.push_back(i) }
+    for _i in 0..3 { _x = d.pop_front() }
+    for i in 8..11 { d.push_back(i) }
+    assert(d.to_list() == [3, 4, 5, 6, 7, 8, 9, 10])
+    // 满了、而且队头不在 0 时扩容：顺序不能乱
+    d.push_back(11)
+    d.push_front(2)
+    assert(d.to_list() == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+    assert_eq(len(d), 10)
+    assert_eq(d.get(0) ?? -1, 2)
+    assert_eq(d.get(9) ?? -1, 11)
+    assert_eq(d.get(10) ?? -1, -1)
+    assert_eq(d.get(-1) ?? -1, -1)
+    // 只从前面放
+    f: deque.Deque[int] = deque.new()
+    for i in 0..20 { f.push_front(i) }
+    assert_eq(f.front() ?? -1, 19)
+    assert_eq(f.back() ?? -1, 0)
+    sum = 0
+    for x in f { sum += x }
+    assert_eq(sum, 190)
+    f.clear()
+    assert(f.is_empty())
+    f.push_back(1)
+    assert(f.to_list() == [1])
+}

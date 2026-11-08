@@ -1,0 +1,644 @@
+// Lark 编译器 stage1 · 所有权检查（规则与 stage0 的 own.ml 相同）
+// 状态 St：live = false 表示这里不可达；moved 是已被移走的变量编号。
+// 求值模式："owning"（拿走值）、"reading"（借来看）、"discard"（结果丢弃）。
+
+type St {
+    live: bool
+    moved: [int]
+}
+
+type Oc {
+    loop_depth: int
+    frozen: [int]       // 正被 for / match 借用的根变量
+    breaks: [St]        // 当前循环里各个 break 处的状态
+    conts: [St]         // 当前循环里各个 continue 处的状态
+    far: [St]           // break / continue 外层循环时的状态，到那个循环收尾时并进它的 breaks / conts
+    far_depth: [int]    // 对应的那个循环的 loop_depth
+    far_cont: [bool]    // 是 continue
+    clo_base: int       // 正在检查的闭包里第一个局部变量的编号；编号更小的是捕获的外层变量，只读。不在闭包里时为 -1
+    pinned: [int]       // defer 用到的体外变量：到所在的块结束前都不能移走（defer 在那时还要用它们）
+}
+
+fn dead() -> St { St(live: false, moved: []) }
+
+fn union_st(a: St, b: St) -> St {
+    if !a.live {
+        b.copy()
+    } else if !b.live {
+        a.copy()
+    } else {
+        m = a.moved.copy()
+        for v in b.moved {
+            if !has(m, v) { m.push(v) }
+        }
+        St(live: true, moved: m)
+    }
+}
+
+fn arm_mode(m: str, ety: int) -> str {
+    if unit_like(ety) {
+        "discard"
+    } else if m == "owning" || m == "discard" {
+        m
+    } else if is_copy(ety) {
+        "reading"
+    } else {
+        "owning"
+    }
+}
+
+fn root(c: Ctx, e: Expr) -> int {
+    match e.kind {
+        EVar(_) => c.vid[e.id]
+        EField(b, _) => root(c, b)
+        EIndex(b, _) => root(c, b)
+        _ => -1
+    }
+}
+
+// 表达式里是否出现了变量 v
+fn mentions(c: Ctx, e: Expr, v: int) -> bool {
+    match e.kind {
+        EVar(_) => c.vid[e.id] == v
+        EInterp(ps) => mentions_list(c, ps, v)
+        EList(ps) => mentions_list(c, ps, v)
+        ETuple(ps) => mentions_list(c, ps, v)
+        EField(b, _) => mentions(c, b, v)
+        EUnary(_, a) => mentions(c, a, v)
+        EIndex(a, b) => mentions(c, a, v) || mentions(c, b, v)
+        EBinary(_, a, b) => mentions(c, a, v) || mentions(c, b, v)
+        ECall(_, args, _) => {
+            found = false
+            for a in args {
+                if mentions(c, a.value, v) { found = true }
+            }
+            found
+        }
+        EIf(cond, thn, els) => {
+            in_else = match els {
+                Some(eb) => mentions_block(c, eb, v)
+                None => false
+            }
+            mentions(c, cond, v) || mentions_block(c, thn, v) || in_else
+        }
+        EMatch(_, scrut, arms) => {
+            found = mentions(c, scrut, v)
+            for a in arms {
+                if mentions(c, a.body, v) { found = true }
+            }
+            found
+        }
+        EBlock(b) => mentions_block(c, b, v)
+        EScope(b) => mentions_block(c, b, v)
+        ELock(mx, _, _, b) => mentions(c, mx, v) || mentions_block(c, b, v)
+        ESelect(arms) => {
+            found = false
+            for a in arms {
+                if mentions(c, a.body, v) || mentions_opt(c, a.src, v) { found = true }
+            }
+            found
+        }
+        EReturn(val) => mentions_opt(c, val, v)
+        EClosure(_, body) => mentions(c, body, v)
+        _ => false
+    }
+}
+
+fn mentions_list(c: Ctx, es: [Expr], v: int) -> bool {
+    for e in es {
+        if mentions(c, e, v) { return true }
+    }
+    false
+}
+
+fn mentions_opt(c: Ctx, oe: Expr?, v: int) -> bool {
+    match oe {
+        Some(x) => mentions(c, x, v)
+        None => false
+    }
+}
+
+fn mentions_block(c: Ctx, b: Block, v: int) -> bool {
+    for s in b.stmts {
+        if mentions_stmt(c, s, v) { return true }
+    }
+    mentions_opt(c, b.tail, v)
+}
+
+fn mentions_stmt(c: Ctx, s: Stmt, v: int) -> bool {
+    match s.kind {
+        SExpr(e) => mentions(c, e, v)
+        SAssign(t, _, r) => mentions(c, t, v) || mentions(c, r, v)
+        SForCond(cond, body) => mentions_opt(c, cond, v) || mentions_block(c, body, v)
+        SForRange(_, _, lo, hi, body) => mentions(c, lo, v) || mentions(c, hi, v) || mentions_block(c, body, v)
+        SForEach(_, _, it, body, _, _) => mentions(c, it, v) || mentions_block(c, body, v)
+        SDefer(body) => mentions_block(c, body, v)
+        SLabel(_, body) => mentions_block(c, body, v)
+    }
+}
+
+fn own_expr(c: Ctx, inout o: Oc, st: St, m0: str, e: Expr) -> St {
+    if !st.live { return st.copy() }
+    // 自动包成 T? 的值会被拿走（与代码生成一致）
+    m = if c.wrap[e.id] && m0 == "reading" { "owning" } else { m0 }
+    if m == "discard" { unused_result(c, e) }
+    match e.kind {
+        EInt(_) => st.copy()
+        EFloat(_) => st.copy()
+        EBool(_) => st.copy()
+        EStr(_) => st.copy()
+        EInterp(ps) => {
+            s = st.copy()
+            for p in ps { s = own_expr(c, &o, s, "reading", p) }
+            s
+        }
+        EVar(x) => {
+            if c.rkind[e.id] == "const" || c.rkind[e.id] == "fnval" { return st.copy() }
+            v = c.vid[e.id]
+            if has(st.moved, v) { fail(e.line, e.col, "#{x} 的值已经被移走，不能再使用") }
+            if m == "owning" && !is_copy(c.ety[e.id]) {
+                if v < o.clo_base { fail(e.line, e.col, "闭包不能移走捕获的变量 #{x}") }
+                if c.locals[v].kind != "owned" {
+                    fail(e.line, e.col, "#{x} 是借用的，不能移走；需要副本请写 #{x}.copy()")
+                }
+                if has(o.frozen, v) { fail(e.line, e.col, "#{x} 正被 for 或 match 借用，不能移走") }
+                if has(o.pinned, v) { fail(e.line, e.col, "#{x} 在前面的 defer 里用到，到块结束前不能移走（defer 执行时还要用它）") }
+                s = st.copy()
+                s.moved.push(v)
+                s
+            } else {
+                st.copy()
+            }
+        }
+        EField(b, f) => {
+            if m == "owning" && !is_copy(c.ety[e.id]) {
+                fail(e.line, e.col, "不能把字段 #{f} 移出，请用 .copy() 或 replace")
+            }
+            own_expr(c, &o, st, "reading", b)
+        }
+        EIndex(b, i) => {
+            // 重载的下标得到的是 index 返回的新值，可以直接拿走
+            if m == "owning" && !is_copy(c.ety[e.id]) && c.rkind[e.id] != "index" {
+                fail(e.line, e.col, "不能把列表元素移出，请用 .copy() 或 pop")
+            }
+            s = own_expr(c, &o, st, "reading", b)
+            own_expr(c, &o, s, "reading", i)
+        }
+        ECall(_, args, _) => own_call(c, &o, st, e, args)
+        ETuple(items) => {
+            s = st.copy()
+            for x in items { s = own_expr(c, &o, s, "owning", x) }
+            s
+        }
+        EList(items) => {
+            s = st.copy()
+            for x in items { s = own_expr(c, &o, s, "owning", x) }
+            s
+        }
+        EUnary(op, a) => own_expr(c, &o, st, if op == "?" { "owning" } else { "reading" }, a)
+        EBinary(_, a, b) => {
+            s = own_expr(c, &o, st, "reading", a)
+            own_expr(c, &o, s, "reading", b)
+        }
+        EIf(cond, thn, els) => {
+            s = own_expr(c, &o, st, "reading", cond)
+            am = arm_mode(m, c.ety[e.id])
+            s1 = own_block(c, &o, s, am, thn)
+            s2 = match els {
+                Some(eb) => own_block(c, &o, s, am, eb)
+                None => s.copy()
+            }
+            union_st(s1, s2)
+        }
+        EMatch(owning, scrut, arms) => {
+            s = own_expr(c, &o, st, if owning { "owning" } else { "reading" }, scrut)
+            r = if owning { -1 } else { root(c, scrut) }
+            if r >= 0 { o.frozen.push(r) }
+            am = arm_mode(m, c.ety[e.id])
+            acc = dead()
+            for a in arms {
+                sa = own_expr(c, &o, s, am, a.body)
+                acc = union_st(acc, sa)
+            }
+            if r >= 0 { o.frozen.pop() }
+            acc
+        }
+        EBlock(b) => own_block(c, &o, st, arm_mode(m, c.ety[e.id]), b)
+        EScope(b) => own_block(c, &o, st, arm_mode(m, c.ety[e.id]), b)
+        ELock(mx, _, _, b) => {
+            // 锁着的时候互斥量本身不能被移走、重新赋值（和借用的 match 一样冻结它的根变量）
+            s = own_expr(c, &o, st, "reading", mx)
+            r = root(c, mx)
+            if r >= 0 { o.frozen.push(r) }
+            s2 = own_block(c, &o, s, arm_mode(m, c.ety[e.id]), b)
+            if r >= 0 { o.frozen.pop() }
+            s2
+        }
+        ESelect(arms) => {
+            // 先读所有通道和超时，再像 match 一样合并各分支；没有 done 分支时还要算上“什么也不做”
+            s = st.copy()
+            for a in arms {
+                match a.src {
+                    Some(x) => { s = own_expr(c, &o, s, "reading", x) }
+                    None => {}
+                }
+            }
+            am = arm_mode(m, c.ety[e.id])
+            acc = dead()
+            has_done = false
+            for a in arms {
+                if a.kind == "done" { has_done = true }
+                sa = own_expr(c, &o, s, am, a.body)
+                acc = union_st(acc, sa)
+            }
+            if !has_done { acc = union_st(acc, s) }
+            acc
+        }
+        EReturn(val) => {
+            match val {
+                Some(rv) => {
+                    _s = own_expr(c, &o, st, "owning", rv)
+                }
+                None => {}
+            }
+            dead()
+        }
+        EBreak(_) => {
+            far_jump(c, &o, e, st, false)
+            dead()
+        }
+        EContinue(_) => {
+            far_jump(c, &o, e, st, true)
+            dead()
+        }
+        EClosure(_, body) => {
+            // 闭包体单独检查：可能被调用多次，也可能一次都不调用，所以不影响外面的状态
+            ci = find_clo(c, e.id)
+            o2 = Oc(loop_depth: 0, frozen: o.frozen.copy(), breaks: [], conts: [], clo_base: c.clos[ci].base, pinned: [], far: [], far_depth: [], far_cont: [])
+            bm = if unit_like(telem(c, c.ety[e.id])) { "discard" } else { "owning" }
+            _s2 = own_expr(c, &o2, st, bm, body)
+            st.copy()
+        }
+    }
+}
+
+// 两阶段借用：其它参数在调用前就已求值完毕，只要它不是“指向 r 内部的借用”就安全。
+// 平凡类型按值传递；调用结果、构造、字符串拼接等都是新值；take 参数的 str 会先 dup。
+// 唯一危险的是：以 read 方式把 r 下面某个非平凡类型的位置（指针）传进去。
+fn aliases(c: Ctx, sg: Sig, is_ctor: bool, j: int, a: Expr, r: int) -> bool {
+    if !mentions(c, a, r) {
+        false
+    } else if is_trivial(c.ety[a.id]) {
+        false
+    } else if is_closure(a) {
+        // 闭包按只读捕获 r，调用期间 r 不能以 inout 传入
+        true
+    } else if !is_place(a) {
+        false
+    } else if is_ctor || sg.modes[j] == "take" {
+        // 移走 r 内部的值已由其它规则禁止；str 会 dup，所以安全
+        c.ety[a.id] != 2 && root(c, a) == r && is_var(a)
+    } else {
+        true
+    }
+}
+
+// 只读的变量是借用的 match 拆出来的时，提示可以写 match take：被匹配的是临时的值（函数调用的结果）时，
+// 拆出来的就是自己拥有的值，能改、能以 inout 传递（比如 match take l.accept() { Ok(c) => c.close() … }）
+fn ro_hint(c: Ctx, v: int) -> str {
+    if c.locals[v].in_match { "（它是借用的 match 拆出来的；要拿走里面的值，写成 match take：被匹配的要是函数调用的结果这样的临时值）" } else { "" }
+}
+
+// 位置是否经过 shared（s.f、s[i]、s.a.b…）：shared 的内容只读，不能经由它修改
+fn through_shared(c: Ctx, e: Expr) -> bool {
+    match e.kind {
+        EField(b, _) => is_shared(c, c.ety[b.id]) || through_shared(c, b)
+        EIndex(b, _) => is_shared(c, c.ety[b.id]) || through_shared(c, b)
+        _ => false
+    }
+}
+
+// 模块里定义的结构体，只要有没写 pub 的字段，字段在别的模块里就只读：赋值、+=、以 inout 传递（包括 m.keys.push(…)
+// 这样的方法调用）都只能在定义它的模块里做，否则外面可能破坏它的内部状态（比如 map.Map 的 keys 和私有的 slots）。
+// 字段全是 pub 的结构体只是一组数据，外面可以随便改（见 check.lark 的 all_pub）。
+// 在 e（要修改的位置）里逐层检查经过的字段
+fn field_guard(c: Ctx, e: Expr, line: int) {
+    match e.kind {
+        EField(b, f) => {
+            bt = c.ety[b.id]
+            m = type_mod(c, bt)
+            if m != "" && m != mod_of(c, line) && !all_pub(c, tname(c, bt)) {
+                ts = show_ty(c, bt)
+                fail(e.line, e.col, "#{ts} 的字段 #{f} 只能在模块 #{m} 里修改（#{ts} 有没写 pub 的字段），在这里只能读（请用 #{m} 提供的函数）")
+            }
+            field_guard(c, b, line)
+        }
+        EIndex(b, _) => field_guard(c, b, line)
+        _ => {}
+    }
+}
+
+// a, b = x 会把 x 移走。x 是借用的元组时（最常见的是 for p in pairs 里的 p），一般的报错只建议 .copy()，
+// 这里把不用复制的写法也告诉写的人
+fn destructure_guard(c: Ctx, target: Expr, rhs: Expr) {
+    is_tuple = match target.kind {
+        ETuple(_) => true
+        _ => false
+    }
+    if !is_tuple || is_copy(c.ety[rhs.id]) { return }
+    match rhs.kind {
+        EVar(x) => {
+            if c.rkind[rhs.id] == "const" || c.rkind[rhs.id] == "fnval" { return }
+            if c.locals[c.vid[rhs.id]].kind != "owned" {
+                fail(rhs.line, rhs.col, "#{x} 是借用的，解构会把它移走。只是读的话用 #{x}.0、#{x}.1，或者 match #{x} { (a, b) => … }（在 for 里可以直接写 for (a, b) in …）；需要副本请写 #{x}.copy()")
+            }
+        }
+        EField(_, f) => {
+            fail(rhs.line, rhs.col, "解构会把字段 #{f} 移出。只是读的话用 .#{f}.0、.#{f}.1，或者 match；要拿走请用 replace 或 .copy()")
+        }
+        _ => {}
+    }
+}
+
+fn own_call(c: Ctx, inout o: Oc, st: St, e: Expr, args: [Arg]) -> St {
+    if c.rkind[e.id] == "const" { return st.copy() }
+    // spawn(f, x)：第一个参数是函数名，只有 x 被移进新线程
+    if c.rkind[e.id] == "builtin" && c.rname[e.id] == "spawn" {
+        return own_expr(c, &o, st.copy(), "owning", args[1].value)
+    }
+    sg = call_sig(c, e, args)
+    order = call_order(c, e, args)
+    rk = c.rkind[e.id]
+    is_ctor = rk == "struct" || rk == "variant"
+    // inout 参数的根变量：可写、未冻结，且不能同时出现在其它参数里
+    for i in 0..len(args) {
+        if arg_amp(c, args[i]) {
+            r = root(c, args[i].value)
+            ln = args[i].value.line
+            cl = args[i].value.col
+            if r < 0 { fail(ln, cl, "& 只能用于变量、字段或下标") }
+            if through_shared(c, args[i].value) { fail(ln, cl, "shared 的内容是只读的，不能以 inout 传递") }
+            field_guard(c, args[i].value, ln)
+            nm = c.locals[r].name
+            if r < o.clo_base { fail(ln, cl, "闭包不能修改捕获的变量 #{nm}") }
+            if c.locals[r].kind == "read" { fail(ln, cl, "#{nm} 是只读的，不能以 inout 传递" + ro_hint(c, r)) }
+            if has(o.frozen, r) { fail(ln, cl, "#{nm} 正被 for 或 match 借用，不能修改") }
+            for j in 0..len(args) {
+                if j != i && aliases(c, sg, is_ctor, j, args[j].value, r) {
+                    fail(args[j].value.line, args[j].value.col, "#{nm} 以 inout 传入的同时又被其它参数使用（违反排他性）")
+                }
+            }
+        }
+    }
+    // 被移走的变量不能同时出现在其它参数里（C 的参数求值顺序不确定）
+    for k in 0..len(order) {
+        i = order[k]
+        takes = is_ctor || sg.modes[k] == "take"
+        if takes && is_var(args[i].value) && !is_copy(c.ety[args[i].value.id]) {
+            v = c.vid[args[i].value.id]
+            for j in 0..len(args) {
+                if j != i && mentions(c, args[j].value, v) {
+                    fail(args[j].value.line, args[j].value.col, "#{c.locals[v].name} 被移走的同时又被其它参数使用")
+                }
+            }
+        }
+    }
+    s = st.copy()
+    // 按书写顺序走，和生成的代码一样
+    slots = arg_slots(order)
+    for i in 0..len(args) {
+        k = slots[i]
+        mm = if is_ctor || sg.modes[k] == "take" { "owning" } else { "reading" }
+        before = s.moved.copy()
+        s = own_expr(c, &o, s, mm, args[i].value)
+        // 实参里间接移走的变量（f(&v, { v })、f(&v, if c { v } else { w })）也不能出现在别的实参里：
+        // 不然被调用的函数借到的是已经移走、清零了的值（见 design/soundness.md 第 8 节）
+        for v in s.moved {
+            if !has(before, v) {
+                for j in 0..len(args) {
+                    if j != i && mentions(c, args[j].value, v) {
+                        fail(args[j].value.line, args[j].value.col, "#{c.locals[v].name} 在另一个参数里被移走了，这里不能再用它")
+                    }
+                }
+            }
+        }
+    }
+    if sg.ret == 4 { dead() } else { s }
+}
+
+fn own_block(c: Ctx, inout o: Oc, st: St, m: str, b: Block) -> St {
+    s = st.copy()
+    npin = len(o.pinned)
+    for x in b.stmts { s = own_stmt(c, &o, s, x) }
+    r = match b.tail {
+        Some(tx) => own_expr(c, &o, s, m, tx)
+        None => s
+    }
+    // 块里 defer 钉住的变量，出了块就放开
+    for len(o.pinned) > npin { _v = o.pinned.pop() }
+    r
+}
+
+fn without(xs: [int], v: int) -> [int] {
+    out: [int] = []
+    for x in xs {
+        if x != v { out.push(x) }
+    }
+    out
+}
+
+// 赋值目标里的下标表达式按读取检查
+fn own_place_idx(c: Ctx, inout o: Oc, st: St, t: Expr) -> St {
+    match t.kind {
+        EIndex(b, i) => {
+            s = own_expr(c, &o, st, "reading", i)
+            own_place_idx(c, &o, s, b)
+        }
+        EField(b, _) => own_place_idx(c, &o, st, b)
+        _ => st.copy()
+    }
+}
+
+fn loop_check(c: Ctx, base: St, s: St, outer: int, line: int, col: int) {
+    if s.live {
+        for v in s.moved {
+            if !has(base.moved, v) && c.locals[v].loop_depth <= outer {
+                fail(line, col, "#{c.locals[v].name} 在循环里被移走，必须在本轮结束前重新赋值")
+            }
+        }
+    }
+}
+
+// break / continue 处的状态记到目标循环上：最里层的直接记，外层的先放在 far 里（见 loop_finish）
+fn far_jump(c: Ctx, inout o: Oc, e: Expr, st: St, cont: bool) {
+    n = c.ridx[e.id]
+    if n <= 1 {
+        if cont { o.conts.push(st.copy()) } else { o.breaks.push(st.copy()) }
+    } else {
+        o.far.push(st.copy())
+        o.far_depth.push(o.loop_depth - n + 1)
+        o.far_cont.push(cont)
+    }
+}
+
+// 循环收尾：检查本轮结束处和各个 continue 处，合并 break 处的状态
+fn loop_finish(c: Ctx, inout o: Oc, base: St, end_st: St, take saved_b: [St], take saved_c: [St], line: int, col: int) -> St {
+    // 跳到这个循环的 break outer / continue outer
+    k = len(o.far) - 1
+    for k >= 0 {
+        if o.far_depth[k] == o.loop_depth {
+            fs = o.far.remove_at(k)
+            _d = o.far_depth.remove_at(k)
+            if o.far_cont.remove_at(k) { o.conts.push(fs) } else { o.breaks.push(fs) }
+        }
+        k -= 1
+    }
+    o.loop_depth -= 1
+    outer = o.loop_depth
+    loop_check(c, base, end_st, outer, line, col)
+    for s in o.conts { loop_check(c, base, s, outer, line, col) }
+    res = union_st(base, end_st)
+    for s in o.breaks { res = union_st(res, s) }
+    o.breaks = saved_b
+    o.conts = saved_c
+    res
+}
+
+fn own_stmt(c: Ctx, inout o: Oc, st: St, s: Stmt) -> St {
+    if !st.live { return st.copy() }
+    match s.kind {
+        SExpr(e) => own_expr(c, &o, st, "discard", e)
+        SAssign(target, _, rhs) => {
+            destructure_guard(c, target, rhs)
+            s1 = own_expr(c, &o, st, "owning", rhs)
+            if c.decl[s.id] || !s1.live {
+                s1
+            } else if is_var(target) {
+                v = c.vid[target.id]
+                nm = c.locals[v].name
+                if v < o.clo_base { fail(s.line, s.col, "闭包不能给捕获的变量 #{nm} 赋值") }
+                if c.locals[v].kind == "read" { fail(s.line, s.col, "#{nm} 是只读的，不能赋值" + ro_hint(c, v)) }
+                if has(o.frozen, v) { fail(s.line, s.col, "#{nm} 正被 for 或 match 借用，不能赋值") }
+                St(live: true, moved: without(s1.moved, v))
+            } else {
+                r = root(c, target)
+                if r < 0 { fail(s.line, s.col, "无效的赋值目标") }
+                if through_shared(c, target) { fail(s.line, s.col, "shared 的内容是只读的，不能修改") }
+                field_guard(c, target, s.line)
+                nm = c.locals[r].name
+                if r < o.clo_base { fail(s.line, s.col, "闭包不能修改捕获的变量 #{nm}") }
+                if c.locals[r].kind == "read" { fail(s.line, s.col, "#{nm} 是只读的，不能修改其内容" + ro_hint(c, r)) }
+                if has(o.frozen, r) { fail(s.line, s.col, "#{nm} 正被 for 或 match 借用，不能修改") }
+                if has(s1.moved, r) { fail(s.line, s.col, "#{nm} 的值已经被移走") }
+                own_place_idx(c, &o, s1, target)
+            }
+        }
+        SForCond(cond, body) => {
+            saved_b = replace(&o.breaks, [])
+            saved_c = replace(&o.conts, [])
+            o.loop_depth += 1
+            s1 = match cond {
+                Some(cx) => own_expr(c, &o, st, "reading", cx)
+                None => st.copy()
+            }
+            end_st = own_block(c, &o, s1, "discard", body)
+            loop_finish(c, &o, st, end_st, saved_b, saved_c, s.line, s.col)
+        }
+        SForRange(_, _, lo, hi, body) => {
+            s0 = own_expr(c, &o, st, "reading", lo)
+            s1 = own_expr(c, &o, s0, "reading", hi)
+            saved_b = replace(&o.breaks, [])
+            saved_c = replace(&o.conts, [])
+            o.loop_depth += 1
+            end_st = own_block(c, &o, s1, "discard", body)
+            loop_finish(c, &o, s1, end_st, saved_b, saved_c, s.line, s.col)
+        }
+        SForEach(_, _, it, body, _, _) => {
+            if c.rkind[s.id] == "iter" {
+                // 自定义迭代器：it 被移进循环，循环变量每轮拥有 next 给的值
+                s0 = own_expr(c, &o, st, "owning", it)
+                saved_b0 = replace(&o.breaks, [])
+                saved_c0 = replace(&o.conts, [])
+                o.loop_depth += 1
+                end0 = own_block(c, &o, s0, "discard", body)
+                return loop_finish(c, &o, s0, end0, saved_b0, saved_c0, s.line, s.col)
+            }
+            s1 = own_expr(c, &o, st, "reading", it)
+            r = root(c, it)
+            if r >= 0 { o.frozen.push(r) }
+            saved_b = replace(&o.breaks, [])
+            saved_c = replace(&o.conts, [])
+            o.loop_depth += 1
+            end_st = own_block(c, &o, s1, "discard", body)
+            res = loop_finish(c, &o, s1, end_st, saved_b, saved_c, s.line, s.col)
+            if r >= 0 { o.frozen.pop() }
+            res
+        }
+        SLabel(_, body) => own_block(c, &o, st, "discard", body)
+        SDefer(body) => {
+            // 体在离开块时才执行：先钉住它用到的体外变量（体里也不能移走它们），再按现在的状态检查一遍；
+            // 体不改变外面的状态。用到的变量现在已经被移走（或者可能被移走）时，检查体时就会报错
+            for v in 0..c.ridx[s.id] {
+                if mentions_block(c, body, v) && !has(o.pinned, v) { o.pinned.push(v) }
+            }
+            _s = own_block(c, &o, st, "discard", body)
+            st.copy()
+        }
+    }
+}
+
+fn own_fn(c: Ctx, fi: int, body: Block) {
+    o = Oc(loop_depth: 0, frozen: [], breaks: [], conts: [], clo_base: -1, pinned: [], far: [], far_depth: [], far_cont: [])
+    m = if c.fns[fi].ret == 3 { "discard" } else { "owning" }
+    _s = own_block(c, &o, St(live: true, moved: []), m, body)
+}
+
+// 结果（T!）被丢掉时报错：错误会被悄悄忽略。if / match / 块本身不报，它们把“丢掉”传给各分支，在分支里的值上报。
+// 看的是值自己的类型（ety），自动包成 Ok 的值不算
+fn unused_result(c: Ctx, e: Expr) {
+    t = c.ety[e.id]
+    if t < 0 || tkind(c, t) != "res" { return }
+    control = match e.kind {
+        EIf(_, _, _) => true
+        EMatch(_, _, _) => true
+        EBlock(_) => true
+        EScope(_) => true
+        ELock(_, _, _, _) => true
+        ESelect(_) => true
+        _ => false
+    }
+    if control { return }
+    fail(e.line, e.col, "#{show_ty(c, t)} 的结果没有处理，出错时会被悄悄忽略：在后面加 ? 交给调用者，用 match 处理，或者写 _ = … 表示确实不需要")
+}
+
+fn own_program(c: Ctx, prog: Program) {
+    for i in 0..len(prog.fns) {
+        if !is_template(c, i) && !prog.fns[i].ext && !skipped_any(c, prog.fns[i]) { own_fn(c, i, prog.fns[i].body) }
+    }
+    for j in 0..len(c.insts) {
+        if !skipped_any(c, c.insts[j]) { own_fn(c, len(prog.fns) + j, c.insts[j].body) }
+    }
+}
+
+// ---------- 单元测试（lark1 --test，见 make unit-compiler） ----------
+
+test "所有权：状态合并" {
+    a = St(live: true, moved: [1, 2])
+    b = St(live: true, moved: [2, 3])
+    u = union_st(a, b)
+    assert(u.live)
+    assert_eq(u.moved, [1, 2, 3])
+    // 不可达的一边不影响结果
+    d = union_st(dead(), b)
+    assert_eq(d.moved, [2, 3])
+    assert(!union_st(dead(), dead()).live)
+    assert_eq(without([1, 2, 1, 3], 1), [2, 3])
+}
+
+test "所有权：match 分支的求值模式" {
+    assert_eq(arm_mode("owning", 3), "discard")
+    assert_eq(arm_mode("owning", 0), "owning")
+    assert_eq(arm_mode("reading", 0), "reading")
+    assert_eq(arm_mode("discard", 6), "discard")
+    assert_eq(arm_mode("reading", 6), "owning")
+}

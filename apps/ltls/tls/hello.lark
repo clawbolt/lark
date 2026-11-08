@@ -1,0 +1,206 @@
+// ClientHello、ServerHello 和扩展（RFC 8446 第 4.1.2、4.1.3、4.2 节）。都是握手消息的内容（不含 4 字节的消息头）。
+// 先证明再写：对应 formal/Lark/Hello.lean。函数和定义一一对应：
+//   exts_write / exts_parse ↔ extsW / extsP（extsP_extsW、extsP_some：写出来再读回来不变；读成功时写回去和原来一样）
+//   ch_write / ch_parse ↔ chW / chP（chP_chW、chP_some）
+//   sh_write / sh_parse ↔ shW / shP（shP_shW、shP_some）
+// 扩展内容自己的格式（supported_versions、key_share……）没有证明，用 record.frame 拼。实验性：没有经过审计
+import "tls/record"
+
+pub const TLS_CHACHA20_POLY1305_SHA256 = 0x1303
+pub const X25519 = 29
+pub const EXT_SUPPORTED_GROUPS = 10
+pub const EXT_SUPPORTED_VERSIONS = 43
+pub const EXT_KEY_SHARE = 51
+
+pub type Ext {
+    pub kind: int
+    pub data: [u8]
+}
+
+pub type ClientHello {
+    pub random: [u8]       // 32 字节
+    pub session_id: [u8]
+    pub suites: [u8]       // 每个套件 2 字节
+    pub exts: [Ext]
+}
+
+pub type ServerHello {
+    pub random: [u8]
+    pub session_id: [u8]
+    pub suite: int
+    pub exts: [Ext]
+}
+
+fn cat(inout out: [u8], b: [u8]) {
+    for x in b { out.push(x) }
+}
+
+// ---------- 扩展列表 ----------
+
+// 每个扩展：2 字节类型 + 内容（2 字节长度）。类型或内容放不进 2 字节时 panic
+pub fn exts_write(es: [Ext]) -> [u8] {
+    out: [u8] = []
+    for e in es {
+        if e.kind < 0 || e.kind > 0xffff { panic("扩展：类型 #{e.kind} 放不进 2 字节") }
+        record.push_be(&out, 2, e.kind)
+        cat(&out, record.frame(2, e.data))
+    }
+    out
+}
+
+// 读到数据用完为止
+pub fn exts_parse(d: [u8]) -> [Ext]! {
+    out: [Ext] = []
+    at = 0
+    for at < len(d) {
+        if len(d) - at < 2 { return Err("扩展：类型不完整") }
+        kind = record.read_be(d, at, 2)
+        p = match take record.unframe(2, d, at + 2) {
+            Ok(p) => p
+            Err(e) => { return Err("扩展 #{kind}：#{e}") }
+        }
+        out.push(Ext(kind: kind, data: p.body.copy()))
+        at = p.next
+    }
+    Ok(out)
+}
+
+// 第一个类型是 kind 的扩展的下标，没有时是 -1
+pub fn find(es: [Ext], kind: int) -> int {
+    for i in 0..len(es) {
+        if es[i].kind == kind { return i }
+    }
+    -1
+}
+
+// ---------- ClientHello ----------
+
+// 3 3、随机数、session_id（1 字节长度）、套件（2 字节长度）、压缩方法 [0]（1 字节长度）、扩展（2 字节长度）
+pub fn ch_write(h: ClientHello) -> [u8] {
+    if len(h.random) != 32 { panic("ClientHello：随机数要 32 字节") }
+    out: [u8] = [3, 3]
+    cat(&out, h.random)
+    cat(&out, record.frame(1, h.session_id))
+    cat(&out, record.frame(2, h.suites))
+    cat(&out, record.frame(1, [0]))
+    cat(&out, record.frame(2, exts_write(h.exts)))
+    out
+}
+
+pub fn ch_parse(d: [u8]) -> ClientHello! {
+    if len(d) < 34 || d[0].to_int() != 3 || d[1].to_int() != 3 { return Err("ClientHello：开头不是 3 3 加 32 字节随机数") }
+    random = sub(d, 2, 34)
+    sid = field(1, d, 34, "session_id")?
+    suites = field(2, d, sid.next, "cipher_suites")?
+    comp = field(1, d, suites.next, "compression_methods")?
+    eb = field(2, d, comp.next, "extensions")?
+    if eb.next != len(d) { return Err("ClientHello：扩展后面还有 #{len(d) - eb.next} 字节") }
+    if comp.body != [0] { return Err("ClientHello：压缩方法只能是 [0]") }
+    exts = exts_parse(eb.body)?
+    Ok(ClientHello(random: random, session_id: sid.body.copy(), suites: suites.body.copy(), exts: exts))
+}
+
+// ---------- ServerHello ----------
+
+// 3 3、随机数、session_id（1 字节长度）、套件（2 字节）、0、扩展（2 字节长度）
+pub fn sh_write(h: ServerHello) -> [u8] {
+    if len(h.random) != 32 { panic("ServerHello：随机数要 32 字节") }
+    out: [u8] = [3, 3]
+    cat(&out, h.random)
+    cat(&out, record.frame(1, h.session_id))
+    record.push_be(&out, 2, h.suite)
+    out.push(0)
+    cat(&out, record.frame(2, exts_write(h.exts)))
+    out
+}
+
+pub fn sh_parse(d: [u8]) -> ServerHello! {
+    if len(d) < 34 || d[0].to_int() != 3 || d[1].to_int() != 3 { return Err("ServerHello：开头不是 3 3 加 32 字节随机数") }
+    random = sub(d, 2, 34)
+    sid = field(1, d, 34, "session_id")?
+    if len(d) - sid.next < 3 { return Err("ServerHello：套件和压缩方法不完整") }
+    suite = record.read_be(d, sid.next, 2)
+    if d[sid.next + 2].to_int() != 0 { return Err("ServerHello：压缩方法只能是 0") }
+    eb = field(2, d, sid.next + 3, "extensions")?
+    if eb.next != len(d) { return Err("ServerHello：扩展后面还有 #{len(d) - eb.next} 字节") }
+    exts = exts_parse(eb.body)?
+    Ok(ServerHello(random: random, session_id: sid.body.copy(), suite: suite, exts: exts))
+}
+
+fn field(k: int, d: [u8], at: int, what: str) -> record.Piece! {
+    match take record.unframe(k, d, at) {
+        Ok(p) => Ok(p)
+        Err(e) => Err("#{what}：#{e}")
+    }
+}
+
+fn sub(d: [u8], a: int, b: int) -> [u8] {
+    out: [u8] = []
+    for i in a..b { out.push(d[i]) }
+    out
+}
+
+// ---------- 我们用到的扩展内容（没有证明，见文件开头） ----------
+
+// 客户端：只支持 TLS 1.3、X25519、ChaCha20-Poly1305
+pub fn client_hello(random: [u8], session_id: [u8], pub_key: [u8]) -> ClientHello {
+    share: [u8] = []
+    record.push_be(&share, 2, X25519)
+    cat(&share, record.frame(2, pub_key))
+    groups: [u8] = []
+    record.push_be(&groups, 2, X25519)
+    suites: [u8] = []
+    record.push_be(&suites, 2, TLS_CHACHA20_POLY1305_SHA256)
+    exts: [Ext] = [
+        Ext(kind: EXT_SUPPORTED_VERSIONS, data: [2, 3, 4]),
+        Ext(kind: EXT_SUPPORTED_GROUPS, data: record.frame(2, groups)),
+        Ext(kind: EXT_KEY_SHARE, data: record.frame(2, share)),
+    ]
+    ClientHello(random: random.copy(), session_id: session_id.copy(), suites: suites, exts: exts)
+}
+
+// 服务器：照着客户端的 session_id 回（第 4.1.3 节），选 ChaCha20-Poly1305
+pub fn server_hello(random: [u8], session_id: [u8], pub_key: [u8]) -> ServerHello {
+    share: [u8] = []
+    record.push_be(&share, 2, X25519)
+    cat(&share, record.frame(2, pub_key))
+    exts: [Ext] = [
+        Ext(kind: EXT_SUPPORTED_VERSIONS, data: [3, 4]),
+        Ext(kind: EXT_KEY_SHARE, data: share),
+    ]
+    ServerHello(random: random.copy(), session_id: session_id.copy(), suite: TLS_CHACHA20_POLY1305_SHA256, exts: exts)
+}
+
+// ClientHello 里 X25519 的公钥：key_share 是一串（组 2 字节 + 公钥 2 字节长度），找组是 29 的
+pub fn client_key(h: ClientHello) -> [u8]! {
+    i = find(h.exts, EXT_KEY_SHARE)
+    if i < 0 { return Err("ClientHello：没有 key_share") }
+    d = h.exts[i].data.copy()
+    list = field(2, d, 0, "key_share")?
+    if list.next != len(d) { return Err("key_share：后面有多余的字节") }
+    at = 0
+    for at < len(list.body) {
+        if len(list.body) - at < 2 { return Err("key_share：组不完整") }
+        g = record.read_be(list.body, at, 2)
+        k = field(2, list.body, at + 2, "key_share")?
+        if g == X25519 {
+            if len(k.body) != 32 { return Err("key_share：X25519 的公钥要 32 字节") }
+            return Ok(k.body.copy())
+        }
+        at = k.next
+    }
+    Err("ClientHello：key_share 里没有 X25519")
+}
+
+// ServerHello 里的公钥；同时检查 supported_versions 是 TLS 1.3（3 4）
+pub fn server_key(h: ServerHello) -> [u8]! {
+    v = find(h.exts, EXT_SUPPORTED_VERSIONS)
+    if v < 0 || h.exts[v].data != [3, 4] { return Err("ServerHello：不是 TLS 1.3") }
+    i = find(h.exts, EXT_KEY_SHARE)
+    if i < 0 { return Err("ServerHello：没有 key_share") }
+    d = h.exts[i].data.copy()
+    if len(d) < 2 || record.read_be(d, 0, 2) != X25519 { return Err("ServerHello：key_share 不是 X25519") }
+    k = field(2, d, 2, "key_share")?
+    if k.next != len(d) || len(k.body) != 32 { return Err("ServerHello：X25519 的公钥要 32 字节") }
+    Ok(k.body.copy())
+}

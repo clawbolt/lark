@@ -1,0 +1,3 @@
+tests/err/exclusive.lark:6:15: 错误：xs 以 inout 传入的同时又被其它参数使用（违反排他性）
+ 6 |     fill(&xs, xs)
+   |               ^

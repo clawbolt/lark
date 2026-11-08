@@ -1,0 +1,95 @@
+// 并发的基准：通道来回、多对一、spawn 的开销。stage 4 改动前后各跑一次（见 design/stage4-tasks.md 第 9 节）。
+// 在仓库根目录：
+//   ./build/lark1 bench/conc/chan.lark -o build/conc_chan.c
+//   cc -std=gnu11 -O2 -pthread -w -Iruntime build/conc_chan.c -o build/conc_chan && ./build/conc_chan
+import "std/time"
+
+type Echo {
+    inp: Chan[int]
+    out: Chan[int]
+}
+
+// 收到一个数就加一发回去；发送方都放手以后结束
+fn echo(take e: Echo) {
+    for true {
+        v = e.inp.recv() ?? -1
+        if v < 0 { break }
+        e.out.send(v + 1)
+    }
+}
+
+// to 移进来，函数返回时放手，echo 的 recv 才会得到 None
+fn drive(take to: Chan[int], back: Chan[int], n: int) -> int {
+    sum = 0
+    for i in 0..n {
+        to.send(i)
+        sum += back.recv() ?? 0
+    }
+    sum
+}
+
+fn pingpong(n: int) -> int {
+    to: Chan[int] = chan()
+    back: Chan[int] = chan()
+    e = Echo(inp: to.copy(), out: back.copy())
+    t = time.now()
+    sum = 0
+    scope {
+        spawn(echo, e)
+        sum = drive(to, back, n)
+    }
+    ns = time.elapsed_ns(t)
+    if sum != n * (n + 1) / 2 { print("pingpong 结果不对：#{sum}") }
+    ns / n
+}
+
+type Prod {
+    n: int
+    out: Chan[int]
+}
+
+fn produce(take p: Prod) {
+    for i in 0..p.n { p.out.send(i) }
+}
+
+// k 个任务各发 n 个数，主任务全部收下；返回每条消息的纳秒数
+fn fanin(k: int, n: int) -> int {
+    ch: Chan[int] = chan()
+    t = time.now()
+    got = 0
+    scope {
+        for _i in 0..k { spawn(produce, Prod(n: n, out: ch.copy())) }
+        for true {
+            v = ch.recv() ?? -1
+            if v < 0 { break }
+            got += 1
+        }
+    }
+    ns = time.elapsed_ns(t)
+    if got != k * n { print("fanin 收到的个数不对：#{got}") }
+    ns / (k * n)
+}
+
+// spawn k 个只发一个数就结束的任务；返回每个任务的纳秒数
+fn spawns(k: int) -> int {
+    ch: Chan[int] = chan()
+    t = time.now()
+    scope {
+        for _i in 0..k { spawn(produce, Prod(n: 1, out: ch.copy())) }
+    }
+    ns = time.elapsed_ns(t)
+    got = 0
+    for true {
+        v = ch.recv() ?? -1
+        if v < 0 { break }
+        got += 1
+    }
+    if got != k { print("spawns 收到的个数不对：#{got}") }
+    ns / k
+}
+
+fn main() {
+    print("通道来回一次：#{pingpong(100_000)} ns")
+    print("4 个发送方，每条消息：#{fanin(4, 250_000)} ns")
+    print("spawn 一个任务：#{spawns(1000)} ns")
+}

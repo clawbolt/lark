@@ -1,0 +1,276 @@
+// JSON-RPC 的请求和回复、服务器的生命周期（LSP 规范的 “Lifecycle Messages”）。
+// 先证明再写：对应 formal/Lark/LspRpc.lean，函数和定义一一对应：
+//   Kind ↔ Msg（classify 把 JSON 分成 Req / Note / Resp / Invalid / Bad）、Out ↔ Out、St ↔ St、step ↔ step
+// 证明了：没退出时每个请求正好得到一条回复、id 对得上（step_req）；通知从不得到回复（note_quiet）；
+// 一串消息处理下来，回复的 id 正好是 exit 之前各个请求（以及带 id 的不是请求的 JSON）的 id，按顺序（run_replies）；
+// initialize 之前别的请求不处理（uninit_guard）；shutdown 以后不会再回到运行中（shutdown_stays）；
+// exit 时 shutdown 过退出码 0，否则 1（exit_code）；退出以后什么都不做（exited_stuck）。
+// 模型里认识的方法（known）一定成功回复：阶段 5 到 9 起是 textDocument/definition、documentSymbol、formatting、completion、semanticTokens/full（找不到时结果是 null，也是成功的回复）；
+// 别的方法回复 -32601。
+// id 在模型里抽象成数字，这里原样保留 JSON 的数字或字符串，回复时照抄。
+import "std/json"
+import "lsp/frame"
+import "lsp/pos"
+import "lsp/docs"
+import "lsp/diag"
+import "lsp/defn"
+import "lsp/symbols"
+import "lsp/format"
+import "lsp/complete"
+import "lsp/semantic"
+
+pub const PARSE_ERROR = -32700
+pub const INVALID_REQUEST = -32600
+pub const METHOD_NOT_FOUND = -32601
+pub const NOT_INITIALIZED = -32002
+
+pub enum St {
+    Uninit
+    Running
+    Shutdown
+    Exited
+}
+
+pub enum Kind {
+    Req(id: json.Json, method: str, params: json.Json)    // 请求：带 id，要回复
+    Note(method: str, params: json.Json)                  // 通知：不回复
+    Resp                                                  // 客户端的回复：服务器还没发过请求，丢掉
+    Invalid(id: json.Json)                                // 合法的 JSON 但不是请求：-32600（id 不合法时是 null）
+    Bad                                                   // 读不出来的 JSON：-32700，id 是 null
+}
+
+pub enum Out {
+    Reply(id: json.Json, result: json.Json)
+    Fail(id: json.Json, code: int, message: str)
+    Exit(code: int)
+    Diag(uri: str, ver: int)    // 要给这个文档发诊断（diag.pubs）；ver 是 -1 时清空。不是回复：通知仍然不得到回复（note_quiet）
+}
+
+pub type Server {
+    pub st: St
+    pub enc: pos.Enc    // initialize 时和客户端商量好的列的单位
+    pub files: [docs.Doc]    // 打开的文档（docs.lark）
+    pub home: str            // Lark 的安装目录（feed 时设置）：格式化要运行里面的 build/lark-fmt
+}
+
+pub fn new() -> Server {
+    fs: [docs.Doc] = []
+    Server(st: Uninit, enc: pos.U16, files: fs, home: "")
+}
+
+// ---------- 分类 ----------
+
+fn good_id(v: json.Json) -> bool {
+    match v {
+        Num(_) => true
+        Str(_) => true
+        _ => false
+    }
+}
+
+fn is_obj(v: json.Json) -> bool {
+    match v {
+        Obj(_, _) => true
+        _ => false
+    }
+}
+
+fn has(j: json.Json, key: str) -> bool {
+    match json.get(j, key) {
+        Some(_) => true
+        None => false
+    }
+}
+
+pub fn classify(text: str) -> Kind {
+    j = match take json.parse(text) {
+        Ok(v) => v
+        Err(_) => { return Bad }
+    }
+    if !is_obj(j) { return Invalid(json.Null) }
+    id = json.Null
+    has_id = false
+    match take json.get(j, "id") {
+        Some(v) => {
+            id = v
+            has_id = true
+        }
+        None => {}
+    }
+    ok_id = good_id(id)
+    ver = json.as_str(json.get(j, "jsonrpc") ?? json.Null) ?? ""
+    params = json.get(j, "params") ?? json.Null
+    if ver != "2.0" { return Invalid(if ok_id { id } else { json.Null }) }
+    match take json.as_str(json.get(j, "method") ?? json.Null) {
+        Some(name) => {
+            if !has_id { return Note(name, params) }
+            if ok_id { return Req(id, name, params) }
+            Invalid(json.Null)
+        }
+        None => {
+            if has_id && ok_id && (has(j, "result") || has(j, "error")) { return Resp }
+            Invalid(if ok_id { id } else { json.Null })
+        }
+    }
+}
+
+// ---------- initialize ----------
+
+// 客户端在 capabilities.general.positionEncodings 里列了 "utf-8" 时用字节，否则用 UTF-16（LSP 默认）
+fn choose(params: json.Json) -> pos.Enc {
+    encs = json.path(params, "capabilities.general.positionEncodings") ?? json.Null
+    match encs {
+        Arr(items) => {
+            for x in items {
+                match x {
+                    Str(s) => { if s == "utf-8" { return pos.U8 } }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    pos.U16
+}
+
+fn init_result(enc: pos.Enc) -> json.Json {
+    name = match enc {
+        U8 => "utf-8"
+        U16 => "utf-16"
+    }
+    // 文档同步：打开和关闭都告诉服务器，修改是增量的（2 = Incremental）
+    sync = json.object([("openClose", json.Bool(true)), ("change", json.Num(2))])
+    // 跳到定义（defn.lark）、文档大纲（symbols.lark）、格式化（format.lark）、补全（complete.lark，输入 . 时也触发）、语义高亮（semantic.lark）
+    sem = json.object([("legend", semantic.legend_json()), ("full", json.Bool(true))])
+    comp = json.object([("triggerCharacters", json.Arr([json.Str(".")]))])
+    caps = json.object([("positionEncoding", json.Str(name)), ("textDocumentSync", sync), ("definitionProvider", json.Bool(true)), ("documentSymbolProvider", json.Bool(true)), ("documentFormattingProvider", json.Bool(true)), ("completionProvider", comp), ("semanticTokensProvider", sem)])
+    info = json.object([("name", json.Str("llsp")), ("version", json.Str("0.1.0"))])
+    json.object([("capabilities", caps), ("serverInfo", info)])
+}
+
+// ---------- 状态机 ----------
+
+fn quiet() -> [Out] { [] }
+
+// 处理一条消息（step）
+pub fn step(inout s: Server, take msg: Kind) -> [Out] {
+    if s.st == Exited { return quiet() }
+    match take msg {
+        Bad => [Fail(json.Null, PARSE_ERROR, "读不出来的 JSON")]
+        Resp => quiet()
+        Invalid(id) => [Fail(id, INVALID_REQUEST, "不是 JSON-RPC 的请求")]
+        Note(m, params) => {
+            if m == "exit" {
+                code = if s.st == Shutdown { 0 } else { 1 }
+                s.st = Exited
+                [Exit(code)]
+            } else if s.st == Running {
+                // 运行中的 didOpen / didChange / didClose 改打开的文档；别的通知（以及 shutdown 以后的）丢掉
+                match take docs.event(m, params) {
+                    Some(e) => {
+                        ps = diag.pubs(s.files, e)
+                        enc = s.enc.copy()
+                        docs.step(enc, &s.files, e)
+                        outs: [Out] = []
+                        for p in ps { outs.push(Diag(p.uri.copy(), p.ver)) }
+                        return outs
+                    }
+                    None => {}
+                }
+                quiet()
+            } else {
+                quiet()
+            }
+        }
+        Req(id, m, params) => {
+            if s.st == Uninit {
+                if m == "initialize" {
+                    s.st = Running
+                    s.enc = choose(params)
+                    [Reply(id, init_result(s.enc))]
+                } else {
+                    [Fail(id, NOT_INITIALIZED, "还没有 initialize")]
+                }
+            } else if s.st == Running {
+                if m == "initialize" {
+                    [Fail(id, INVALID_REQUEST, "已经 initialize 过了")]
+                } else if m == "shutdown" {
+                    s.st = Shutdown
+                    [Reply(id, json.Null)]
+                } else if m == "textDocument/definition" {
+                    [Reply(id, defn.locate(s.enc, s.files, params))]
+                } else if m == "textDocument/documentSymbol" {
+                    [Reply(id, symbols.outline(s.enc, s.files, params))]
+                } else if m == "textDocument/formatting" {
+                    [Reply(id, format.formatting(s.home, s.enc, s.files, params))]
+                } else if m == "textDocument/completion" {
+                    [Reply(id, complete.completion(s.enc, s.files, params))]
+                } else if m == "textDocument/semanticTokens/full" {
+                    [Reply(id, semantic.full(s.enc, s.files, params))]
+                } else {
+                    [Fail(id, METHOD_NOT_FOUND, "不认识的方法：#{m}")]
+                }
+            } else {
+                [Fail(id, INVALID_REQUEST, "已经 shutdown 了")]
+            }
+        }
+    }
+}
+
+// 一条输出写成 JSON-RPC 的消息内容；Exit 不是消息，是空串
+pub fn encode(o: Out) -> str {
+    match o {
+        Reply(id, result) => json.format(json.object([("jsonrpc", json.Str("2.0")), ("id", id.copy()), ("result", result.copy())]))
+        Fail(id, code, message) => {
+            e = json.object([("code", json.Num(code)), ("message", json.Str(message.copy()))])
+            json.format(json.object([("jsonrpc", json.Str("2.0")), ("id", id.copy()), ("error", e)]))
+        }
+        Exit(_) => ""
+        Diag(_, _) => ""
+    }
+}
+
+// buf 里所有完整的消息都处理掉（读过的从 buf 里去掉）；返回要写出去的字节和退出码（还没 exit 时是 -1）。
+// 分帧错了是 Err：消息的边界找不回来了，只能退出
+// home 是 Lark 的安装目录（diag.find_home），用来运行编译器发诊断；"" 时不检查（关掉文档时照样清空诊断）
+pub fn feed(inout s: Server, inout buf: str, home: str) -> (str, int)! {
+    s.home = home.copy()
+    out = ""
+    code = -1
+    more = false
+    for code < 0 && !more {
+        got = frame.parse(buf, 0)?
+        match take got {
+            Msg(body, next) => {
+                buf = slice(buf, next, len(buf))
+                outs = step(&s, classify(body))
+                for o in outs {
+                    match o {
+                        Exit(c) => { code = c }
+                        Diag(uri, ver) => {
+                            m = diag_msg(s, home, uri, ver)
+                            if m != "" { out += frame.frame(m) }
+                        }
+                        _ => { out += frame.frame(encode(o)) }
+                    }
+                }
+            }
+            More => { more = true }
+        }
+    }
+    Ok((out, code))
+}
+
+// 发给 uri 的诊断；ver 是 -1 时清空。要检查但没有编译器、或者文档已经不在时是 ""（不发）
+fn diag_msg(s: Server, home: str, uri: str, ver: int) -> str {
+    if ver < 0 {
+        empty: [diag.Item] = []
+        return diag.publish(uri, -1, empty)
+    }
+    if home == "" { return "" }
+    d = match take docs.get(s.files, uri) {
+        Some(x) => x
+        None => { return "" }
+    }
+    diag.publish(uri, d.ver, diag.check(home, uri, d.text, s.enc))
+}

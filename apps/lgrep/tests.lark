@@ -1,0 +1,127 @@
+// lgrep 的单元测试：lark test（在 apps/lgrep 里运行）。正则表达式和逐行查找，不碰文件
+import "std/re"
+import "grep/scan"
+
+fn rx(p: str) -> re.Re {
+    match take re.compile(p) {
+        Ok(r) => r
+        Err(e) => panic("模式 #{p} 编译失败：#{e}")
+    }
+}
+
+// 第一处匹配的原文，没有时是 "-"
+fn first(p: str, s: str) -> str {
+    a, b = re.find_at(rx(p), s, 0) ?? (-1, -1)
+    if a < 0 { "-" } else { slice(s, a, b) }
+}
+
+fn plain() -> scan.Opts {
+    scan.Opts(number: false, count: false, files_only: false, invert: false, color: false, with_name: false)
+}
+
+test "正则：字面量、. 和转义" {
+    assert_eq(first("abc", "xxabcxx"), "abc")
+    assert_eq(first("a.c", "abc a-c"), "abc")
+    assert_eq(first("a\\.c", "abc a.c"), "a.c")
+    assert_eq(first("云雀", "天上的云雀"), "云雀")
+    assert_eq(first("abc", "ab"), "-")
+    assert_eq(first("", "xyz"), "")
+}
+
+test "正则：重复（贪心）" {
+    assert_eq(first("ab*c", "ac abc abbbc"), "ac")
+    assert_eq(first("ab+c", "ac abbbc"), "abbbc")
+    assert_eq(first("colou?r", "color colour"), "color")
+    assert_eq(first("a.*b", "a1b2b3"), "a1b2b")
+    assert_eq(first("x*", "abc"), "")
+}
+
+test "正则：字符类和 \\d \\w \\s" {
+    assert_eq(first("[0-9]+", "abc 2026 x"), "2026")
+    assert_eq(first("[^a-z ]+", "abc DEF ghi"), "DEF")
+    assert_eq(first("\\d+\\.\\d+", "v 3.14 x"), "3.14")
+    assert_eq(first("\\w+", "  hi_2 !"), "hi_2")
+    assert_eq(first("a\\sb", "a b a\tb"), "a b")
+    assert_eq(first("[\\d_]+", "x_12_"), "_12_")
+    assert_eq(first("[]x]", "a]b"), "]")
+    assert_eq(first("[a-]+", "--a-z"), "--a-")
+}
+
+test "正则：^ $ 和 |" {
+    assert_eq(first("^ab", "ab ab"), "ab")
+    assert_eq(first("^b", "ab"), "-")
+    assert_eq(first("b$", "ab b"), "b")
+    a, _b = re.find_at(rx("b$"), "ab b", 0) ?? (-1, -1)
+    assert_eq(a, 3)
+    assert_eq(first("cat|dog", "hotdog"), "dog")
+    assert_eq(first("^x|y$", "axy"), "y")
+    assert_eq(first("a\\|b", "a|b"), "a|b")
+    assert_eq(first("[|]", "a|b"), "|")
+}
+
+test "正则：忽略大小写" {
+    r = match take re.compile("(?i)he[l-n]+o|WORLD") {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    assert(re.is_match(r, "Say HELLO"))
+    assert(re.is_match(r, "the World"))
+    assert(!re.is_match(r, "help"))
+    // 不忽略时照常区分
+    assert(!re.is_match(rx("hello"), "HELLO"))
+}
+
+test "正则：写错的模式" {
+    bad = ["*a", "a(?", "[abc", "a\\", "[z-a]"]
+    errs = 0
+    for p in bad {
+        match re.compile(p) {
+            Ok(_) => {}
+            Err(_) => { errs += 1 }
+        }
+    }
+    // "a(?" 是没写完的分组
+    assert_eq(errs, 5)
+}
+
+test "逐行：行号、文件名、反选、计数" {
+    text = "alpha\nbeta\ngamma\ndelta"
+    r = rx("ta$|^g")
+    out, n = scan.scan(r, text, "f.txt", plain())
+    assert_eq(out, "beta\ngamma\ndelta\n")
+    assert_eq(n, 3)
+    o = plain()
+    o.number = true
+    o.with_name = true
+    out2, _n2 = scan.scan(r, text, "f.txt", o)
+    assert_eq(out2, "f.txt:2:beta\nf.txt:3:gamma\nf.txt:4:delta\n")
+    v = plain()
+    v.invert = true
+    out3, n3 = scan.scan(r, text, "f.txt", v)
+    assert_eq(out3, "alpha\n")
+    assert_eq(n3, 1)
+    c = plain()
+    c.count = true
+    out4, _n4 = scan.scan(r, text, "f.txt", c)
+    assert_eq(out4, "3\n")
+    l = plain()
+    l.files_only = true
+    out5, _n5 = scan.scan(r, text, "f.txt", l)
+    assert_eq(out5, "f.txt\n")
+    // 没有匹配：什么也不打印
+    out6, n6 = scan.scan(rx("zzz"), text, "f.txt", plain())
+    assert_eq(out6, "")
+    assert_eq(n6, 0)
+}
+
+test "逐行：颜色、二进制文件" {
+    o = plain()
+    o.color = true
+    out, _n = scan.scan(rx("o+"), "foo boo\n", "f", o)
+    esc = "\e"
+    assert_eq(out, "f#{esc}[1;31moo#{esc}[0m b#{esc}[1;31moo#{esc}[0m\n")
+    bin = "abc" + from_byte(0) + "def\nxyz\n"
+    out2, n2 = scan.scan(rx("def"), bin, "b.bin", plain())
+    assert_eq(out2, "二进制文件 b.bin 有匹配\n")
+    assert_eq(n2, 1)
+}

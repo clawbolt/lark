@@ -1,0 +1,86 @@
+// std/utf8 的边界：空串、不合法的字节、截断的字符、每种长度的边界码点
+import "std/utf8"
+
+// 0 到 255 每个字节各一个，再加几段形状对但不合法的（代理区、超过 U+10FFFF）
+fn bad_bytes() -> str {
+    s = ""
+    for b in 0..256 { s += from_byte(b) }
+    s + from_byte(0xED) + from_byte(0xA0) + from_byte(0x80) + from_byte(0xF4) + from_byte(0x90) + from_byte(0x80) + from_byte(0x80)
+}
+
+test "计数和切成字符" {
+    none: [str] = []
+    assert_eq(utf8.count(""), 0)
+    assert_eq(utf8.count("a云😀"), 3)
+    assert(utf8.chars("a云😀") == ["a", "云", "😀"])
+    assert(utf8.chars("") == none)
+    // 不合法的字节一个算一个字符
+    assert_eq(utf8.count("a" + from_byte(0xff) + "b"), 3)
+    assert_eq(utf8.count(from_byte(0x80) + from_byte(0x80)), 2)
+    // 截断的多字节字符：每个字节各算一个
+    cut = slice("云", 0, 2)
+    assert_eq(utf8.count(cut), 2)
+    assert_eq(utf8.count("x" + cut), 3)
+    // 首字节后面跟的不是后续字节：首字节单独算一个，后面的字符照常（以前会把 A 吞掉，当成一个 Á）
+    assert(utf8.chars(from_byte(0xC3) + "A") == [from_byte(0xC3), "A"])
+    // 不管怎么切，拼回去都是原来的字节
+    bad = "a" + from_byte(0xE4) + from_byte(0xB8) + "云" + from_byte(0xF0) + from_byte(0x9F) + from_byte(0x98) + "b" + from_byte(0xC0)
+    assert_eq(join(utf8.chars(bad), ""), bad)
+    it = utf8.each("")
+    assert_eq(next(&it) ?? "<完>", "<完>")
+}
+
+test "码点" {
+    assert(utf8.code_points("中a") == [20013, 97])
+    assert(utf8.code_points("😀") == [0x1F600])
+    // 不合法的地方：每个字节一个 U+FFFD，和 Go 的 utf8.DecodeRune 一样
+    assert(utf8.code_points(from_byte(0xff)) == [0xFFFD])
+    assert(utf8.code_points(slice("云", 0, 2)) == [0xFFFD, 0xFFFD])
+    assert(utf8.code_points(from_byte(0xC3) + "A") == [0xFFFD, 65])
+    // 过长编码、代理区、超过 U+10FFFF：形状对也不解出来（以前会解出 NUL、0xD800、0x1FFFFF）
+    assert(utf8.code_points(from_byte(0xC0) + from_byte(0x80)) == [0xFFFD, 0xFFFD])
+    assert(utf8.code_points(from_byte(0xED) + from_byte(0xA0) + from_byte(0x80)) == [0xFFFD, 0xFFFD, 0xFFFD])
+    assert(utf8.code_points(from_byte(0xF7) + from_byte(0xBF) + from_byte(0xBF) + from_byte(0xBF)) == [0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD])
+    // 所以解出来的码点都能编码回去，不会 panic
+    for cp in utf8.code_points(bad_bytes()) { assert(len(utf8.from_code_point(cp)) > 0) }
+    assert_eq(len(utf8.from_code_point(0x7F)), 1)
+    assert_eq(len(utf8.from_code_point(0x80)), 2)
+    assert_eq(len(utf8.from_code_point(0x7FF)), 2)
+    assert_eq(len(utf8.from_code_point(0x800)), 3)
+    assert_eq(len(utf8.from_code_point(0xFFFF)), 3)
+    assert_eq(len(utf8.from_code_point(0x10000)), 4)
+    assert_eq(utf8.from_code_point(0x10FFFF), from_byte(0xF4) + from_byte(0x8F) + from_byte(0xBF) + from_byte(0xBF))
+    // 每种长度的边界码点编码以后再解回来
+    for cp in [0, 0x7F, 0x80, 0x7FF, 0x800, 0xFFFF, 0x10000, 0x10FFFF] {
+        assert(utf8.code_points(utf8.from_code_point(cp)) == [cp])
+        assert(utf8.is_valid(utf8.from_code_point(cp)))
+    }
+}
+
+test "按字符取子串和倒过来" {
+    s = "a云b😀"
+    assert_eq(utf8.slice_chars(s, 1, 3), "云b")
+    assert_eq(utf8.slice_chars(s, -5, 1), "a")
+    assert_eq(utf8.slice_chars(s, 2, 100), "b😀")
+    assert_eq(utf8.slice_chars(s, 3, 3), "")
+    assert_eq(utf8.slice_chars(s, 3, 1), "")
+    assert_eq(utf8.slice_chars(s, 10, 20), "")
+    assert_eq(utf8.slice_chars("", 0, 1), "")
+}
+
+test "检查是否合法" {
+    assert(utf8.is_valid(""))
+    assert(utf8.is_valid("a云😀"))
+    assert(!utf8.is_valid(from_byte(0x80)))
+    assert(!utf8.is_valid(slice("云", 0, 2)))
+    assert(!utf8.is_valid(from_byte(0xC3)))
+    assert(!utf8.is_valid(from_byte(0xF8) + "aaaa"))
+    assert(!utf8.is_valid(from_byte(0xE4) + "ab"))
+    // 过长编码、代理区、超过 U+10FFFF：形状对，但不合法
+    assert(!utf8.is_valid(from_byte(0xC0) + from_byte(0x80)))
+    assert(!utf8.is_valid(from_byte(0xE0) + from_byte(0x80) + from_byte(0x80)))
+    assert(!utf8.is_valid(from_byte(0xED) + from_byte(0xA0) + from_byte(0x80)))
+    assert(!utf8.is_valid(from_byte(0xF0) + from_byte(0x8F) + from_byte(0xBF) + from_byte(0xBF)))
+    assert(!utf8.is_valid(from_byte(0xF4) + from_byte(0x90) + from_byte(0x80) + from_byte(0x80)))
+    assert(utf8.is_valid(from_byte(0xED) + from_byte(0x9F) + from_byte(0xBF)))
+}

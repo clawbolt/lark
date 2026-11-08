@@ -1,0 +1,33 @@
+// ledit · 对文字（一个行的列表）的修改。每种修改做完都返回能撤销它的那个修改，撤销栈里存的就是这些
+pub enum Edit {
+    Ins(row: int, col: int, text: str)    // 在第 row 行第 col 个字节处插入（text 里没有换行）
+    Del(row: int, col: int, text: str)    // 删掉那里的 text
+    Split(row: int, col: int)             // 在 col 处断成两行
+    Join(row: int, col: int)              // 第 row 行和下一行接起来；col 是接缝处（第 row 行原来的长度）
+}
+
+pub fn apply(inout lines: [str], e: Edit) -> Edit {
+    match e {
+        Ins(r, c, t) => {
+            s = lines[r]
+            lines[r] = slice(s, 0, c) + t + slice(s, c, len(s))
+            Del(r, c, t)
+        }
+        Del(r, c, t) => {
+            s = lines[r]
+            lines[r] = slice(s, 0, c) + slice(s, c + len(t), len(s))
+            Ins(r, c, t)
+        }
+        Split(r, c) => {
+            s = lines[r]
+            lines[r] = slice(s, 0, c)
+            lines.insert_at(r + 1, slice(s, c, len(s)))
+            Join(r, c)
+        }
+        Join(r, c) => {
+            lines[r] += lines[r + 1]
+            _next = lines.remove_at(r + 1)
+            Split(r, c)
+        }
+    }
+}

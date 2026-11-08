@@ -1,0 +1,137 @@
+// Lark 标准库 · 日志（用 Lark 自己写）
+// 用法：import "std/log"
+//
+//   lg = log.new("lhttp")                   // 级别看环境变量 LARK_LOG（debug / info / warn / error / off，默认 info）
+//   lg.info("开始监听")                      // 2026-10-29T04:24:01.123Z INFO lhttp: 开始监听
+//   lg.warn("慢请求")                        // debug / info / warn / error 四个级别
+//   c = lg.with("conn", "17")               // 带上固定的字段，返回新的 Logger
+//   c.log(log.ERROR, "读失败", ["path", p, "err", e])   // 一次性的字段：键、值交替
+//   lg.level = log.DEBUG                    // 字段都是 pub 的，可以直接改
+//
+// 写到标准错误（fd 字段可以改），每条一行，一次 write 写完。值里有空格、=、引号或控制字符时加引号（按 JSON 的写法转义）。
+// LARK_LOG_FORMAT=json，或者把 as_json 设成 true 时每行是一个 JSON 对象：{"time":…,"level":"INFO","name":…,"msg":…,键:值…}。
+// 不想要时间（比如对比测试的输出）把 show_time 设成 false。
+import "std/json"
+import "std/time"
+import "std/str"
+
+pub const DEBUG = 0
+pub const INFO = 1
+pub const WARN = 2
+pub const ERROR = 3
+pub const OFF = 4
+
+pub type Logger {
+    pub name: str
+    pub level: int      // 低于这个级别的不写
+    pub as_json: bool
+    pub show_time: bool
+    pub fd: int
+    pub fields: [str]   // 每条都带上的字段，键、值交替
+}
+
+pub fn new(name: str) -> Logger {
+    form = os_env("LARK_LOG_FORMAT")
+    no: [str] = []
+    Logger(name: name, level: parse_level(os_env("LARK_LOG")) ?? INFO, as_json: form == "json", show_time: true, fd: 2, fields: no)
+}
+
+fn os_env(k: str) -> str { try_getenv(k) ?? "" }
+
+// "debug" / "info" / "warn"（或 "warning"）/ "error" / "off"，不分大小写
+pub fn parse_level(s: str) -> int? {
+    l = str.to_lower(str.trim(s))
+    if l == "debug" { return Some(DEBUG) }
+    if l == "info" { return Some(INFO) }
+    if l == "warn" || l == "warning" { return Some(WARN) }
+    if l == "error" { return Some(ERROR) }
+    if l == "off" || l == "none" { return Some(OFF) }
+    None
+}
+
+pub fn level_name(level: int) -> str {
+    if level <= DEBUG { "DEBUG" } else if level == INFO { "INFO" } else if level == WARN { "WARN" } else { "ERROR" }
+}
+
+pub fn enabled(lg: Logger, level: int) -> bool { level >= lg.level && level < OFF }
+
+pub fn with(lg: Logger, key: str, val: str) -> Logger {
+    c = lg.copy()
+    c.fields.push(key)
+    c.fields.push(val)
+    c
+}
+
+pub fn debug(lg: Logger, msg: str) { log(lg, DEBUG, msg, none()) }
+
+pub fn info(lg: Logger, msg: str) { log(lg, INFO, msg, none()) }
+
+pub fn warn(lg: Logger, msg: str) { log(lg, WARN, msg, none()) }
+
+pub fn error(lg: Logger, msg: str) { log(lg, ERROR, msg, none()) }
+
+// kv 是键、值交替的列表；个数是单数时最后一个键的值是空字符串
+pub fn log(lg: Logger, level: int, msg: str, kv: [str]) {
+    if !enabled(lg, level) { return }
+    _w = try_fd_write(lg.fd, format_line(lg, level, msg, kv, time.unix_ms()) + "\n")
+}
+
+// 一条日志的文字（不带换行），ms 是时间（从 1970 年起的毫秒数）
+pub fn format_line(lg: Logger, level: int, msg: str, kv: [str], ms: int) -> str {
+    stamp = time.format_iso(time.date_utc(ms))
+    if lg.as_json {
+        out = "{"
+        if lg.show_time { out += "\"time\":\"#{stamp}\"," }
+        out += "\"level\":\"#{level_name(level)}\""
+        if lg.name != "" { out += ",\"name\":" + json.quote(lg.name) }
+        out += ",\"msg\":" + json.quote(msg)
+        out += json_pairs(lg.fields)
+        out += json_pairs(kv)
+        return out + "}"
+    }
+    out = if lg.show_time { stamp + " " } else { "" }
+    out += level_name(level)
+    if lg.name != "" { out += " " + lg.name + ":" }
+    out += " " + msg
+    out += text_pairs(lg.fields)
+    out + text_pairs(kv)
+}
+
+fn json_pairs(kv: [str]) -> str {
+    out = ""
+    i = 0
+    for i < len(kv) {
+        v = if i + 1 < len(kv) { kv[i + 1].copy() } else { "" }
+        out += "," + json.quote(kv[i]) + ":" + json.quote(v)
+        i += 2
+    }
+    out
+}
+
+fn text_pairs(kv: [str]) -> str {
+    out = ""
+    i = 0
+    for i < len(kv) {
+        v = if i + 1 < len(kv) { kv[i + 1].copy() } else { "" }
+        out += " " + kv[i] + "=" + value(v)
+        i += 2
+    }
+    out
+}
+
+fn value(s: str) -> str {
+    if len(s) == 0 { return "\"\"" }
+    for i in 0..len(s) {
+        b = byte_at(s, i)
+        if b <= ' ' || b == '=' || b == '"' || b == 0x7F { return json.quote(s) }
+    }
+    s
+}
+
+fn none() -> [str] {
+    out: [str] = []
+    out
+}
+
+// "#{lg}"：Logger(lhttp, INFO)：名字和级别；输出格式、固定字段在 pub 字段里
+pub fn show(lg: Logger) -> str { "Logger(#{lg.name}, #{level_name(lg.level)})" }

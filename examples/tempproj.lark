@@ -1,0 +1,39 @@
+// 在临时值（函数调用的结果）上直接取字段和下标：f().xs[0].name
+// 只是读（打印、比较、assert_eq、传给只读参数）时，临时值放进本作用域的临时变量，字段和下标就地读，之后整个释放；
+// 以前这里编译器会报"内部错误：从字段或下标移出"。要拥有里面的列表、结构时和变量一样写 .copy()（所有权检查不让隐式移出）；
+// str / int 这些直接取出来（复制一份）。
+// 编译：lark1 examples/tempproj.lark -o out.c
+type In {
+    name: str
+    xs: [int]
+}
+
+type Out {
+    ins: [In]
+    tag: str
+}
+
+fn mk() -> Out { Out(ins: [In(name: "a", xs: [1, 2]), In(name: "b", xs: [3])], tag: "t") }
+
+fn total(xs: [int]) -> int {
+    s = 0
+    for x in xs { s += x }
+    s
+}
+
+fn main() {
+    print(mk().ins[1].name)
+    print("#{mk().ins[0].xs[1]}")
+    print("#{len(mk().ins)}")
+    print("#{total(mk().ins[0].xs)}")
+    n = mk().ins[0].xs.copy()
+    n.push(9)
+    print("#{n}")
+    s = mk().tag
+    print(s)
+    b = mk().ins[1].copy()
+    print(b.name)
+    assert_eq(mk().ins[1].xs[0], 3)
+    assert_eq(mk().ins[0].name, "a")
+    print("好了")
+}

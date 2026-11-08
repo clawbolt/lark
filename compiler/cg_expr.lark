@@ -1,0 +1,1070 @@
+// Lark 编译器 stage1 · C 代码生成：表达式
+// 约定同 stage0：owned 产生新拥有的值；read 产生借来看的值（临时变量登记到当前作用域释放）；
+// 移走 = LK_MOVE（按位复制后清零）。
+
+fn spaces(n: int) -> str {
+    parts: [str] = []
+    for _i in 0..n { parts.push("  ") }
+    join(parts, "")
+}
+
+fn emit(inout g: Gen, s: str) {
+    if s != "" {
+        pre = spaces(g.ind)
+        g.lines.push(pre + s)
+    }
+}
+
+fn fresh(inout g: Gen, pfx: str) -> str {
+    g.tmp += 1
+    pfx + int_str(g.tmp)
+}
+
+fn open_scope(inout g: Gen, is_loop: bool) {
+    g.scopes.push(GScope(places: [], tys: [], is_loop: is_loop, exit: "", wait: false))
+}
+
+// lock 块、scope 块的边界：正常走到块尾时由块自己解锁、等待；跳出去时由 drop_jump 执行 exit
+fn open_exit(inout g: Gen, exit: str, wait: bool) {
+    g.scopes.push(GScope(places: [], tys: [], is_loop: false, exit: exit, wait: wait))
+}
+
+// 从后往前释放第 i 层作用域登记的值；类型是 -1 的是 defer 的体（已经生成好的 C 代码，见 cg_stmt 的 SDefer）
+fn drop_scope_at(c: Ctx, inout g: Gen, i: int) {
+    pl = g.scopes[i].places.copy()
+    ty = g.scopes[i].tys.copy()
+    k = len(pl) - 1
+    for k >= 0 {
+        if ty[k] < 0 { emit(&g, pl[k]) } else { emit(&g, drop_stmt(c, ty[k], pl[k])) }
+        k -= 1
+    }
+}
+
+fn close_scope(c: Ctx, inout g: Gen) {
+    n = len(g.scopes)
+    drop_scope_at(c, &g, n - 1)
+    g.scopes.pop()
+}
+
+fn own_place(inout g: Gen, place: str, t: int) {
+    if managed(t) {
+        n = len(g.scopes)
+        g.scopes[n - 1].places.push(place)
+        g.scopes[n - 1].tys.push(t)
+    }
+}
+
+// 跳出去（return、?、尾调用跳回开头时到函数外，break、continue 时到循环外）之前：从里到外释放局部变量，
+// 经过的 lock 块马上解锁（互斥量可能是外层的变量，要在释放它之前解锁），经过的 scope 块最后才等任务结束：
+// 先放掉手里的值（比如通道的副本），等着 None 的任务才能结束，不会互相等住。
+// loops 是要跳出几层循环（break outer 可能不止一层）；0 表示一直到函数外
+fn drop_jump(c: Ctx, inout g: Gen, loops: int) {
+    waits: [str] = []
+    left = loops
+    i = len(g.scopes) - 1
+    for i >= 0 {
+        drop_scope_at(c, &g, i)
+        ex = g.scopes[i].exit.copy()
+        if ex != "" {
+            if g.scopes[i].wait { waits.push(ex) } else { emit(&g, ex) }
+        }
+        if g.scopes[i].is_loop && left > 0 {
+            left -= 1
+            if left == 0 { break }
+        }
+        i -= 1
+    }
+    for w in waits { emit(&g, w) }
+}
+
+// 有没有还在生效的 defer：有的话调用自己的 return f(…) 不能变成跳回开头，不然 defer 会在递归调用之前执行
+fn defers_active(g: Gen) -> bool {
+    for sc in g.scopes {
+        for t in sc.tys {
+            if t < 0 { return true }
+        }
+    }
+    false
+}
+
+fn drop_all(c: Ctx, inout g: Gen) { drop_jump(c, &g, 0) }
+
+// break / continue：n 是跳出几层循环（见 check 的 jump_depth），超过一层时用 goto 跳到外层循环的标签
+fn gen_jump(c: Ctx, inout g: Gen, n: int, cont: bool) {
+    k = if n < 1 { 1 } else { n }
+    drop_jump(c, &g, k)
+    if k == 1 {
+        emit(&g, if cont { "continue;" } else { "break;" })
+    } else {
+        tag = g.loops[len(g.loops) - k]
+        emit(&g, if cont { "goto lk_cont_#{tag};" } else { "goto lk_brk_#{tag};" })
+    }
+}
+
+fn lit(inout g: Gen, s: str) -> str {
+    g.nlit += 1
+    n = g.nlit
+    g.lits.push("static lk_str lit#{n};\n")
+    "lk_lit(&lit#{n}, #{c_string(s)}, #{len(s)})"
+}
+
+fn local_expr(c: Ctx, g: Gen, vid: int) -> str {
+    cn = c.locals[vid].cname
+    if g.ptrs[vid] { "(*" + cn + ")" } else { cn }
+}
+
+fn place(c: Ctx, inout g: Gen, e: Expr) -> str {
+    match e.kind {
+        EVar(_) => {
+            rk = c.rkind[e.id]
+            if rk == "const" {
+                const_c(c, &g, c.ridx[e.id])
+            } else if rk == "fnval" {
+                gen_fn_value(c, &g, e, false)
+            } else {
+                local_expr(c, g, c.vid[e.id])
+            }
+        }
+        EField(b, f) => {
+            rb = read(c, &g, b)
+            // shared 自动解一层
+            if is_shared(c, c.ety[b.id]) { "(" + rb + ")->v." + fld(f) } else { rb + "." + fld(f) }
+        }
+        EIndex(b, i) => {
+            if c.rkind[e.id] == "index" { return gen_index_op(c, &g, e, b, i) }
+            rb = read(c, &g, b)
+            ri = read(c, &g, i)
+            bt = c.ety[b.id]
+            if is_shared(c, bt) {
+                "(*lk_at_#{mangle(c, telem(c, bt))}(&((#{rb})->v), #{ri}))"
+            } else {
+                "(*lk_at_#{mangle(c, bt)}(&(#{rb}), #{ri}))"
+            }
+        }
+        _ => {
+            panic("内部错误：不是位置表达式")
+        }
+    }
+}
+
+// 重载的下标 x[i]（见 check_index）。要拥有结果时直接交出 index 返回的新值（index_call）；
+// 当位置读时放进本作用域的临时变量（之后释放），这样能复制、借给只读参数、match
+fn index_call(c: Ctx, inout g: Gen, e: Expr, b: Expr, i: Expr) -> str {
+    fi = find_fn(c, c.rname[e.id])
+    rb = read(c, &g, b)
+    ri = read(c, &g, i)
+    call = fname(c.rname[e.id]) + "(" + op_arg(c.fns[fi].ptys[0], rb) + ", " + op_arg(c.fns[fi].ptys[1], ri) + ")"
+    ret_tmp(c, &g, c.ety[e.id], call)
+}
+
+fn gen_index_op(c: Ctx, inout g: Gen, e: Expr, b: Expr, i: Expr) -> str {
+    tn = index_call(c, &g, e, b, i)
+    own_place(&g, tn, c.ety[e.id])
+    tn
+}
+
+fn read(c: Ctx, inout g: Gen, e: Expr) -> str {
+    t = c.ety[e.id]
+    register(c, &g, t)
+    if c.wrap[e.id] {
+        // 自动包成 T? 的值：先做出新值，再登记释放
+        ot = c.wrapt[e.id]
+        v = owned(c, &g, e)
+        tn = fresh(&g, "t")
+        ct = ctype(c, &g, ot)
+        emit(&g, "#{ct} #{tn} = #{v};")
+        own_place(&g, tn, ot)
+        tn
+    } else if is_place(e) || is_proj(c, e) {
+        place(c, &g, e)
+    } else {
+        match e.kind {
+            EStr(s) => lit(&g, s)
+            _ => {
+                if !managed(t) {
+                    owned(c, &g, e)
+                } else {
+                    v = owned(c, &g, e)
+                    tn = fresh(&g, "t")
+                    ct = ctype(c, &g, t)
+                    emit(&g, "#{ct} #{tn} = #{v};")
+                    own_place(&g, tn, t)
+                    tn
+                }
+            }
+        }
+    }
+}
+
+// 临时值上的字段、下标（f().xs[0].name）：根不是变量，不是 is_place，但也能当位置读——
+// place 读底下的值时 read 会把临时值放进本作用域的临时变量（之后释放），字段、下标就是那个临时变量里的位置
+fn is_proj(c: Ctx, e: Expr) -> bool {
+    match e.kind {
+        EField(_, _) => true
+        EIndex(_, _) => c.rkind[e.id] != "index"
+        _ => false
+    }
+}
+
+fn owned_place(c: Ctx, inout g: Gen, e: Expr, t: int) -> str {
+    pl = place(c, &g, e)
+    if !managed(t) {
+        pl
+    } else if t == 2 {
+        "lk_str_dup(" + pl + ")"
+    } else if is_var(e) {
+        "LK_MOVE(" + pl + ")"
+    } else if !is_place(e) {
+        // 临时值里的字段、下标：临时值之后整个释放，这里复制一份（不能从变量的字段、下标移出，所有权检查已经拦住了）
+        copy_expr(c, t, pl)
+    } else {
+        panic("内部错误：从字段或下标移出")
+    }
+}
+
+fn owned_control(c: Ctx, inout g: Gen, e: Expr, t: int) -> str {
+    if unit_like(t) {
+        control(c, &g, e, "")
+        ""
+    } else {
+        r = fresh(&g, "t")
+        ct = ctype(c, &g, t)
+        emit(&g, "#{ct} #{r} = {0};")
+        control(c, &g, e, r)
+        // ()! 的 if：没有值的分支没给 r 赋值，就是 Ok()
+        if is_res_unit(c, t) { emit(&g, "if (#{res_unset(c, t, r)}) #{r} = lk_ok_#{mangle(c, t)}();") }
+        r
+    }
+}
+
+// ---------- T? 与 T! ----------
+
+// 把值 v 包进容器类型 bt（Some 或 Ok）；v 为 "" 时是 Ok()
+fn box_ctor(c: Ctx, bt: int, v: str) -> str {
+    m = mangle(c, bt)
+    if tkind(c, bt) == "res" { "lk_ok_#{m}(#{v})" } else { "lk_some_#{m}(#{v})" }
+}
+
+// 容器里是否有值
+fn box_has(c: Ctx, bt: int, x: str) -> str {
+    if tkind(c, bt) == "res" { "#{racc(c, bt, x)}ok" } else if is_boxed(c, bt) { "(#{x}) != NULL" } else { "(#{x}).some" }
+}
+
+// 容器里的值（位置表达式）
+fn box_val(c: Ctx, bt: int, x: str) -> str {
+    if tkind(c, bt) == "res" { "#{racc(c, bt, x)}val" } else if is_boxed(c, bt) { "*(#{x})" } else { "(#{x}).v" }
+}
+
+// T? 的 None
+fn opt_none(c: Ctx, t: int) -> str { if is_boxed(c, t) { "NULL" } else { "(#{cty(c, t)}){0}" } }
+
+// 把 T? 的变量 x 里的值移到新变量 dst（类型 dct）里，x 变成 None（在堆上的顺便释放外壳）
+fn opt_take(c: Ctx, t: int, x: str, dct: str, dst: str) -> str {
+    if is_boxed(c, t) { "#{dct} #{dst} = *#{x}; lk_free(#{x}); #{x} = NULL;" } else { "#{dct} #{dst} = #{x}.v; #{x}.some = false;" }
+}
+
+// a?：T! 出错时把错误转给调用者，T? 为 None 时返回 None；否则取出里面的值
+// e 是 ? 表达式本身：c.rname[e.id] 非空时，错误值先经过那个 from 转换
+fn gen_try(c: Ctx, inout g: Gen, e: Expr, a: Expr) -> str {
+    at = c.ety[a.id]
+    v = owned(c, &g, a)
+    ct = ctype(c, &g, at)
+    q = fresh(&g, "q")
+    emit(&g, "#{ct} #{q} = #{v};")
+    rt = g.ret
+    rct = ctype(c, &g, rt)
+    is_res = tkind(c, at) == "res"
+    emit(&g, "if (!(#{box_has(c, at, q)})) {")
+    g.ind += 1
+    r = fresh(&g, "r")
+    if is_res {
+        ect = ctype(c, &g, res_err(c, at))
+        emit(&g, "#{ect} #{r}e = #{racc(c, at, q)}err; memset(&#{racc(c, at, q)}err, 0, sizeof(#{r}e)); #{drop_stmt(c, at, q)}")
+        conv = c.rname[e.id]
+        ev = if conv == "" { r + "e" } else { fname(conv) + "(" + r + "e)" }
+        emit(&g, "#{rct} #{r} = lk_err_#{mangle(c, rt)}(#{ev});")
+    } else {
+        emit(&g, "#{rct} #{r} = #{opt_none(c, rt)};")
+    }
+    drop_all(c, &g)
+    emit(&g, "return #{r};")
+    g.ind -= 1
+    emit(&g, "}")
+    el = telem(c, at)
+    if unit_like(el) {
+        emit(&g, drop_stmt(c, at, q))
+        ""
+    } else {
+        val = fresh(&g, "t")
+        ect = ctype(c, &g, el)
+        if is_res {
+            emit(&g, "#{ect} #{val} = #{racc(c, at, q)}val; memset(&#{racc(c, at, q)}val, 0, sizeof(#{val})); #{drop_stmt(c, at, q)}")
+        } else {
+            emit(&g, opt_take(c, at, q, ect, val))
+        }
+        val
+    }
+}
+
+fn owned(c: Ctx, inout g: Gen, e: Expr) -> str {
+    if c.wrap[e.id] {
+        ot = c.wrapt[e.id]
+        v = owned_raw(c, &g, e)
+        ct = ctype(c, &g, ot)
+        tn = fresh(&g, "t")
+        bx = if is_dyn(c, ot) { "lk_mkdyn_#{mangle(c, ot)}_#{mangle(c, c.ety[e.id])}(#{v})" } else { box_ctor(c, ot, v) }
+        emit(&g, "#{ct} #{tn} = #{bx};")
+        tn
+    } else {
+        owned_raw(c, &g, e)
+    }
+}
+
+// int 字面量的 C 写法：最小值写成 INT64_MIN（C 里 -9223372036854775808 是对一个放不下的正数取负）
+fn int_c(n: int) -> str { if n == int_min() { "INT64_MIN" } else { "INT64_C(#{n})" } }
+
+fn owned_raw(c: Ctx, inout g: Gen, e: Expr) -> str {
+    t = c.ety[e.id]
+    register(c, &g, t)
+    match e.kind {
+        EVar(_) => if c.rkind[e.id] == "fnval" { gen_fn_value(c, &g, e, true) } else { owned_place(c, &g, e, t) }
+        EField(_, _) => owned_place(c, &g, e, t)
+        EIndex(b, i) => if c.rkind[e.id] == "index" { index_call(c, &g, e, b, i) } else { owned_place(c, &g, e, t) }
+        EInt(n) => int_c(n)
+        EFloat(s) => s
+        EBool(b) => if b { "true" } else { "false" }
+        EStr(s) => lit(&g, s)
+        EInterp(parts) => {
+            tn = fresh(&g, "t")
+            emit(&g, "lk_str #{tn} = lk_str_new();")
+            for p in parts {
+                v = read(c, &g, p)
+                pt = c.ety[p.id]
+                if pt == 2 {
+                    emit(&g, "lk_str_append(&#{tn}, #{v});")
+                } else if pt == 0 || is_fixed(pt) {
+                    emit(&g, "lk_str_append_int(&#{tn}, #{v});")
+                } else if pt == 9 {
+                    emit(&g, "lk_str_append_float(&#{tn}, #{v});")
+                } else if pt == 1 {
+                    emit(&g, "lk_str_append_bool(&#{tn}, #{v});")
+                } else {
+                    // 自己的 show，或者列表、T?、元组按元素拼（见 check_show）
+                    register_show(c, &g, pt)
+                    emit(&g, "lk_show_#{mangle(c, pt)}(&#{tn}, &(#{v}));")
+                }
+            }
+            tn
+        }
+        ECall(_, args, _) => gen_call(c, &g, e, args)
+        ETuple(items) => {
+            // 元组是匿名结构体：按字段 0、1… 初始化
+            inits: [str] = []
+            for k in 0..len(items) {
+                v = owned(c, &g, items[k])
+                inits.push(".f_#{k} = " + v)
+            }
+            tn = fresh(&g, "t")
+            emit(&g, "S_#{tname(c, t)} #{tn} = { #{join(inits, ", ")} };")
+            tn
+        }
+        EList(items) => {
+            tn = fresh(&g, "t")
+            ct = ctype(c, &g, t)
+            emit(&g, "#{ct} #{tn} = {0};")
+            m = mangle(c, t)
+            for x in items {
+                v = owned(c, &g, x)
+                emit(&g, "lk_push_#{m}(&#{tn}, #{v});")
+            }
+            tn
+        }
+        EUnary(op, a) => {
+            if op == "?" { return gen_try(c, &g, e, a) }
+            if c.rkind[e.id] == "op" { return gen_op(c, &g, e.id, op, a, a, true) }
+            v = read(c, &g, a)
+            if op == "-" && t == 9 {
+                "(-(" + v + "))"
+            } else if op == "!" && is_fixed(t) {
+                "((" + fixed_cty(t) + ")~(" + v + "))"
+            } else if op == "!" && t == 0 {
+                "(~(" + v + "))"
+            } else if op == "-" {
+                "lk_neg(" + v + ")"
+            } else {
+                "(" + op + "(" + v + "))"
+            }
+        }
+        EBinary(op, a, b) => gen_binary(c, &g, e.id, op, a, b)
+        EIf(_, _, _) => owned_control(c, &g, e, t)
+        EMatch(_, _, _) => owned_control(c, &g, e, t)
+        EBlock(_) => owned_control(c, &g, e, t)
+        EScope(_) => owned_control(c, &g, e, t)
+        ELock(_, _, _, _) => owned_control(c, &g, e, t)
+        ESelect(_) => owned_control(c, &g, e, t)
+        EReturn(val) => {
+            gen_return(c, &g, val)
+            ""
+        }
+        EBreak(_) => {
+            gen_jump(c, &g, c.ridx[e.id], false)
+            ""
+        }
+        EContinue(_) => {
+            gen_jump(c, &g, c.ridx[e.id], true)
+            ""
+        }
+        EClosure(ps, body) => gen_closure(c, &g, e, ps, body)
+    }
+}
+
+// a ?? b，T 不能复制：a 是临时的值（类型检查保证），有值时把里面的值移出来，再释放外壳（结果类型的 Err 不会出现在这条路上）；
+// 没有值时先释放 a（结果类型要释放 err），再求 b
+fn gen_coalesce_move(c: Ctx, inout g: Gen, a: Expr, b: Expr) -> str {
+    at = c.ety[a.id]
+    el = telem(c, at)
+    v = owned(c, &g, a)
+    act = ctype(c, &g, at)
+    q = fresh(&g, "q")
+    emit(&g, "#{act} #{q} = #{v};")
+    ct = ctype(c, &g, el)
+    tn = fresh(&g, "t")
+    emit(&g, "#{ct} #{tn} = {0};")
+    emit(&g, "if (#{box_has(c, at, q)}) {")
+    if tkind(c, at) == "res" {
+        emit(&g, "  #{tn} = #{racc(c, at, q)}val; memset(&#{racc(c, at, q)}val, 0, sizeof(#{tn})); #{drop_stmt(c, at, q)}")
+    } else {
+        w = fresh(&g, "t")
+        emit(&g, "  " + opt_take(c, at, q, ct, w) + " #{tn} = #{w};")
+    }
+    emit(&g, "} else {")
+    g.ind += 1
+    emit(&g, drop_stmt(c, at, q))
+    open_scope(&g, false)
+    // b 是 exit、panic 这类不返回的调用时没有值，不赋值
+    assign_into(c, &g, tn, b)
+    close_scope(c, &g)
+    g.ind -= 1
+    emit(&g, "}")
+    tn
+}
+
+fn gen_binary(c: Ctx, inout g: Gen, id: int, op: str, a: Expr, b: Expr) -> str {
+    if c.rkind[id] == "op" {
+        return gen_op(c, &g, id, op, a, b, false)
+    }
+    if op == "??" && !is_copy(telem(c, c.ety[a.id])) {
+        return gen_coalesce_move(c, &g, a, b)
+    }
+    if op == "??" {
+        // a 有值就复制里面的值，否则才求 b
+        ra = read(c, &g, a)
+        el = telem(c, c.ety[a.id])
+        tn = fresh(&g, "t")
+        ct = ctype(c, &g, el)
+        emit(&g, "#{ct} #{tn} = {0};")
+        at = c.ety[a.id]
+        inner = copy_expr(c, el, box_val(c, at, ra))
+        emit(&g, "if (#{box_has(c, at, ra)}) {")
+        emit(&g, "  #{tn} = #{inner};")
+        emit(&g, "} else {")
+        g.ind += 1
+        open_scope(&g, false)
+        // b 是 exit、panic 这类不返回的调用时没有值，不赋值
+        assign_into(c, &g, tn, b)
+        close_scope(c, &g)
+        g.ind -= 1
+        emit(&g, "}")
+        return tn
+    }
+    if op == "&&" || op == "||" {
+        tn = fresh(&g, "t")
+        ra = read(c, &g, a)
+        emit(&g, "bool #{tn} = #{ra};")
+        neg = if op == "&&" { "" } else { "!" }
+        emit(&g, "if (#{neg}#{tn}) {")
+        g.ind += 1
+        open_scope(&g, false)
+        rb = read(c, &g, b)
+        emit(&g, "#{tn} = #{rb};")
+        close_scope(c, &g)
+        g.ind -= 1
+        emit(&g, "}")
+        tn
+    } else {
+        ra = read(c, &g, a)
+        rb = read(c, &g, b)
+        ta = c.ety[a.id]
+        if op == "+" && ta == 2 {
+            "lk_str_cat(#{ra}, #{rb})"
+        } else if op == "==" && ta == 2 {
+            "lk_str_eq(#{ra}, #{rb})"
+        } else if op == "!=" && ta == 2 {
+            "(!lk_str_eq(#{ra}, #{rb}))"
+        } else if (op == "==" || op == "!=") && managed(ta) {
+            // 结构体、枚举、列表、T?、T!：按值逐个比较
+            neg = if op == "!=" { "!" } else { "" }
+            "(#{neg}lk_eq_#{mangle(c, ta)}(&(#{ra}), &(#{rb})))"
+        } else if ta == 2 {
+            "(lk_str_cmp(#{ra}, #{rb}) #{op} 0)"
+        } else if ta == 9 {
+            // 浮点数按 IEEE 754 算：除以 0 得到 inf 或 nan，不会 panic；% 是 C 的 fmod（符号同被除数）
+            if op == "%" { "fmod(#{ra}, #{rb})" } else { "(#{ra} #{op} #{rb})" }
+        } else if op == "/" {
+            "lk_div(#{ra}, #{rb})"
+        } else if op == "%" {
+            "lk_mod(#{ra}, #{rb})"
+        } else if op == "+" && ta == 0 {
+            // 溢出时 panic（见运行时的 lk_add 等）
+            "lk_add(#{ra}, #{rb})"
+        } else if op == "-" && ta == 0 {
+            "lk_sub(#{ra}, #{rb})"
+        } else if op == "<<" {
+            "lk_shl(#{ra}, #{rb})"
+        } else if op == ">>" {
+            "lk_shr(#{ra}, #{rb})"
+        } else if op == ">>>" {
+            "lk_ushr(#{ra}, #{rb})"
+        } else if op == "+%" {
+            "lk_wadd(#{ra}, #{rb})"
+        } else if op == "-%" {
+            "lk_wsub(#{ra}, #{rb})"
+        } else if op == "*%" {
+            "lk_wmul(#{ra}, #{rb})"
+        } else if op == "*" && ta == 0 {
+            "lk_mul(#{ra}, #{rb})"
+        } else {
+            "(#{ra} #{op} #{rb})"
+        }
+    }
+}
+
+// 重载的运算符（见 check_op）：两侧按只读参数传给对应的函数；比较运算拿 cmp 的结果和 0 比
+fn gen_op(c: Ctx, inout g: Gen, id: int, op: str, a: Expr, b: Expr, unary: bool) -> str {
+    fi = find_fn(c, c.rname[id])
+    vs: [str] = []
+    ra = read(c, &g, a)
+    vs.push(op_arg(c.fns[fi].ptys[0], ra))
+    if !unary {
+        rb = read(c, &g, b)
+        vs.push(op_arg(c.fns[fi].ptys[1], rb))
+    }
+    call = fname(c.rname[id]) + "(" + join(vs, ", ") + ")"
+    if op == "<" || op == "<=" || op == ">" || op == ">=" {
+        tn = fresh(&g, "t")
+        ct = ctype(c, &g, 0)
+        emit(&g, "#{ct} #{tn} = #{call};")
+        "(#{tn} #{op} 0)"
+    } else {
+        ret_tmp(c, &g, c.fns[fi].ret, call)
+    }
+}
+
+fn op_arg(pt: int, v: str) -> str {
+    if managed(pt) && pt != 2 { "&(" + v + ")" } else { v }
+}
+
+fn ret_tmp(c: Ctx, inout g: Gen, ret: int, v: str) -> str {
+    if unit_like(ret) {
+        emit(&g, v + ";")
+        ""
+    } else {
+        tn = fresh(&g, "t")
+        ct = ctype(c, &g, ret)
+        emit(&g, "#{ct} #{tn} = #{v};")
+        tn
+    }
+}
+
+fn pass_arg(c: Ctx, inout g: Gen, m: str, pt: int, a: Arg) -> str {
+    if m == "take" {
+        owned(c, &g, a.value)
+    } else if m == "inout" {
+        "&(" + place(c, &g, a.value) + ")"
+    } else if ofn_fits(c, pt, c.ety[a.value.id]) {
+        // Fn 值借给 fn 参数：布局相同，换成 fn 类型的临时值（不拥有环境）
+        v = read(c, &g, a.value)
+        tn = fresh(&g, "t")
+        ct = ctype(c, &g, pt)
+        emit(&g, "#{ct} #{tn}; #{tn}.f = (#{v}).f; #{tn}.env = (#{v}).env;")
+        "&(" + tn + ")"
+    } else if managed(pt) && pt != 2 {
+        "&(" + read(c, &g, a.value) + ")"
+    } else {
+        read(c, &g, a.value)
+    }
+}
+
+// 尾部的自调用：先把新的实参算进临时变量（它们都是自己拥有的值，见 tail_ok），
+// 再像 return 一样释放所有局部变量，最后给参数重新赋值并跳回函数开头
+fn gen_tail(c: Ctx, inout g: Gen, e: Expr, args: [Arg]) {
+    sg = call_sig(c, e, args)
+    tmps: [str] = []
+    for i in 0..len(args) {
+        v = pass_arg(c, &g, sg.modes[i], sg.tys[i], args[i])
+        tn = fresh(&g, "a")
+        ct = ctype(c, &g, sg.tys[i])
+        emit(&g, "#{ct} #{tn} = #{v};")
+        tmps.push(tn)
+    }
+    drop_all(c, &g)
+    for k in 0..len(tmps) {
+        pn = g.pnames[k]
+        emit(&g, "#{pn} = #{tmps[k]};")
+    }
+    emit(&g, "goto lk_top;")
+    g.tail_used = true
+}
+
+// 构造的各个字段值：按实参的书写顺序算（有副作用的都先落到临时变量里），按字段顺序交回
+fn ctor_vals(c: Ctx, inout g: Gen, order: [int], args: [Arg]) -> [str] {
+    vals = fill(len(order), "")
+    slots = arg_slots(order)
+    for i in 0..len(args) {
+        vals[slots[i]] = owned(c, &g, args[i].value)
+    }
+    vals
+}
+
+fn gen_call(c: Ctx, inout g: Gen, e: Expr, args: [Arg]) -> str {
+    if c.rkind[e.id] == "const" { return const_c(c, &g, c.ridx[e.id]) }
+    sg = call_sig(c, e, args)
+    order = call_order(c, e, args)
+    rk = c.rkind[e.id]
+    rn = c.rname[e.id]
+    if rk == "struct" {
+        si = find_struct(c, rn)
+        vals = ctor_vals(c, &g, order, args)
+        inits: [str] = []
+        for k in 0..len(order) {
+            inits.push("." + fld(c.structs[si].fnames[k]) + " = " + vals[k])
+        }
+        if dtor_of(c, sg.ret) >= 0 { inits.push(".lk_live = 1") }
+        body = if len(inits) == 0 { "0" } else { join(inits, ", ") }
+        tn = fresh(&g, "t")
+        emit(&g, "S_#{cid(rn)} #{tn} = { #{body} };")
+        tn
+    } else if rk == "variant" {
+        vs = ctor_vals(c, &g, order, args)
+        callee = "lk_mk_#{mangle(c, sg.ret)}_#{c.ridx[e.id]}"
+        ret_tmp(c, &g, sg.ret, callee + "(" + join(vs, ", ") + ")")
+    } else if rk == "closure" {
+        // 通过函数类型的参数调用：f.f(f.env, 参数…)
+        acc = local_expr(c, g, c.vid[e.id])
+        cargs: [str] = [acc + ".env"]
+        for i in 0..len(args) {
+            v = pass_arg(c, &g, sg.modes[i], sg.tys[i], args[i])
+            cargs.push(v)
+        }
+        ret_tmp(c, &g, sg.ret, acc + ".f(" + join(cargs, ", ") + ")")
+    } else if rk == "dyn" {
+        // 经虚表调用：recv.vt->m<k>(recv.obj, 其余参数…)
+        recv = read(c, &g, args[0].value)
+        k = dyn_method(c, c.ridx[e.id], rn)
+        dargs: [str] = ["(" + recv + ").obj"]
+        for i in 1..len(args) {
+            v = pass_arg(c, &g, sg.modes[i], sg.tys[i], args[i])
+            dargs.push(v)
+        }
+        ret_tmp(c, &g, sg.ret, "(#{recv}).vt->m#{k}(#{join(dargs, ", ")})")
+    } else if rk == "fn" && c.ridx[e.id] == 1 && !defers_active(g) {
+        gen_tail(c, &g, e, args)
+        ""
+    } else if rk == "fn" {
+        vs: [str] = []
+        for i in 0..len(args) {
+            v = pass_arg(c, &g, sg.modes[i], sg.tys[i], args[i])
+            vs.push(v)
+        }
+        ret_tmp(c, &g, sg.ret, fname(rn) + "(" + join(vs, ", ") + ")")
+    } else {
+        if rn == "assert" || rn == "assert_eq" { return gen_assert(c, &g, e, rn, args) }
+        if rn == "downcast" { return gen_downcast(c, &g, e, args) }
+        gen_builtin(c, &g, rn, args, sg.ret)
+    }
+}
+
+// d.downcast()：装的类型对上时复制一份包成 Some，否则 None（返回类型是这次调用的期望类型 T?）
+fn gen_downcast(c: Ctx, inout g: Gen, e: Expr, args: [Arg]) -> str {
+    ot = c.ety[e.id]
+    t = telem(c, ot)
+    d = read(c, &g, args[0].value)
+    sct = ctype(c, &g, t)
+    v = copy_expr(c, t, "*(" + sct + "*)(" + d + ").obj")
+    ret_tmp(c, &g, ot, "((#{d}).vt->tid == INT64_C(#{t}) ? #{box_ctor(c, ot, v)} : #{opt_none(c, ot)})")
+}
+
+// assert / assert_eq：不成立时 panic，信息是 “断言失败：文件:行:列”，assert_eq 再带上两边的值（字符串加引号）。
+// 两边先按位复制到临时变量里再比较（只是借用，不释放）
+fn gen_assert(c: Ctx, inout g: Gen, e: Expr, b: str, args: [Arg]) -> str {
+    fi = e.line / 100000
+    path = if fi < len(g.paths) { g.paths[fi].copy() } else { "?" }
+    loc = "断言失败：#{path}:#{e.line % 100000}:#{e.col}"
+    if b == "assert" {
+        v = read(c, &g, args[0].value)
+        msg = lit(&g, loc)
+        emit(&g, "if (!(#{v})) lk_panic(#{msg});")
+        return ""
+    }
+    t = c.ety[args[0].value.id]
+    register(c, &g, t)
+    register_show(c, &g, t)
+    ct = ctype(c, &g, t)
+    x = fresh(&g, "t")
+    y = fresh(&g, "t")
+    va = read(c, &g, args[0].value)
+    emit(&g, "#{ct} #{x} = #{va};")
+    vb = read(c, &g, args[1].value)
+    emit(&g, "#{ct} #{y} = #{vb};")
+    head = lit(&g, loc + "：左边是 ")
+    mid = lit(&g, "，右边是 ")
+    emit(&g, "if (!#{eq_expr(c, t, x, y)}) {")
+    g.ind += 1
+    emit(&g, "lk_str m_ = lk_str_new(); lk_str* o = &m_;")
+    emit(&g, "lk_str_append(o, #{head});")
+    emit(&g, show_elem(c, t, x))
+    emit(&g, "lk_str_append(o, #{mid});")
+    emit(&g, show_elem(c, t, y))
+    emit(&g, "lk_panic(m_);")
+    g.ind -= 1
+    emit(&g, "}")
+    ""
+}
+
+fn gen_builtin(c: Ctx, inout g: Gen, b: str, args: [Arg], ret: int) -> str {
+    if needs_full_rt(b) { g.full_rt = true }
+    if b == "print" || b == "eprint" || b == "from_byte" || b == "int_str" || b == "parse_int" ||
+        b == "read_file" || b == "system" || b == "exit" || b == "panic" || b == "sleep_ms" {
+        a = read(c, &g, args[0].value)
+        ret_tmp(c, &g, ret, "lk_#{b}(#{a})")
+    } else if b == "to_float" {
+        a = read(c, &g, args[0].value)
+        ret_tmp(c, &g, ret, "((double)(#{a}))")
+    } else if b == "to_int" && is_fixed(c.ety[args[0].value.id]) {
+        a = read(c, &g, args[0].value)
+        ret_tmp(c, &g, ret, "((int64_t)(#{a}))")
+    } else if fixed_conv(b) >= 0 && slice(b, 0, 4) == "try_" {
+        ft = fixed_conv(b)
+        a = read(c, &g, args[0].value)
+        n = fresh(&g, "t")
+        emit(&g, "int64_t #{n} = #{a};")
+        some = box_ctor(c, ret, "(#{fixed_cty(ft)})" + n)
+        ret_tmp(c, &g, ret, "(#{n} >= #{int_c(fixed_lo(ft))} && #{n} <= #{int_c(fixed_hi(ft))} ? #{some} : #{opt_none(c, ret)})")
+    } else if fixed_conv(b) >= 0 {
+        a = read(c, &g, args[0].value)
+        ret_tmp(c, &g, ret, "lk_#{b}(#{a})")
+    } else if b == "to_bytes" {
+        // 一次分配好，整段复制
+        a = read(c, &g, args[0].value)
+        tn = fresh(&g, "t")
+        ct = ctype(c, &g, ret)
+        m = mangle(c, ret)
+        emit(&g, "#{ct} #{tn} = {0};")
+        emit(&g, "{ lk_str s_ = #{a}; int64_t n_ = lk_str_len(s_); if (n_ > 0) { lk_reserve_#{m}(&#{tn}, n_); memcpy(#{tn}.data, lk_str_ptr(s_), (size_t)n_); #{tn}.len = n_; } }")
+        tn
+    } else if b == "from_bytes" {
+        a = read(c, &g, args[0].value)
+        ret_tmp(c, &g, ret, "lk_str_from((#{a}).len ? (const char*)(#{a}).data : \"\", (#{a}).len)")
+    } else if b == "to_int" || b == "float_str" || b == "parse_float" {
+        a = read(c, &g, args[0].value)
+        ret_tmp(c, &g, ret, "lk_#{b}(#{a})")
+    } else if b == "atan2" || b == "float_pow" {
+        x = read(c, &g, args[0].value)
+        y = read(c, &g, args[1].value)
+        cf = if b == "atan2" { "atan2" } else { "pow" }
+        ret_tmp(c, &g, ret, "#{cf}(#{x}, #{y})")
+    } else if has(float_math1(), b) {
+        // 直接调用 C 的数学库；ln 是 C 的 log
+        a = read(c, &g, args[0].value)
+        cf = if b == "ln" { "log" } else { b }
+        ret_tmp(c, &g, ret, "#{cf}(#{a})")
+    } else if b == "len" {
+        a = read(c, &g, args[0].value)
+        if c.ety[args[0].value.id] == 2 {
+            ret_tmp(c, &g, ret, "lk_str_len(#{a})")
+        } else {
+            ret_tmp(c, &g, ret, "(#{a}).len")
+        }
+    } else if b == "byte_at" {
+        s = read(c, &g, args[0].value)
+        i = read(c, &g, args[1].value)
+        ret_tmp(c, &g, ret, "lk_byte_at(#{s}, #{i})")
+    } else if b == "slice" {
+        s = read(c, &g, args[0].value)
+        lo = read(c, &g, args[1].value)
+        hi = read(c, &g, args[2].value)
+        ret_tmp(c, &g, ret, "lk_slice(#{s}, #{lo}, #{hi})")
+    } else if b == "write_file" {
+        pth = read(c, &g, args[0].value)
+        d = read(c, &g, args[1].value)
+        ret_tmp(c, &g, ret, "lk_write_file(#{pth}, #{d})")
+    } else if b == "join" {
+        xs = read(c, &g, args[0].value)
+        sep = read(c, &g, args[1].value)
+        ret_tmp(c, &g, ret, "lk_join_arr((#{xs}).data, (#{xs}).len, #{sep})")
+    } else if b == "args" {
+        ct = ctype(c, &g, 6)
+        tn = fresh(&g, "t")
+        emit(&g, "#{ct} #{tn} = {0};")
+        emit(&g, "for (int64_t i = 0; i < lk_argc(); i++) lk_push_Ls(&#{tn}, lk_argv(i));")
+        tn
+    } else if b == "push" {
+        xs = place(c, &g, args[0].value)
+        v = owned(c, &g, args[1].value)
+        m = mangle(c, c.ety[args[0].value.id])
+        ret_tmp(c, &g, ret, "lk_push_#{m}(&(#{xs}), #{v})")
+    } else if b == "reserve" {
+        xs = place(c, &g, args[0].value)
+        n = read(c, &g, args[1].value)
+        m = mangle(c, c.ety[args[0].value.id])
+        ret_tmp(c, &g, ret, "lk_reserve_#{m}(&(#{xs}), #{n})")
+    } else if b == "insert_at" {
+        xs = place(c, &g, args[0].value)
+        i = read(c, &g, args[1].value)
+        v = owned(c, &g, args[2].value)
+        m = mangle(c, c.ety[args[0].value.id])
+        ret_tmp(c, &g, ret, "lk_insert_at_#{m}(&(#{xs}), #{i}, #{v})")
+    } else if b == "remove_at" {
+        xs = place(c, &g, args[0].value)
+        i = read(c, &g, args[1].value)
+        m = mangle(c, c.ety[args[0].value.id])
+        ret_tmp(c, &g, ret, "lk_remove_at_#{m}(&(#{xs}), #{i})")
+    } else if b == "try_pop" {
+        xs = place(c, &g, args[0].value)
+        lt = ctype(c, &g, c.ety[args[0].value.id])
+        p = fresh(&g, "l")
+        emit(&g, "#{lt}* #{p} = &(#{xs});")
+        some = box_ctor(c, ret, "#{p}->data[--#{p}->len]")
+        ret_tmp(c, &g, ret, "(#{p}->len > 0 ? #{some} : #{opt_none(c, ret)})")
+    } else if b == "pop" {
+        xs = place(c, &g, args[0].value)
+        m = mangle(c, c.ety[args[0].value.id])
+        ret_tmp(c, &g, ret, "lk_pop_#{m}(&(#{xs}))")
+    } else if b == "copy" {
+        a = read(c, &g, args[0].value)
+        ret_tmp(c, &g, ret, copy_expr(c, c.ety[args[0].value.id], a))
+    } else if b == "chan" {
+        ect = ctype(c, &g, telem(c, ret))
+        ret_tmp(c, &g, ret, "lk_chan_new(sizeof(#{ect}))")
+    } else if b == "send" {
+        ch = read(c, &g, args[0].value)
+        v = owned(c, &g, args[1].value)
+        ret_tmp(c, &g, ret, "lk_send_#{mangle(c, c.ety[args[0].value.id])}(#{ch}, #{v})")
+    } else if b == "recv" {
+        ch = read(c, &g, args[0].value)
+        ret_tmp(c, &g, ret, "lk_recv_#{mangle(c, c.ety[args[0].value.id])}(#{ch})")
+    } else if b == "chan_close" {
+        ch = read(c, &g, args[0].value)
+        emit(&g, "lk_chan_close(#{ch});")
+        ""
+    } else if b == "spawn" {
+        gen_spawn(c, &g, args)
+        ""
+    } else if b == "mutex" {
+        v = owned(c, &g, args[0].value)
+        ret_tmp(c, &g, ret, "lk_mutex_new_#{mangle(c, ret)}(#{v})")
+    } else if b == "share" {
+        v = owned(c, &g, args[0].value)
+        ret_tmp(c, &g, ret, "lk_share_#{mangle(c, ret)}(#{v})")
+    } else if b == "Some" {
+        v = owned(c, &g, args[0].value)
+        ret_tmp(c, &g, ret, "lk_some_#{mangle(c, ret)}(#{v})")
+    } else if b == "None" {
+        ret_tmp(c, &g, ret, opt_none(c, ret))
+    } else if b == "Ok" {
+        v = if len(args) > 0 { owned(c, &g, args[0].value) } else { "" }
+        ret_tmp(c, &g, ret, "lk_ok_#{mangle(c, ret)}(#{v})")
+    } else if b == "Err" {
+        v = owned(c, &g, args[0].value)
+        ret_tmp(c, &g, ret, "lk_err_#{mangle(c, ret)}(#{v})")
+    } else if b == "try_read_file" || b == "try_parse_int" || b == "try_parse_float" || has(os_try_str(), b) ||
+        has(os_try_int(), b) {
+        // 运行时通过出参返回错误信息；成功时 err 为 NULL
+        cargs = ""
+        for a in args { cargs = cargs + read(c, &g, a.value) + ", " }
+        er = fresh(&g, "e")
+        vt = if b == "try_parse_float" { "double" } else if b == "try_parse_int" || has(os_try_int(), b) { "int64_t" } else { "lk_str" }
+        vv = fresh(&g, "t")
+        emit(&g, "lk_str #{er} = NULL; #{vt} #{vv} = lk_#{b}(#{cargs}&#{er});")
+        m = mangle(c, ret)
+        ret_tmp(c, &g, ret, "#{er} ? lk_err_#{m}(#{er}) : lk_ok_#{m}(#{vv})")
+    } else if b == "file_kind" || b == "run_cmd" {
+        a = read(c, &g, args[0].value)
+        cf = if b == "run_cmd" { "lk_run" } else { "lk_file_kind" }
+        ret_tmp(c, &g, ret, "#{cf}(#{a})")
+    } else if b == "now_ms" || b == "now_ns" || b == "mono_ns" {
+        ret_tmp(c, &g, ret, "lk_#{b}()")
+    } else {
+        // replace
+        pl = place(c, &g, args[0].value)
+        v = owned(c, &g, args[1].value)
+        tn = fresh(&g, "t")
+        ct = ctype(c, &g, c.ety[args[0].value.id])
+        emit(&g, "#{ct} #{tn} = #{pl}; #{pl} = #{v};")
+        tn
+    }
+}
+
+// 闭包：生成一个 C 函数 cloN_f(void* env_, 参数…) 和一个环境结构体（字段是指向捕获变量的指针）。
+// 闭包不能存储，只活在这次调用里，所以环境放在当前函数的栈上，捕获的变量也一定还活着。
+// spawn(f, x)：把 x 移进堆上的参数块，新线程里取出来调用 f（f 拿走 x，负责释放），
+// 线程登记到最内层的 scope，由它在块尾等待
+fn gen_spawn(c: Ctx, inout g: Gen, args: [Arg]) {
+    g.full_rt = true
+    fnm = c.rname[args[0].value.id]
+    pt = c.fns[find_fn(c, fnm)].ptys[0]
+    pct = ctype(c, &g, pt)
+    n = fresh(&g, "sp")
+    g.clos.push("struct #{n}_a { #{pct} a; };\nstatic void* #{n}(void* p) { #{pct} a = ((struct #{n}_a*)p)->a; lk_free(p); #{fname(fnm)}(a); return NULL; }\n\n")
+    v = owned(c, &g, args[1].value)
+    emit(&g, "struct #{n}_a* #{n}_p = lk_alloc(sizeof *#{n}_p); #{n}_p->a = #{v};")
+    sc0 = g.sc[len(g.sc) - 1]
+    emit(&g, "lk_spawn(&#{sc0}, #{n}, #{n}_p);")
+}
+
+fn gen_closure(c: Ctx, inout g: Gen, e: Expr, params: [Param], body: Expr) -> str {
+    ci = find_clo(c, e.id)
+    caps = c.clos[ci].caps.copy()
+    ft = c.ety[e.id]
+    fct = ctype(c, &g, ft)
+    ret = telem(c, ft)
+    ps = fn_params(c, ft)
+    n = fresh(&g, "clo")
+    env_t = "struct #{n}_env"
+    // 存储的闭包（Fn）：环境在堆上，以 lk_env 开头，存捕获变量的副本；否则环境在栈上，存指向变量的指针
+    owned_env = c.clos[ci].owned
+    fields: [str] = []
+    inits: [str] = []
+    drops: [str] = []
+    if owned_env { fields.push("lk_env h;") }
+    for k in 0..len(caps) {
+        v = caps[k]
+        vt = c.locals[v].ty
+        ct = ctype(c, &g, vt)
+        if owned_env {
+            fields.push("#{ct} p#{k};")
+            inits.push("#{n}_e->p#{k} = #{copy_expr(c, vt, local_expr(c, g, v))};")
+            drops.push(drop_stmt(c, vt, "x->p#{k}"))
+        } else {
+            fields.push("#{ct}* p#{k};")
+            inits.push("&(" + local_expr(c, g, v) + ")")
+        }
+    }
+    fdecl = if len(fields) == 0 { "char _e;" } else { join(fields, " ") }
+    if owned_env {
+        emit(&g, "#{env_t}* #{n}_e = lk_alloc(sizeof *#{n}_e); #{n}_e->h.rc = 1; #{n}_e->h.drop = #{n}_drop;")
+        for s in inits { emit(&g, s) }
+    } else {
+        ival = if len(inits) == 0 { "0" } else { join(inits, ", ") }
+        emit(&g, "#{env_t} #{n}_e = { #{ival} };")
+    }
+    // 保存外层函数的生成状态
+    old_lines = replace(&g.lines, [])
+    old_scopes = replace(&g.scopes, [])
+    old_ind = g.ind
+    old_ret = g.ret
+    old_ptrs: [bool] = []
+    for v in caps { old_ptrs.push(g.ptrs[v]) }
+    g.ind = 1
+    g.ret = ret
+    cps: [str] = ["void* env_"]
+    for k in 0..len(params) {
+        pv = c.vid[params[k].id]
+        pt = ps[k]
+        by_ptr = managed(pt) && pt != 2
+        g.ptrs[pv] = by_ptr
+        star = if by_ptr { "*" } else { "" }
+        pct = ctype(c, &g, pt)
+        cps.push(pct + star + " " + c.locals[pv].cname)
+    }
+    fr = frame_decl(g, "闭包", e.line)
+    emit(&g, fr)
+    open_scope(&g, false)
+    for k in 0..len(caps) {
+        v = caps[k]
+        ct = ctype(c, &g, c.locals[v].ty)
+        cn = c.locals[v].cname
+        // 两种环境都按指针访问捕获的值：栈上的环境存的是指针，堆上的环境存的是副本
+        acc = if owned_env { "&((#{env_t}*)env_)->p#{k}" } else { "((#{env_t}*)env_)->p#{k}" }
+        emit(&g, "#{ct}* #{cn} = #{acc};")
+        g.ptrs[v] = true
+    }
+    // 闭包体是表达式而不是块：它的临时变量登记在这个作用域里，所以不能再套一层 { }，否则释放语句会落在花括号外面
+    rct = ctype(c, &g, ret)
+    if unit_like(ret) {
+        assign_into(c, &g, "", body)
+        close_scope(c, &g)
+    } else {
+        r = fresh(&g, "r")
+        emit(&g, "#{rct} #{r} = {0};")
+        assign_into(c, &g, r, body)
+        close_scope(c, &g)
+        emit(&g, "return #{r};")
+    }
+    blines = replace(&g.lines, [])
+    header = "static #{rct} #{n}_f(#{join(cps, ", ")})"
+    g.clos.push("#{env_t} { #{fdecl} };\n" + header + " {\n" + join(blines, "\n") + "\n}\n\n")
+    // 恢复
+    g.lines = old_lines
+    g.scopes = old_scopes
+    g.ind = old_ind
+    g.ret = old_ret
+    for k in 0..len(caps) { g.ptrs[caps[k]] = old_ptrs[k] }
+    if owned_env {
+        // 环境的释放函数：计数归零时释放捕获的副本（定义在环境结构体之后、外层函数之前）
+        g.clos.push("static void #{n}_drop(void* p) { #{env_t}* x = p; #{join(drops, " ")} (void)x; }\n\n")
+        "((#{fct}){ #{n}_f, #{n}_e })"
+    } else {
+        "((#{fct}){ #{n}_f, &#{n}_e })"
+    }
+}
+
+// 函数名当值用（见 check.lark 的 check_fn_value）：做一个什么都不捕获的闭包，转调这个函数。
+// 参数的传法和闭包一样（只读的、要管理内存的值传指针），所以原样转过去。
+// Fn 值的环境在堆上；owned 为 false（只是读一下）时登记到当前作用域里释放
+fn gen_fn_value(c: Ctx, inout g: Gen, e: Expr, owned: bool) -> str {
+    ft = c.ety[e.id]
+    fct = ctype(c, &g, ft)
+    ret = telem(c, ft)
+    ps = fn_params(c, ft)
+    n = fresh(&g, "fv")
+    cps: [str] = ["void* env_"]
+    args: [str] = []
+    for k in 0..len(ps) {
+        pt = ps[k]
+        star = if managed(pt) && pt != 2 { "*" } else { "" }
+        cps.push(ctype(c, &g, pt) + star + " a#{k}")
+        args.push("a#{k}")
+    }
+    rct = ctype(c, &g, ret)
+    call = fname(c.rname[e.id]) + "(" + join(args, ", ") + ")"
+    body = if unit_like(ret) { "(void)env_; #{call};" } else { "(void)env_; return #{call};" }
+    header = "static #{rct} #{n}_f(#{join(cps, ", ")})"
+    if !is_ofn(c, ft) {
+        g.clos.push(header + " { " + body + " }\n\n")
+        return "((#{fct}){ #{n}_f, 0 })"
+    }
+    env_t = "struct #{n}_env"
+    g.clos.push("#{env_t} { lk_env h; };\nstatic void #{n}_drop(void* p) { (void)p; }\n" + header + " { " + body + " }\n\n")
+    emit(&g, "#{env_t}* #{n}_e = lk_alloc(sizeof *#{n}_e); #{n}_e->h.rc = 1; #{n}_e->h.drop = #{n}_drop;")
+    v = "((#{fct}){ #{n}_f, #{n}_e })"
+    if owned { return v }
+    tn = fresh(&g, "t")
+    emit(&g, "#{fct} #{tn} = #{v};")
+    own_place(&g, tn, ft)
+    tn
+}
+
+// 常量（见 check.lark 的 cval）：直接写出值；字符串是静态的字面量
+fn const_c(c: Ctx, inout g: Gen, k: int) -> str {
+    t = c.ktys[k]
+    if t == 2 {
+        lit(&g, c.kstrs[k])
+    } else if t == 9 {
+        "(" + c.kstrs[k] + ")"
+    } else if t == 1 {
+        if c.kints[k] != 0 { "true" } else { "false" }
+    } else {
+        int_c(c.kints[k])
+    }
+}

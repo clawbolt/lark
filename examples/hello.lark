@@ -1,0 +1,92 @@
+// Lark0 示例：表达式树 + 所有权的常见用法
+
+type User {
+    name: str
+    age: int
+}
+
+enum Expr {
+    Num(n: int)
+    Add(a: Expr, b: Expr)
+    Mul(a: Expr, b: Expr)
+    Neg(e: Expr)
+}
+
+// 只读借用：不拷贝整棵树
+fn eval(e: Expr) -> int {
+    match e {
+        Num(n) => n
+        Add(a, b) => eval(a) + eval(b)
+        Mul(a, b) => eval(a) * eval(b)
+        Neg(x) => -eval(x)
+    }
+}
+
+fn show(e: Expr) -> str {
+    match e {
+        Num(n) => int_str(n)
+        Add(a, b) => "(#{show(a)} + #{show(b)})"
+        Mul(a, b) => "#{show(a)} * #{show(b)}"
+        Neg(x) => "-#{show(x)}"
+    }
+}
+
+// 取得所有权：拆开旧树、复用子树，构造新树
+fn simplify(take e: Expr) -> Expr {
+    match take e {
+        Add(a, b) => {
+            a2 = simplify(a)
+            b2 = simplify(b)
+            if eval(a2) == 0 { b2 } else { Add(a2, b2) }
+        }
+        Mul(a, b) => Mul(simplify(a), simplify(b))
+        Neg(x) => Neg(simplify(x))
+        other => other
+    }
+}
+
+// 可变借用：调用处必须写 &
+fn birthday(inout u: User) {
+    u.age += 1
+}
+
+fn total_age(users: [User]) -> int {
+    sum = 0
+    for u in users {
+        sum += u.age
+    }
+    sum
+}
+
+fn main() {
+    e = Add(Num(0), Mul(Num(6), Neg(Num(-7))))
+    print("原式：#{show(e)} = #{eval(e)}")
+    s = simplify(e)
+    print("化简：#{show(s)} = #{eval(s)}")
+
+    users: [User] = []
+    push(&users, User(name: "小林", age: 30))
+    users.push(User(name: "阿青", age: 25))
+    birthday(&users[0])
+    print("年龄合计：#{total_age(users)}")
+
+    names: [str] = []
+    for u in users {
+        names.push(u.name)
+    }
+    print(join(names, "、"))
+
+    first = users[0].copy()
+    first.name = "复制品"
+    print("#{first.name} / #{users[0].name}")
+
+    i = 0
+    for i < 3 {
+        i += 1
+        if i == 2 { continue }
+        print("i = #{i}")
+    }
+    for k in 0..3 {
+        print("k = #{k}")
+    }
+}

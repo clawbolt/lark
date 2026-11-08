@@ -1,0 +1,173 @@
+// ledit 的单元测试：lark test（在 apps/ledit 里运行）。按键解码、修改和撤销、搜索、屏幕内容，不碰终端
+import "std/str"
+import "ed/keys"
+import "ed/text"
+import "ed/buffer"
+import "ed/editor"
+
+fn run(inout ed: editor.Editor, s: str) {
+    ks = match take keys.parse_script(s) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    for k in ks {
+        ed.handle(k)
+        ed.scroll()
+    }
+}
+
+fn ed_of(content: str, h: int, w: int) -> editor.Editor { editor.new("a.txt", content, h, w) }
+
+test "按键：解码终端的字节" {
+    e = "\e"
+    k, n = keys.decode(e + "[A", 0)
+    assert(k == keys.Up)
+    assert_eq(n, 3)
+    k2, n2 = keys.decode("x" + e + "[3~", 1)
+    assert(k2 == keys.Delete)
+    assert_eq(n2, 4)
+    k3, n3 = keys.decode(e + "[6~", 0)
+    assert(k3 == keys.PageDown)
+    assert_eq(n3, 4)
+    _k4, n4 = keys.decode(e, 0)
+    assert_eq(n4, 0)
+    _k5, n5 = keys.decode(e + "[", 0)
+    assert_eq(n5, 0)
+    k6, n6 = keys.decode("云x", 0)
+    assert(k6 == keys.Ch("云"))
+    assert_eq(n6, 3)
+    _k7, n7 = keys.decode(slice("云", 0, 2), 0)
+    assert_eq(n7, 0)
+    k8, _n8 = keys.decode(from_byte(17), 0)
+    assert(k8 == keys.Ctrl('q'))
+    k9, _n9 = keys.decode(from_byte(13), 0)
+    assert(k9 == keys.Enter)
+    k10, _n10 = keys.decode(from_byte(127), 0)
+    assert(k10 == keys.Backspace)
+    k11, n11 = keys.decode(e + "x", 0)
+    assert(k11 == keys.Esc)
+    assert_eq(n11, 1)
+}
+
+test "按键：脚本" {
+    ks = match take keys.parse_script("ab<Enter><C-s><lt>\n<Left>") {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    assert_eq(len(ks), 6)
+    assert(ks[2] == keys.Enter)
+    assert(ks[3] == keys.Ctrl('s'))
+    assert(ks[4] == keys.Ch("<"))
+    assert(ks[5] == keys.Left)
+    bad = 0
+    for s in ["<Foo>", "a<bc", "<C-1>"] {
+        match keys.parse_script(s) {
+            Ok(_) => {}
+            Err(_) => { bad += 1 }
+        }
+    }
+    assert_eq(bad, 3)
+}
+
+test "修改：每一步都能撤回" {
+    lines = ["hello", "world"]
+    u1 = buffer.apply(&lines, buffer.Ins(0, 5, "!"))
+    assert_eq(join(lines, "|"), "hello!|world")
+    u2 = buffer.apply(&lines, buffer.Split(0, 2))
+    assert_eq(join(lines, "|"), "he|llo!|world")
+    u3 = buffer.apply(&lines, buffer.Join(1, 4))
+    assert_eq(join(lines, "|"), "he|llo!world")
+    _r3 = buffer.apply(&lines, u3)
+    assert_eq(join(lines, "|"), "he|llo!|world")
+    _r2 = buffer.apply(&lines, u2)
+    assert_eq(join(lines, "|"), "hello!|world")
+    _r1 = buffer.apply(&lines, u1)
+    assert_eq(join(lines, "|"), "hello|world")
+    d = buffer.apply(&lines, buffer.Del(1, 1, "orl"))
+    assert_eq(join(lines, "|"), "hello|wd")
+    assert(d == buffer.Ins(1, 1, "orl"))
+}
+
+test "编辑：打字、换行、撤销" {
+    ed = ed_of("abc\n", 5, 20)
+    run(&ed, "<End>xy<Enter>z")
+    assert_eq(join(ed.lines, "|"), "abcxy|z")
+    assert(editor.dirty(ed))
+    // 连着打的 xy 是一项，换行一项，z 一项
+    run(&ed, "<C-z>")
+    assert_eq(join(ed.lines, "|"), "abcxy|")
+    run(&ed, "<C-z>")
+    assert_eq(join(ed.lines, "|"), "abcxy")
+    run(&ed, "<C-z>")
+    assert_eq(editor.text_of(ed), "abc\n")
+    assert_eq(ed.msg, "撤销了一步，和保存时一样了")
+    assert(!editor.dirty(ed))
+    run(&ed, "<C-z>")
+    assert_eq(ed.msg, "没有可以撤销的了")
+    // 行首退格和别的行接起来，行尾 Delete 什么也不做
+    e2 = ed_of("ab\ncd", 5, 20)
+    run(&e2, "<Down><BS>")
+    assert_eq(join(e2.lines, "|"), "abcd")
+    assert_eq(e2.col, 2)
+    run(&e2, "<Del><End><Del>")
+    assert_eq(editor.text_of(e2), "abd")
+    // 中文按字符移动和删除
+    e3 = ed_of("云雀飞\n", 5, 20)
+    run(&e3, "<Right><BS><End><Left>x")
+    assert_eq(e3.lines[0], "雀x飞")
+    assert_eq(e3.col, 4)
+}
+
+test "编辑：退出要确认" {
+    ed = ed_of("a\n", 5, 30)
+    run(&ed, "<C-q>")
+    assert(ed.quit)
+    e2 = ed_of("a\n", 5, 30)
+    run(&e2, "b<C-q>")
+    assert(!e2.quit)
+    // 中间按了别的键就要重新确认
+    run(&e2, "<Right><C-q>")
+    assert(!e2.quit)
+    run(&e2, "<C-q>")
+    assert(e2.quit)
+}
+
+test "搜索：边打边找、下一处、绕回开头、取消" {
+    ed = ed_of("one two\nthree two\nfour\n", 5, 30)
+    run(&ed, "<C-f>two")
+    assert_eq(ed.row, 0)
+    assert_eq(ed.col, 4)
+    run(&ed, "<C-f>")
+    assert_eq(ed.row, 1)
+    assert_eq(ed.col, 6)
+    run(&ed, "<C-f>")
+    assert_eq(ed.row, 0)
+    assert_eq(ed.col, 4)
+    assert_eq(ed.msg, "到结尾了，从头找到第 1 行")
+    run(&ed, "<Enter><C-f>fo<Esc>")
+    assert_eq(ed.row, 0)
+    assert_eq(ed.col, 4)
+    run(&ed, "<C-f>zzz")
+    assert_eq(ed.msg, "没找到：zzz")
+    run(&ed, "<BS><BS><BS>thr<Enter>")
+    assert_eq(ed.row, 1)
+    assert_eq(ed.col, 0)
+}
+
+test "显示：宽字符、滚动、状态栏" {
+    assert_eq(text.visible("第一行", 1, 4), " 一 ")
+    assert_eq(text.visible("a\tb", 0, 10), "a    b")
+    assert_eq(text.width_to("云a", 4), 3)
+    assert_eq(text.index_at_width("云雀", 3), 3)
+    ed = ed_of("第一行\nsecond line is longer\n", 3, 20)
+    s = editor.screen(ed)
+    assert_eq(join(s, "|"), "第一行|second line is longe|~| a.txt  2 行    1:1 |")
+    run(&ed, "<Down><End>")
+    assert_eq(ed.left, 2)
+    s2 = editor.screen(ed)
+    assert_eq(join(s2, "|"), "一行|cond line is longer|~| a.txt  2 行   2:22 |")
+    e = "\e"
+    assert(str.ends_with(editor.render(ed), e + "[2;20H" + e + "[?25h"))
+    run(&ed, "x")
+    assert(str.contains(editor.screen(ed)[3], "a.txt [+]"))
+}

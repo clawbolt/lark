@@ -1,0 +1,3 @@
+tests/err1/label_unknown.lark:5:29: 错误：外层没有叫 outr 的循环（标签写在 for 前面：outr: for …）
+ 5 |             if i + j == 3 { break outr }
+   |                             ^

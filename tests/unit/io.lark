@@ -1,0 +1,138 @@
+// std/io 的边界：空文件、空行、\r\n、最后一行没有换行、比读缓冲区（64KB）还长的行、\r\n 正好跨两块、
+// 写的缓冲、关闭以后再写、不 close 时离开作用域也会写出去
+import "std/io"
+import "std/os"
+import "std/str"
+import "std/time"
+
+fn tmp(name: str) -> str { os.join_path(os.temp_dir(), "lark_io_#{name}_#{time.unix_ms()}") }
+
+fn put(p: str, s: str) {
+    match os.write(p, s) {
+        Ok(_) => {}
+        Err(e) => panic(e)
+    }
+}
+
+fn reader(p: str) -> io.Reader {
+    match take io.open(p) {
+        Ok(r) => r
+        Err(e) => panic(e)
+    }
+}
+
+fn must(r: ()!) {
+    match r {
+        Ok(_) => {}
+        Err(e) => panic(e)
+    }
+}
+
+fn err_of(r: ()!) -> str {
+    match r {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}
+
+// 所有的行，每行括在 [ ] 里
+fn all_lines(p: str) -> str {
+    r = reader(p)
+    out = ""
+    for true {
+        match take r.read_line() {
+            Some(l) => { out += "[#{l}]" }
+            None => break
+        }
+    }
+    out
+}
+
+test "按行读" {
+    p = tmp("lines")
+    put(p, "")
+    assert_eq(all_lines(p), "")
+    put(p, "\n")
+    assert_eq(all_lines(p), "[]")
+    put(p, "a\r\nb")
+    assert_eq(all_lines(p), "[a][b]")
+    put(p, "a\n\nb\n")
+    assert_eq(all_lines(p), "[a][][b]")
+    put(p, "\r\n")
+    assert_eq(all_lines(p), "[]")
+    put(p, "a\r")
+    assert_eq(all_lines(p), "[a]")
+    // 比一块（64KB）还长的行
+    put(p, str.repeat("x", 100000) + "\ntail")
+    r1 = reader(p)
+    assert_eq(len(r1.read_line() ?? ""), 100000)
+    assert_eq(r1.read_line() ?? "", "tail")
+    assert_eq(r1.read_line() ?? "<完>", "<完>")
+    // \r 是第一块的最后一个字节，\n 在第二块里
+    put(p, str.repeat("y", 65535) + "\r\nz")
+    r2 = reader(p)
+    assert_eq(len(r2.read_line() ?? ""), 65535)
+    assert_eq(r2.read_line() ?? "", "z")
+    // read_line 之后 read_all 拿到剩下的
+    put(p, "a\nb\nc")
+    r3 = reader(p)
+    assert_eq(r3.read_line() ?? "", "a")
+    assert_eq(r3.read_all() ?? "-", "b\nc")
+    assert_eq(r3.read_all() ?? "-", "")
+    assert_eq(r3.last_error(), "")
+    must(r3.close())
+    // 关两次也没关系
+    must(r3.close())
+    _rm = os.remove(p)
+    // 打不开的文件是错误
+    match io.open(os.join_path(p, "不存在")) {
+        Ok(_) => panic("不应该打开")
+        Err(_) => {}
+    }
+}
+
+// 写了不 close，离开作用域时会写出去并关闭
+fn write_no_close(p: str) {
+    w = match take io.create(p) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    must(w.write("没有 close"))
+}
+
+test "写" {
+    p = tmp("write")
+    w = match take io.create(p) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    must(w.write("a"))
+    must(w.write_line("b"))
+    // 还在缓冲区里，文件还是空的
+    assert_eq(os.read(p) ?? "-", "")
+    must(w.flush())
+    assert_eq(os.read(p) ?? "-", "ab\n")
+    // 缓冲区是空的时候 flush 什么也不做
+    must(w.flush())
+    must(w.close())
+    assert_eq(err_of(w.write("x")), "io：写入已经关闭的 Writer")
+    must(w.close())
+    a = match take io.open_append(p) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    must(a.write("c"))
+    must(a.close())
+    assert_eq(os.read(p) ?? "-", "ab\nc")
+    write_no_close(p)
+    assert_eq(os.read(p) ?? "-", "没有 close")
+    // 缓冲区满 64KB 时自动写出去
+    big = match take io.create(p) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    must(big.write(str.repeat("z", 70000)))
+    assert_eq(len(os.read(p) ?? ""), 70000)
+    must(big.close())
+    _rm = os.remove(p)
+}

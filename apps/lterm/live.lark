@@ -1,0 +1,104 @@
+// lterm run：真的能用的终端（像只有一个窗格的 tmux）。
+// 在伪终端里跑 shell（vt/pty、native/pty.c），shell 输出的字节喂给我们自己的终端仿真（vt/term：阶段 1–6），
+// 再把仿真出来的屏幕画到外面真的终端上，每次只画变了的地方（vt/draw，证明在 formal/Lark/VtDraw.lean）。
+// 键盘输入原样交给 shell；外面的窗口改了大小时，仿真的屏幕和伪终端一起改（vt/mode.resize，VtSb.lean）。
+// shell 退出（伪终端读不到东西）时结束，外面的终端恢复原样。
+// 没有证明的一层：事件循环本身（等输入、读、写）；要在真的终端里试。
+// Ctrl-] [ 翻看滚动缓冲（vt/view，证明在 formal/Lark/VtView.lean）：k j 一行、b f 一页、g G 最上最下、q 回去；Ctrl-] Ctrl-] 交给 shell 一个 Ctrl-]。
+// 回答程序的查询（光标位置、终端是什么，vt/term，证明在 formal/Lark/VtReply.lean）；方向键、小键盘的模式交给外面的终端。
+// 没做：分屏、断开以后再连上（tmux 的那些）；鼠标；在历史里搜索。
+import "vt/term"
+import "vt/pty"
+import "vt/draw"
+import "vt/view"
+import "vt/mode"
+
+fn live(cmd: str) -> int {
+    if !pty.is_tty(0) || !pty.is_tty(1) {
+        eprint("lterm run：标准输入和标准输出要是终端")
+        return 2
+    }
+    rows, cols = pty.size() ?? (24, 80)
+    fd = match pty.spawn(cmd, rows, cols) {
+        Ok(x) => x
+        Err(e) => {
+            eprint("lterm run：#{e}")
+            return 1
+        }
+    }
+    match pty.raw() {
+        Ok(_) => {}
+        Err(e) => {
+            eprint("lterm run：#{e}")
+            return 1
+        }
+    }
+    // 外面的终端换到备用屏幕，退出时原来的内容回来
+    _a = try_fd_write(1, "\x1b[?1049h")
+    t = term.new(rows, cols)
+    prev: draw.F? = None
+    paste = false
+    ckm = false
+    kpam = false
+    dirty = true
+    v = view.new()
+    for true {
+        if pty.resized() {
+            r, c = pty.size() ?? (t.m.scr.rows, t.m.scr.cols)
+            if r > 0 && c > 0 && (r != t.m.scr.rows || c != t.m.scr.cols) {
+                term.resize(&t, r, c)
+                pty.resize(fd, r, c)
+            }
+            dirty = true
+        }
+        if dirty {
+            nsb = mode.sb_len(t.m)
+            n = if v.view { view.mark(view.window(t.m, v.off), v.off, nsb) } else { draw.frame(t.m.scr) }
+            show = t.m.tcem && !v.view
+            s = draw.update(prev, n, t.m.scr.x, t.m.scr.y, show)
+            // 括号粘贴：里面的程序打开了，外面的终端也要打开，粘贴的内容才会带着标记交进来
+            if paste != t.m.paste {
+                s += if t.m.paste { "\x1b[?2004h" } else { "\x1b[?2004l" }
+                paste = t.m.paste
+            }
+            // 方向键、小键盘的模式也交给外面的终端：它按里面的程序要的样子发键
+            if ckm != t.ckm {
+                s += if t.ckm { "\x1b[?1h" } else { "\x1b[?1l" }
+                ckm = t.ckm
+            }
+            if kpam != t.kpam {
+                s += if t.kpam { "\x1b=" } else { "\x1b>" }
+                kpam = t.kpam
+            }
+            _w = try_fd_write(1, s)
+            prev = Some(n)
+            dirty = false
+        }
+        a, b = pty.wait(fd, 100)
+        if a {
+            got = try_fd_read(0, 4096) ?? ""
+            if got != "" {
+                nsb = mode.sb_len(t.m)
+                page = if t.m.scr.rows > 1 { t.m.scr.rows - 1 } else { 1 }
+                fwd = view.keys(&v, got, nsb, page)
+                if fwd != "" { _k = try_fd_write(fd, fwd) }
+                dirty = true
+            }
+        }
+        if b {
+            // shell 退出以后读到的是 EOF 或者 EIO
+            got = try_fd_read(fd, 65536) ?? ""
+            if got == "" { break }
+            term.feed(&t, got)
+            // 查询的回答（光标位置、终端是什么）交给程序
+            rep = term.take_reply(&t)
+            if rep != "" { _r = try_fd_write(fd, rep) }
+            dirty = true
+        } else if pty.exited() {
+            break
+        }
+    }
+    _z = try_fd_write(1, "\x1b[0m\x1b[?2004l\x1b[?1l\x1b>\x1b[?25h\x1b[?1049l")
+    pty.restore()
+    0
+}

@@ -1,0 +1,150 @@
+// lgit · 三方合并文本：以共同祖先 base 为准，分别求出 ours、theirs 改了 base 的哪些行（编辑序列见 std/diff），
+// 两边改的地方不挨着就都收下；挨着或者重叠、而且改得不一样就是冲突，按 git 的格式写冲突标记：
+//   <<<<<<< ours 的名字
+//   ours 的行
+//   =======
+//   theirs 的行
+//   >>>>>>> theirs 的名字
+// 冲突里两边开头、结尾相同的行会挪到标记外面（git 还会在冲突内部再找相同的行把它拆开，这里没做）。
+import "std/diff"
+
+// 一边相对 base 的改动：base 的 [starts[k], ends[k]) 换成 lines[k]
+type Changes {
+    starts: [int]
+    ends: [int]
+    lines: [[str]]
+}
+
+fn changes(base: [str], side: [str]) -> Changes {
+    ch = Changes(starts: [], ends: [], lines: [])
+    ops = diff.edits(base, side)
+    a = 0
+    b = 0
+    k = 0
+    for k < len(ops) {
+        if ops[k] == 0 {
+            a += 1
+            b += 1
+            k += 1
+            continue
+        }
+        s = a
+        added: [str] = []
+        for k < len(ops) && ops[k] != 0 {
+            if ops[k] == 1 {
+                a += 1
+            } else {
+                added.push(side[b].copy())
+                b += 1
+            }
+            k += 1
+        }
+        ch.starts.push(s)
+        ch.ends.push(a)
+        ch.lines.push(added)
+    }
+    ch
+}
+
+// base 的 [lo, hi) 这一段，换上 ch 里第 k0 到 k1 - 1 个改动之后的样子
+fn apply(base: [str], lo: int, hi: int, ch: Changes, k0: int, k1: int) -> [str] {
+    out: [str] = []
+    p = lo
+    for k in k0..k1 {
+        for i in p..ch.starts[k] { out.push(base[i].copy()) }
+        for ln in ch.lines[k] { out.push(ln.copy()) }
+        p = ch.ends[k]
+    }
+    for i in p..hi { out.push(base[i].copy()) }
+    out
+}
+
+fn same_lines(a: [str], b: [str]) -> bool {
+    if len(a) != len(b) { return false }
+    for i in 0..len(a) {
+        if a[i] != b[i] { return false }
+    }
+    true
+}
+
+fn ends_nl(s: str) -> bool { len(s) > 0 && byte_at(s, len(s) - 1) == '\n' }
+
+// 冲突的一边：最后一行没有换行时补上，免得和后面的标记连在一起
+fn section(xs: [str], a: int, b: int) -> str {
+    s = ""
+    for i in a..b {
+        s += xs[i]
+        if i == b - 1 && !ends_nl(xs[i]) { s += "\n" }
+    }
+    s
+}
+
+fn conflict(o: [str], t: [str], lo: str, lt: str) -> str {
+    // 两边开头、结尾相同的行放到标记外面
+    pre = 0
+    for pre < len(o) && pre < len(t) && o[pre] == t[pre] { pre += 1 }
+    suf = 0
+    for suf < len(o) - pre && suf < len(t) - pre && o[len(o) - 1 - suf] == t[len(t) - 1 - suf] { suf += 1 }
+    s = ""
+    for i in 0..pre { s += o[i] }
+    s += "<<<<<<< #{lo}\n" + section(o, pre, len(o) - suf) + "=======\n" + section(t, pre, len(t) - suf) + ">>>>>>> #{lt}\n"
+    tail_at = len(o) - suf
+    for i in tail_at..len(o) { s += o[i] }
+    s
+}
+
+// 合并的结果和冲突的个数（0 表示干净地合并了）。lo、lt 是冲突标记上两边的名字
+pub fn merge_text(base_text: str, ours_text: str, theirs_text: str, lo: str, lt: str) -> (str, int) {
+    base = diff.lines_with_ends(base_text)
+    co = changes(base, diff.lines_with_ends(ours_text))
+    ct = changes(base, diff.lines_with_ends(theirs_text))
+    out = ""
+    conflicts = 0
+    pos = 0
+    i = 0
+    j = 0
+    no = len(co.starts)
+    nt = len(ct.starts)
+    for i < no || j < nt {
+        // 一组从最靠前的改动开始，把挨着或者重叠的改动（两边的）都并进来
+        lo_at = 0
+        if j >= nt || (i < no && co.starts[i] <= ct.starts[j]) {
+            lo_at = co.starts[i]
+        } else {
+            lo_at = ct.starts[j]
+        }
+        hi_at = lo_at
+        i2 = i
+        j2 = j
+        grew = true
+        for grew {
+            grew = false
+            if i2 < no && co.starts[i2] <= hi_at {
+                if co.ends[i2] > hi_at { hi_at = co.ends[i2] }
+                i2 += 1
+                grew = true
+            }
+            if j2 < nt && ct.starts[j2] <= hi_at {
+                if ct.ends[j2] > hi_at { hi_at = ct.ends[j2] }
+                j2 += 1
+                grew = true
+            }
+        }
+        for k in pos..lo_at { out += base[k] }
+        o = apply(base, lo_at, hi_at, co, i, i2)
+        t = apply(base, lo_at, hi_at, ct, j, j2)
+        if i2 == i || same_lines(o, t) {
+            for x in t { out += x }
+        } else if j2 == j {
+            for x in o { out += x }
+        } else {
+            out += conflict(o, t, lo, lt)
+            conflicts += 1
+        }
+        pos = hi_at
+        i = i2
+        j = j2
+    }
+    for k in pos..len(base) { out += base[k] }
+    (out, conflicts)
+}

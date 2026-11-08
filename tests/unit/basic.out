@@ -1,0 +1,17 @@
+通过  加法
+通过  字符串、列表和可选值
+失败  失败的 assert_eq 会显示两边
+    这行输出只在失败时显示
+    panic: 断言失败：tests/unit/basic.lark:28:5：左边是 ["a", "b"]，右边是 ["a", "c"]
+      在 测试“失败的 assert_eq 会显示两边”（tests/unit/basic.lark:28）
+失败  失败的 assert
+    panic: 断言失败：tests/unit/basic.lark:33:5
+      在 测试“失败的 assert”（tests/unit/basic.lark:33）
+失败  panic 也算失败
+    panic: 下标越界：0，长度 0
+      在 测试“panic 也算失败”（tests/unit/basic.lark:38）
+失败  结构体
+    panic: 断言失败：tests/unit/basic.lark:44:5：左边是 (3, 4)，右边是 (3, 5)
+      在 测试“结构体”（tests/unit/basic.lark:44）
+6 项测试：2 项通过，4 项失败
+[退出码 1]

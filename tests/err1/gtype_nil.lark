@@ -1,0 +1,9 @@
+// 期望错误：Nil 没有字段，又没有期望类型，推断不出 T
+enum List[T] {
+    Cons(head: T, tail: List[T])
+    Nil
+}
+
+fn main() {
+    xs = Nil
+}

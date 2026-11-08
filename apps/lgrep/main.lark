@@ -1,0 +1,104 @@
+// lgrep：用 Lark 写的 grep。在文件里逐行找正则表达式（写法见 std/re.lark），打印匹配的行。
+// 构建：在 apps/lgrep 里 lark build，得到 build/lgrep
+//
+//   lgrep [选项] 模式 [文件或目录…]      没给文件时读标准输入；- 也是标准输入
+//
+//   -r  进入目录（按名字排序，跳过以 . 开头的文件和目录）
+//   -n  行号    -i  忽略大小写    -v  不匹配的行    -c  只打印行数    -l  只打印文件名
+//   --color    把匹配的部分标成红色
+//
+// 退出码和 grep 一样：有匹配是 0，没有是 1，出错（模式写错、文件读不了）是 2。
+// 几个短开关可以写在一起（-rn）。二进制文件（前 8000 字节里有 0 字节）只说有没有匹配。
+import "std/os"
+import "std/io"
+import "std/flag"
+import "std/re"
+import "grep/scan"
+
+fn main() {
+    p = flag.new("lgrep", "在文件里逐行找正则表达式")
+    p.add_bool("recursive", "r", "进入目录")
+    p.add_bool("number", "n", "打印行号")
+    p.add_bool("ignore-case", "i", "忽略大小写（只管 ASCII 字母）")
+    p.add_bool("invert", "v", "打印不匹配的行")
+    p.add_bool("count", "c", "只打印匹配的行数")
+    p.add_bool("files", "l", "只打印有匹配的文件名")
+    p.add_bool("color", "", "把匹配的部分标成红色")
+    a = p.parse_or_exit()
+    if len(a.rest) == 0 {
+        eprint("lgrep：缺少模式")
+        eprint(p.usage())
+        exit(2)
+    }
+    pat = if a.get_bool("ignore-case") { "(?i)" + a.rest[0] } else { a.rest[0].copy() }
+    r = match take re.compile(pat) {
+        Ok(x) => x
+        Err(e) => {
+            eprint("lgrep：模式写错了：#{e}")
+            exit(2)
+        }
+    }
+    targets: [str] = []
+    for i in 1..len(a.rest) { targets.push(a.rest[i]) }
+    if len(targets) == 0 { targets.push("-") }
+    rec = a.get_bool("recursive")
+    files: [str] = []
+    errors = 0
+    for t in targets {
+        if t != "-" && os.is_dir(t) {
+            if !rec {
+                eprint("lgrep：#{t} 是目录（要进入目录请加 -r）")
+                errors += 1
+                continue
+            }
+            match walk(t, &files) {
+                Ok => {}
+                Err(e) => {
+                    eprint("lgrep：#{e}")
+                    errors += 1
+                }
+            }
+        } else {
+            files.push(t)
+        }
+    }
+    o = scan.Opts(number: a.get_bool("number"), count: a.get_bool("count"), files_only: a.get_bool("files"),
+        invert: a.get_bool("invert"), color: a.get_bool("color"), with_name: len(files) > 1 || rec)
+    w = io.stdout()
+    matched = false
+    for f in files {
+        text = match take read_input(f) {
+            Ok(x) => x
+            Err(e) => {
+                eprint("lgrep：#{e}")
+                errors += 1
+                continue
+            }
+        }
+        shown = if f == "-" { "(标准输入)" } else { f }
+        out, hits = scan.scan(r, text, shown, o)
+        if hits > 0 { matched = true }
+        if out != "" { _w = w.write(out) }
+    }
+    _f = w.flush()
+    exit(if errors > 0 { 2 } else if matched { 0 } else { 1 })
+}
+
+fn read_input(f: str) -> str! {
+    if f != "-" { return os.read(f) }
+    r = io.stdin()
+    r.read_all()
+}
+
+// 目录里的文件（按名字排序，跳过以 . 开头的），递归地放进 files
+fn walk(dir: str, inout files: [str]) -> ()! {
+    for n in os.read_dir(dir)? {
+        if byte_at(n, 0) == '.' { continue }
+        p = os.join_path(dir, n)
+        if os.is_dir(p) {
+            walk(p, &files)?
+        } else if os.is_file(p) {
+            files.push(p)
+        }
+    }
+}

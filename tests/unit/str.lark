@@ -1,0 +1,143 @@
+// std/str 的边界：空串、找不到、在开头和结尾、重叠的匹配、多字节字符
+import "std/str"
+
+test "查找" {
+    assert_eq(str.find("", "") ?? -1, 0)
+    assert_eq(str.find("abc", "") ?? -1, 0)
+    assert_eq(str.find("", "a") ?? -1, -1)
+    assert_eq(str.find("abcabc", "c") ?? -1, 2)
+    assert_eq(str.find("ab", "abc") ?? -1, -1)
+    assert_eq(str.find("天上的云雀", "云") ?? -1, 9)
+    assert_eq(str.find_from("abcabc", "a", 1) ?? -1, 3)
+    assert_eq(str.find_from("abc", "a", -5) ?? -1, 0)
+    assert_eq(str.find_from("abc", "", -1) ?? -1, 0)
+    assert_eq(str.find_from("abc", "a", 10) ?? -1, -1)
+    assert_eq(str.find_from("abc", "", 3) ?? -1, 3)
+    assert_eq(str.find_from("abc", "", 4) ?? -1, -1)
+    assert_eq(str.rfind("abcabc", "bc") ?? -1, 4)
+    assert_eq(str.rfind("abc", "") ?? -1, 3)
+    assert_eq(str.rfind("ab", "abc") ?? -1, -1)
+    assert(str.contains("abc", ""))
+    assert(!str.contains("", "a"))
+    // 不重叠地数
+    assert_eq(str.count("aaaa", "aa"), 2)
+    assert_eq(str.count("aaa", "aa"), 1)
+    assert_eq(str.count("abc", ""), 0)
+    assert_eq(str.count("", "a"), 0)
+    assert(str.starts_with("abc", ""))
+    assert(str.starts_with("abc", "abc"))
+    assert(!str.starts_with("ab", "abc"))
+    assert(str.ends_with("abc", "bc"))
+    assert(!str.ends_with("c", "bc"))
+}
+
+test "切开" {
+    none: [str] = []
+    assert(str.split("", ",") == [""])
+    assert(str.split(",", ",") == ["", ""])
+    assert(str.split("a,b,", ",") == ["a", "b", ""])
+    assert(str.split("a--b----c", "--") == ["a", "b", "", "c"])
+    assert(str.split("abc", "") == ["abc"])
+    assert(str.split("", "x") == [""])
+    assert(str.split("aaa", "aa") == ["", "a"])
+    // 多字节的分隔符（UTF-8 的中文标点）和一个字节的走不同的路，结果一样
+    assert(str.split("甲、乙、", "、") == ["甲", "乙", ""])
+    assert(str.split("a\nb", "\n") == ["a", "b"])
+    assert(str.split_n("a b c", " ", -1) == ["a", "b", "c"])
+    assert(str.split_n("", ":", 2) == [""])
+    assert(str.split_n("a::b", "::", 5) == ["a", "b"])
+    assert(str.words("") == none)
+    assert(str.words(" \t a\nb  ") == ["a", "b"])
+    assert(str.lines("") == none)
+    assert(str.lines("\n") == [""])
+    assert(str.lines("a\n\nb") == ["a", "", "b"])
+    // \r 不去掉（要去掉用 io.read_line，或者每行再 trim_end）
+    assert(str.lines("a\r\nb\r\n") == ["a\r", "b\r"])
+    a, b = str.cut("=", "=") ?? ("-", "-")
+    assert_eq(a, "")
+    assert_eq(b, "")
+    c, d = str.cut("abc", "") ?? ("-", "-")
+    assert_eq(c, "")
+    assert_eq(d, "abc")
+}
+
+test "去空白和前后缀" {
+    assert_eq(str.trim(""), "")
+    assert_eq(str.trim(" \t\r\n"), "")
+    assert_eq(str.trim("  a b  "), "a b")
+    assert_eq(str.trim_start("  a  "), "a  ")
+    assert_eq(str.trim_end("  a  "), "  a")
+    // 只去 ASCII 的空白，全角空格保留
+    assert_eq(str.trim("　a"), "　a")
+    assert_eq(str.trim_prefix("aab", "a"), "ab")
+    assert_eq(str.trim_prefix("ab", "abc"), "ab")
+    assert_eq(str.trim_suffix("a.tar.gz", ".gz"), "a.tar")
+    assert_eq(str.trim_suffix("x", ""), "x")
+}
+
+test "替换、重复、大小写、补齐" {
+    assert_eq(str.replace_all("aaa", "a", "aa"), "aaaaaa")
+    assert_eq(str.replace_all("abab", "ab", ""), "")
+    assert_eq(str.replace_all("abc", "", "x"), "abc")
+    assert_eq(str.replace_all("abc", "z", "x"), "abc")
+    assert_eq(str.replace_all("云雀云", "云", "鸟"), "鸟雀鸟")
+    assert_eq(str.to_upper("abc-XYZ 云"), "ABC-XYZ 云")
+    assert_eq(str.to_upper(""), "")
+    // 只转换 ASCII 字母
+    assert_eq(str.to_lower("ÀB"), "Àb")
+    // 补齐按字节数算
+    assert_eq(str.pad_start("x", 4, "云"), "云x")
+    assert_eq(str.pad_end("a", 4, "xy"), "axyxy")
+    assert_eq(str.pad_end("ab", 0, "-"), "ab")
+    assert_eq(str.pad_start("ab", 5, ""), "ab")
+    assert_eq(len(str.repeat("ab", 50000)), 100000)
+}
+
+type Doc {
+    text: str
+}
+
+fn twice(s: str) -> str { s + s }
+
+fn head(xs: [str]) -> str? {
+    if len(xs) == 0 { return None }
+    Some(xs[0].copy())
+}
+
+fn first_or_stop(xs: [str]) -> str? {
+    s = "开头"
+    s = s + "-" + (match take head(xs) {
+        Some(v) => v
+        None => return None
+    }) + "-"
+    Some(s)
+}
+
+// s = s + a + b 在编译器里展平成连续追加：结果要和整段拼一样，右边提到 s 的时候用的是追加前的值
+test "拼接链" {
+    s = "a"
+    for i in 0..3 { s = s + "-" + "#{i}" }
+    assert_eq(s, "a-0-1-2")
+    s = s + "|" + s
+    assert_eq(s, "a-0-1-2|a-0-1-2")
+    t = "x"
+    t = t + twice(t) + "y"
+    assert_eq(t, "xxxy")
+    d = Doc(text: "<")
+    d.text = d.text + "p" + ">"
+    assert_eq(d.text, "<p>")
+    d.text = d.text + d.text + "!"
+    assert_eq(d.text, "<p><p>!")
+    xs = ["0", "1"]
+    xs[1] = xs[1] + "a" + "b"
+    assert(xs == ["0", "1ab"])
+    xs[0] = xs[0] + xs[1] + "c"
+    assert(xs == ["01abc", "1ab"])
+    // 中途提前返回时 s 不变
+    assert(first_or_stop([]) == None)
+    assert(first_or_stop(["k"]) == Some("开头-k-"))
+    // 很长的链也只在 s 后面追加
+    big = ""
+    for _i in 0..100_000 { big = big + "a" + "b" + "c" }
+    assert_eq(len(big), 300_000)
+}

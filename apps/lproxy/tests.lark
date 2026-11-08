@@ -1,0 +1,124 @@
+// lproxy 的单元测试：lark test（在 apps/lproxy 里运行）。规则、头部、502 和 504；整个代理和 lhttp 一起的测试在 tests/e2e.sh
+import "proxy/proxy"
+import "std/http"
+import "std/net"
+import "std/str"
+
+fn rule(s: str) -> proxy.Upstream {
+    match take proxy.parse_rule(s) {
+        Ok(u) => u
+        Err(e) => panic(e)
+    }
+}
+
+fn rule_err(s: str) -> str {
+    match proxy.parse_rule(s) {
+        Ok(_) => "<成功>"
+        Err(e) => e
+    }
+}
+
+fn rq(s: str) -> http.Request {
+    r, _at, code = http.parse_request(s, 0)
+    match take r {
+        Some(x) => x
+        None => panic("没有解析出请求，状态码 #{code}")
+    }
+}
+
+test "规则" {
+    u = rule("/api=http://127.0.0.1:9000")
+    assert_eq(u.prefix, "/api")
+    assert_eq(u.base, "http://127.0.0.1:9000")
+    assert(proxy.patterns(u) == ["/api", "/api/{rest...}"])
+    assert(proxy.patterns(rule("/=http://h:80")) == ["/{rest...}"])
+    assert_eq(rule_err("api=http://h:1"), "前缀要以 / 开头：api=http://h:1")
+    assert_eq(rule_err("/api/=http://h:1"), "前缀不要以 / 结尾（/api 就包括了 /api/…）：/api/=http://h:1")
+    assert_eq(rule_err("/a=http://h:1/x"), "上游只写 http://主机:端口，不带路径：/a=http://h:1/x")
+    assert_eq(rule_err("/a=http://h:1/"), "上游只写 http://主机:端口，不带路径：/a=http://h:1/")
+    assert_eq(rule_err("/a"), "规则要写成 前缀=http://主机:端口：/a")
+    assert_eq(rule_err("/{x}=http://h:1"), "前缀里不能有 { }：/{x}=http://h:1")
+    assert(str.starts_with(rule_err("/a=https://h"), "不支持 https"))
+}
+
+test "路由选最长的前缀" {
+    r = http.new_router()
+    for s in ["/=http://a:1", "/api=http://b:2"] {
+        u = rule(s)
+        base = u.base.copy()
+        h: Fn(http.Request) -> http.Response = |q| http.reply(200, [], base)
+        for p in proxy.patterns(u) { r.handle(p, h) }
+    }
+    assert_eq(http.route(r, rq("GET /api HTTP/1.1\r\n\r\n")).body, "http://b:2")
+    assert_eq(http.route(r, rq("POST /api/x/y HTTP/1.1\r\n\r\n")).body, "http://b:2")
+    assert_eq(http.route(r, rq("GET /apix HTTP/1.1\r\n\r\n")).body, "http://a:1")
+    assert_eq(http.route(r, rq("GET / HTTP/1.1\r\n\r\n")).body, "http://a:1")
+}
+
+test "头部" {
+    req = rq("POST /x HTTP/1.1\r\nHost: front:8000\r\nConnection: keep-alive\r\nKeep-Alive: 5\r\nContent-Length: 2\r\nX-Id: 7\r\nAccept: */*\r\n\r\nhi")
+    assert(proxy.request_headers(req) == [("x-id", "7"), ("accept", "*/*"), ("x-forwarded-host", "front:8000"), ("via", "1.1 lproxy")])
+    resp = http.Response(status: 200, reason: "OK", headers: [("content-type", "text/plain"), ("transfer-encoding", "chunked"), ("content-length", "3"), ("connection", "close"), ("set-cookie", "a=1")], body: "abc")
+    assert(proxy.response_headers(resp) == [("content-type", "text/plain"), ("set-cookie", "a=1")])
+}
+
+type Silent {
+    l: net.Listener
+}
+
+// 接一个连接，什么都不回，等对面先关掉
+fn silent_once(inout s: Silent) -> ()! {
+    c = s.l.accept()?
+    _x = c.read_all()
+}
+
+fn silent(take s: Silent) {
+    match silent_once(&s) {
+        Ok => {}
+        Err(e) => panic(e)
+    }
+}
+
+type Ask {
+    port: int
+    out: Chan[str]
+}
+
+fn ask(take a: Ask) {
+    cl = http.new_client()
+    err = ""
+    resp = proxy.forward(&cl, "http://127.0.0.1:#{a.port}", rq("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n"), 50, &err)
+    cl.close()
+    a.out.send("#{resp.status} #{net.is_timeout(err)}")
+}
+
+test "502 和 504" {
+    // 端口上没有人：502
+    l0 = match take net.listen("127.0.0.1", 0) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    dead = l0.local_port() ?? 0
+    match l0.close() {
+        Ok => {}
+        Err(e) => panic(e)
+    }
+    cl = http.new_client()
+    err = ""
+    resp = proxy.forward(&cl, "http://127.0.0.1:#{dead}", rq("GET / HTTP/1.1\r\n\r\n"), 1000, &err)
+    assert_eq(resp.status, 502)
+    assert_eq(resp.body, "502 Bad Gateway\n")
+    assert(str.starts_with(err, "无法连接"))
+    // 上游接了连接、一直不回：504
+    l = match take net.listen("127.0.0.1", 0) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    port = l.local_port() ?? 0
+    out: Chan[str] = chan()
+    scope {
+        spawn(silent, Silent(l: l))
+        spawn(ask, Ask(port: port, out: out.copy()))
+    }
+    assert_eq(out.recv() ?? "", "504 true")
+}

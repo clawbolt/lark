@@ -1,0 +1,32 @@
+// 基准：std/map。整数键的插入和查找，字符串键的计数，最后借用遍历一遍；整个过程做 4 轮
+import "std/map"
+
+fn one_round(seed: int) -> int {
+    m: map.Map[int, int] = map.new()
+    n = 200000
+    for i in 0..n { m.insert((i + seed) * 7919 % 1000003, i) }
+    hit = 0
+    for _ in 0..5 {
+        for i in 0..n { hit += m.get((i + seed) * 7919 % 1000003) ?? 0 }
+    }
+    keys: [str] = []
+    for i in 0..20000 { keys.push("词#{(i + seed) % 5000}") }
+    ws: map.Map[str, int] = map.new()
+    for _ in 0..20 {
+        for k in keys {
+            c = ws.get(k) ?? 0
+            ws.insert(k, c + 1)
+        }
+    }
+    total = 0
+    for _ in 0..20 {
+        for (w, v) in ws { total += v + len(w) }
+    }
+    hit + len(ws) + total
+}
+
+fn main() {
+    sum = 0
+    for r in 0..4 { sum += one_round(r) }
+    print("#{sum}")
+}

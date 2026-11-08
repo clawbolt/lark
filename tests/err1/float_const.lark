@@ -1,0 +1,5 @@
+// 期望错误：float 常量不在编译时求值（交给 C 编译器算），所以不能比较
+const HALF = 0.5
+const BIG = HALF > 0.25
+
+fn main() {}

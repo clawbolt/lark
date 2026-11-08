@@ -1,0 +1,3 @@
+tests/err1/iter_sig.lark:9:14: 错误：迭代器的 next 要写成 fn next(inout it: Count) -> T?
+ 9 |     for x in Count(n: 3) {
+   |              ^

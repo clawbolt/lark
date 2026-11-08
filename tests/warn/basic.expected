@@ -1,0 +1,16 @@
+tests/warn/basic.lark:2:1: 警告：import "std/math" 没有用到
+ 2 | import "std/math"
+   | ^
+tests/warn/basic.lark:8:9: 警告：这里永远不会执行：前面的语句已经 return / break / continue / panic / exit
+ 8 |         print("不会执行")
+   |         ^
+tests/warn/basic.lark:15:5: 警告：变量 extra 没有用到（不需要的话写成 _，或者改成以 _ 开头的名字）
+ 15 |     extra = 5
+    |     ^
+tests/warn/basic.lark:17:5: 警告：变量 i 没有用到（不需要的话写成 _，或者改成以 _ 开头的名字）
+ 17 |     for i in 0..3 { total += 1 }
+    |     ^
+tests/warn/basic.lark:24:9: 警告：变量 e 没有用到（不需要的话写成 _，或者改成以 _ 开头的名字）
+ 24 |         Err(e) => print("不是数")
+    |         ^
+5 条警告（加 -w 可以不显示）

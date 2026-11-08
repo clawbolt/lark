@@ -1,0 +1,88 @@
+// std/treemap 的测试：基本操作、按键排序、和 std/map + 排序的结果逐个比较
+import "std/treemap"
+import "std/map"
+import "std/rand"
+import "std/sort"
+
+test "基本操作" {
+    m: treemap.TreeMap[str, int] = treemap.new()
+    assert(m.is_empty())
+    assert_eq(len(m), 0)
+    assert_eq(m.get("a") ?? -1, -1)
+    assert_eq(m.remove("a") ?? -1, -1)
+    assert(m.first_key_value() == None)
+    assert(m.last_key_value() == None)
+    m.insert("云", 3)
+    m.insert("b", 2)
+    m.insert("a", 1)
+    m.insert("b", 20)            // 已有的键：换成新值
+    assert_eq(len(m), 3)
+    assert_eq(m.iter_len(), 3)
+    assert_eq(m.get("b") ?? -1, 20)
+    assert(m.contains_key("a"))
+    assert(!m.contains_key("c"))
+    assert_eq("#{m}", "{\"a\": 1, \"b\": 20, \"云\": 3}")
+    assert(m.first_key_value() == Some(("a", 1)))
+    assert(m.last_key_value() == Some(("云", 3)))
+    assert(m.at(1) == Some(("b", 20)))
+    assert(m.at(3) == None)
+    assert(m.at(-1) == None)
+    assert(m.iter_at(1) == ("b", 20))
+    keys: [str] = []
+    for (k, _) in m { keys.push(k) }
+    assert(keys == ["a", "b", "云"])
+    assert_eq(m.remove("b") ?? -1, 20)
+    assert(m.to_list() == [("a", 1), ("云", 3)])
+    m.clear()
+    assert(m.is_empty())
+    assert_eq("#{m}", "{}")
+}
+
+test "顺序插入不会退化" {
+    // 1..n 依次插入，普通的二叉搜索树会变成一条链；AVL 的高度不超过 1.44 log2(n)，递归不会太深
+    m: treemap.TreeMap[int, int] = treemap.new()
+    n = 100000
+    for i in 0..n { m.insert(i, i * i) }
+    assert_eq(len(m), n)
+    assert_eq(m.get(31415) ?? -1, 31415 * 31415)
+    assert(m.at(n - 1) == Some((n - 1, (n - 1) * (n - 1))))
+    for i in 0..n {
+        if i % 2 == 0 { m.remove(i) }
+    }
+    assert_eq(len(m), n / 2)
+    assert(m.first_key_value() == Some((1, 1)))
+    assert(m.at(10) == Some((21, 441)))
+}
+
+test "和 map 加排序的结果一样" {
+    r = rand.new(7)
+    t: treemap.TreeMap[int, int] = treemap.new()
+    h: map.Map[int, int] = map.new()
+    for step in 0..20000 {
+        k = r.range(-300, 300)
+        if r.range(0, 3) == 0 {
+            assert(t.remove(k) == h.remove(k))
+        } else {
+            t.insert(k, step)
+            h.insert(k, step)
+        }
+    }
+    assert_eq(len(t), len(h))
+    wrong = 0
+    for k in -310..310 {
+        if t.get(k) != h.get(k) { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+    want = sort.sorted(h.keys.copy())
+    got: [int] = []
+    for (k, v) in t {
+        got.push(k)
+        if (h.get(k) ?? -1) != v { wrong += 1 }
+    }
+    assert(got == want)
+    assert_eq(wrong, 0)
+    for i, p in t.to_list() {
+        if p.0 != want[i] { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}

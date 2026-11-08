@@ -1,0 +1,27 @@
+out/a.txt out/a.txt /etc
+a/b.tar.gz：base b.tar.gz，dir a，ext ".gz"，stem b.tar
+a/b/：base b，dir a，ext ""，stem b
+b.txt：base b.txt，dir .，ext ".txt"，stem b
+/b：base b，dir /，ext ""，stem b
+.bashrc：base .bashrc，dir .，ext ""，stem .bashrc
+根目录：["README.md", "empty", "src"]
+  README.md：文件
+  empty：目录
+  src：目录
+str.lark 有 20 字节：第一行
+第二行
+
+stat：20 字节，是文件 true，是目录 false，修改时间在一分钟之内 true
+stat 目录：是目录 true，stat 不存在的：失败
+改名后：["docs.md", "empty", "src"]，README.md 还在吗：false
+删除不是空目录的 src：失败
+清理后：["docs.md"]
+实验目录删掉了：true
+读不存在的文件：失败
+LARK_NO_SUCH_VAR：None，env ?? 默认值：默认值
+有 PATH 吗：true
+capture：你好
+世界
+
+命令失败：echo 一半; exit 3（退出码 3）
+run("exit 2") = 2，run("true") = 0

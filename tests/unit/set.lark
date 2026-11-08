@@ -1,0 +1,33 @@
+// std/set 的边界：重复放、删掉不存在的、空集合的运算、遍历的顺序
+import "std/set"
+
+test "放、删、集合运算" {
+    s: set.Set[str] = set.new()
+    s.insert("a")
+    s.insert("a")
+    s.insert("b")
+    assert_eq(len(s), 2)
+    assert(s.contains("a"))
+    assert(!s.contains("c"))
+    assert(!s.remove("c"))
+    assert(s.remove("a"))
+    assert(!s.contains("a"))
+    assert(s.to_list() == ["b"])
+    a = set.of(["1", "2", "3"])
+    b = set.of(["3", "4", "1"])
+    // union 先是 a 的元素，再是 b 里 a 没有的
+    assert(set.union(a, b).to_list() == ["1", "2", "3", "4"])
+    assert(set.intersection(a, b).to_list() == ["1", "3"])
+    assert(set.difference(a, b).to_list() == ["2"])
+    assert(set.difference(b, a).to_list() == ["4"])
+    e: set.Set[str] = set.new()
+    assert(set.union(e, e).is_empty())
+    assert(set.intersection(a, e).is_empty())
+    assert(set.difference(a, e).to_list() == a.to_list())
+    // 遍历按插入顺序
+    seen: [str] = []
+    for x in b { seen.push(x.copy()) }
+    assert(seen == ["3", "4", "1"])
+    nums = set.of([3, 1, 3, 2, 1])
+    assert(nums.to_list() == [3, 1, 2])
+}

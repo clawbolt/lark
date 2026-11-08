@@ -1,0 +1,227 @@
+// Lark 标准库 · 哈希表 Map[K, V]（用 Lark 自己写）
+// 用法：在程序开头写 import "std/map"，之后用 map.Map、map.new()；方法 m.insert / m.get 按 m 的类型自动找到这个模块
+//
+//   m: map.Map[str, int] = map.new()
+//   m.insert("a", 1)
+//   n = m.get("a") ?? 0
+//   m["b"] = 2; m["b"] += 1        // 下标读写；m[k] 没有这个键时 panic
+//   for (k, v) in m { … }        // 借用 m，按插入顺序，每轮复制一对键值
+//   for k in m.keys { … }        // 只要键（或 for v in m.vals 只要值）：借用，不复制；pub 字段在模块外只读
+//   m.remove("a")                // 返回 V?（O(n)：要保持插入顺序）
+//   m.retain(|k, v| v > 0)       // 只留下满足条件的，返回删掉几项（删很多时用它）
+//   m.update("a", 1, |n| n + 1)  // 有则改成 f(旧值)，无则放入 1（计数）
+//
+// 开放寻址、线性探测：slots 里存 keys / vals 的下标，空位为 -1；槽数是 2 的幂，装填超过一半时翻倍。
+// 槽位带随机种子，str 的哈希带随机密钥（防哈希洪水攻击，见 map_slot）；遍历按插入顺序，所以输出每次一样。
+// 键需要满足 Hash + Eq：内置了 int / bool / str 的 hash，自己的类型写一个 fn hash(x: T) -> int 即可
+// （除函数类型外都满足 Eq）。删除会保持其余键的插入顺序。
+
+extern "c" {
+    fn lark_siphash(s: str, n: int) -> int
+    fn lark_hash_seed() -> int
+}
+
+pub interface Hash {
+    fn hash(x: Self) -> int
+}
+
+pub type Map[K, V] {
+    pub keys: [K]       // 按插入顺序；模块外只读
+    pub vals: [V]       // 和 keys 一一对应
+    slots: [int]        // 内部的哈希槽，模块外看不到
+    seed: int           // 这个 Map 自己的随机种子（见 map_slot）
+}
+
+// 槽位 = 打散(hash(k) ^ 种子) 的低位（槽数是 2 的幂），每个 Map 的种子随机：
+// 别人造不出一批专门挤在同一串槽里的键（哈希洪水攻击），自己写的 hash 也不用操心高位低位。
+// 自己写的 hash 可以返回任意 int（包括负数）。
+
+// 乘以 2^64 / 黄金比例（回绕），再把高 32 位异或到低 32 位
+pub fn hash(n: int) -> int {
+    h = n *% 0x9E37_79B9_7F4A_7C15
+    h ^ (h >>> 32)
+}
+
+pub fn hash(b: bool) -> int { if b { 1 } else { 0 } }
+
+// SipHash-1-3，密钥是进程启动后随机取的（运行时的 lark_siphash）：同一个进程里同一个字符串的哈希不变，
+// 每次运行不一样，所以别把它写进文件或者发给别的进程
+pub fn hash(s: str) -> int { lark_siphash(s, len(s)) }
+
+pub fn new[K, V]() -> Map[K, V] {
+    Map(keys: [], vals: [], slots: empty_slots(8), seed: lark_hash_seed())
+}
+
+// 键 k 所在的槽；不存在时是它应该放进去的空槽
+fn map_slot[K: Hash + Eq, V](m: Map[K, V], k: K) -> int {
+    mask = len(m.slots) - 1
+    i = spread(hash(k) ^ m.seed) & mask
+    for m.slots[i] >= 0 && m.keys[m.slots[i]] != k {
+        i = (i + 1) & mask
+    }
+    i
+}
+
+// MurmurHash3 的 fmix64：每一位都影响结果的每一位
+fn spread(x: int) -> int {
+    h = (x ^ (x >>> 33)) *% 0xff51_afd7_ed55_8ccd
+    h = (h ^ (h >>> 33)) *% 0xc4ce_b9fe_1a85_ec53
+    h ^ (h >>> 33)
+}
+
+fn map_grow[K: Hash + Eq, V](inout m: Map[K, V]) {
+    n = len(m.slots) * 2      // 不能写 map_rehash(&m, len(m.slots) * 2)：m 被改的同时又被读
+    map_rehash(&m, n)
+}
+
+// 按 keys 重新建槽位表（扩容和删除之后）
+fn map_rehash[K: Hash + Eq, V](inout m: Map[K, V], n: int) {
+    m.slots = empty_slots(n)
+    for j in 0..len(m.keys) {
+        i = map_slot(m, m.keys[j])
+        m.slots[i] = j
+    }
+}
+
+pub fn insert[K: Hash + Eq, V](inout m: Map[K, V], take k: K, take v: V) {
+    if (len(m.keys) + 1) * 2 > len(m.slots) { map_grow(&m) }
+    i = map_slot(m, k)
+    if m.slots[i] >= 0 {
+        j = m.slots[i]
+        m.vals[j] = v
+    } else {
+        m.slots[i] = len(m.keys)
+        m.keys.push(k)
+        m.vals.push(v)
+    }
+}
+
+// 取出值的副本；没有时为 None
+pub fn get[K: Hash + Eq, V](m: Map[K, V], k: K) -> V? {
+    i = map_slot(m, k)
+    if m.slots[i] < 0 { return None }
+    m.vals[m.slots[i]].copy()
+}
+
+pub fn contains_key[K: Hash + Eq, V](m: Map[K, V], k: K) -> bool {
+    i = map_slot(m, k)
+    m.slots[i] >= 0
+}
+
+fn empty_slots(n: int) -> [int] {
+    xs: [int] = []
+    xs.reserve(n)
+    for _i in 0..n { xs.push(-1) }
+    xs
+}
+
+// 删除键 k，返回它的值；没有时为 None。其余键保持插入顺序（代价是 O(n)：后面的元素挪开再放回，然后重建槽位）
+pub fn remove[K: Hash + Eq, V](inout m: Map[K, V], k: K) -> V? {
+    i = map_slot(m, k)
+    if m.slots[i] < 0 { return None }
+    j = m.slots[i]
+    ks: [K] = []
+    vs: [V] = []
+    for len(m.keys) > j + 1 {
+        ks.push(m.keys.pop())
+        vs.push(m.vals.pop())
+    }
+    _old_k = m.keys.pop()
+    old_v = m.vals.pop()
+    for len(ks) > 0 {
+        m.keys.push(ks.pop())
+        m.vals.push(vs.pop())
+    }
+    n = len(m.slots)
+    map_rehash(&m, n)
+    Some(old_v)
+}
+
+// 只留下 keep(键, 值) 为真的项，返回删掉了几项。其余键保持插入顺序；不管删多少，都只挪一遍、重建一次槽位，
+// 要删很多项时比一个个 remove（每次 O(n)）快得多。例如清掉过期的：m.retain(|_k, e| e.exp > now)
+pub fn retain[K: Hash + Eq, V](inout m: Map[K, V], keep: fn(K, V) -> bool) -> int {
+    ks: [K] = []
+    vs: [V] = []
+    ks.reserve(len(m.keys))
+    vs.reserve(len(m.keys))
+    for len(m.keys) > 0 {
+        ks.push(m.keys.pop())
+        vs.push(m.vals.pop())
+    }
+    removed = 0
+    for len(ks) > 0 {
+        k = ks.pop()
+        v = vs.pop()
+        if keep(k, v) {
+            m.keys.push(k)
+            m.vals.push(v)
+        } else {
+            removed += 1
+        }
+    }
+    if removed > 0 {
+        n = len(m.slots)
+        map_rehash(&m, n)
+    }
+    removed
+}
+
+// 有 k 时把值换成 f(旧值)，没有时直接放入 init（不经过 f，和 Elixir 的 Map.update 一样）。例如计数：m.update(w, 1, |n| n + 1)
+pub fn update[K: Hash + Eq, V](inout m: Map[K, V], take k: K, take init: V, f: fn(V) -> V) {
+    i = map_slot(m, k)
+    if m.slots[i] >= 0 {
+        j = m.slots[i]
+        m.vals[j] = f(m.vals[j])
+    } else {
+        insert(&m, k, init)
+    }
+}
+
+pub fn clear[K, V](inout m: Map[K, V]) {
+    ek: [K] = []
+    ev: [V] = []
+    m.keys = ek
+    m.vals = ev
+    m.slots = empty_slots(8)
+}
+
+pub fn is_empty[K, V](m: Map[K, V]) -> bool { len(m.keys) == 0 }
+
+// for (k, v) in m：借用 m 遍历，每轮复制一对键值，按插入顺序（借用遍历，见 README）
+pub fn iter_len[K, V](m: Map[K, V]) -> int { len(m.keys) }
+
+pub fn iter_at[K, V](m: Map[K, V], i: int) -> (K, V) { (m.keys[i].copy(), m.vals[i].copy()) }
+
+// 所有键值对的副本，按插入顺序
+pub fn to_list[K, V](m: Map[K, V]) -> [(K, V)] {
+    out: [(K, V)] = []
+    for j in 0..len(m.keys) {
+        out.push((m.keys[j].copy(), m.vals[j].copy()))
+    }
+    out
+}
+
+// m[k]：取出值的副本；没有这个键时 panic（不确定有没有时用 m.get(k)）
+pub fn index[K: Hash + Eq, V](m: Map[K, V], k: K) -> V {
+    i = map_slot(m, k)
+    if m.slots[i] < 0 { panic("map.index：没有这个键（不确定有没有时用 get）") }
+    m.vals[m.slots[i]].copy()
+}
+
+// m[k] = v：同 m.insert(k, v)；m[k] += 1 先读后写
+pub fn set_index[K: Hash + Eq, V](inout m: Map[K, V], k: K, take v: V) {
+    insert(&m, k.copy(), v)
+}
+
+// "#{m}"：{"a": 1, "b": 2}，按插入顺序；键和值的写法和列表里的元素一样（字符串加引号）。键和值的类型要能插值
+pub fn show[K, V](m: Map[K, V]) -> str {
+    parts: [str] = []
+    for i in 0..len(m.keys) { parts.push("#{elem(m.keys[i])}: #{elem(m.vals[i])}") }
+    "{" + join(parts, ", ") + "}"
+}
+
+// 一个值放在容器里时的写法：借列表的插值（字符串加引号），再去掉两边的方括号
+fn elem[T](x: T) -> str {
+    s = "#{[x.copy()]}"
+    slice(s, 1, len(s) - 1)
+}

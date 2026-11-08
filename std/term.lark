@@ -1,0 +1,132 @@
+// Lark 标准库 · 终端（用 Lark 自己写，底下是运行时里的几个 C 函数）
+// 用法：import "std/term"
+//
+//   if term.is_tty(1) { … }                   // 文件描述符 0 / 1 / 2 是不是终端
+//   rows, cols = term.size() ?? (24, 80)      // 窗口大小；不是终端时 None
+//   term.enable_raw(100)?                            // 原始模式：按一个键就能读到，没有输入时 read 最多等 100 毫秒
+//   got = term.read(256)?                     // 读标准输入；等了那么久还没有输入时是 ""
+//   if term.was_resized() { … }                   // 进入原始模式以后，窗口大小有没有变过（SIGWINCH）
+//   term.enter_alt_screen()                     // 备用屏幕：恢复时原来的内容回来
+//   term.restore()?                           // 恢复终端；程序退出（包括 panic）时也会自动恢复
+//
+// 转义序列（返回字符串，自己写出去）：term.move_to(行, 列)（从 1 开始）、term.CLEAR、term.CLEAR_LINE、term.HOME、
+// term.HIDE_CURSOR / SHOW_CURSOR；颜色 term.color(s, term.RED)、term.bold(s)、term.style(s, "1;4")；term.strip_ansi(s) 去掉转义序列。
+// term.supports_color(fd)：是终端、没有设置 NO_COLOR、TERM 不是 dumb 时才该输出颜色。
+import "os"
+
+extern "c" {
+    fn isatty(fd: c_int) -> c_int
+    fn strerror(e: c_int) -> str
+    fn lark_term_raw(tenths: c_int) -> c_int
+    fn lark_term_restore() -> c_int
+    fn lark_term_size(fd: c_int) -> int
+    fn lark_term_resizes() -> int
+    fn lark_term_alt(on: c_int) -> ()
+}
+
+pub fn is_tty(fd: int) -> bool { fd >= 0 && fd < 0x7FFF_FFFF && isatty(fd) == 1 }
+
+// 先查标准输出，再查标准输入和标准错误（输出被重定向时也能拿到终端的大小）
+pub fn size() -> (int, int)? {
+    for fd in [1, 0, 2] {
+        v = lark_term_size(fd)
+        if v >= 0 { return Some((v >> 16, v & 0xFFFF)) }
+    }
+    None
+}
+
+// 进入原始模式：不回显、不按行缓冲、Ctrl-C / Ctrl-Z 当作普通的字节读到（3 和 26），输出时 \n 不再自动回到行首（换行要写 \r\n）。
+// wait_ms 大于 0 时没有输入的 read 最多等这么久（按 0.1 秒取整，最多 25.5 秒）；0 时一直等到有输入。
+// 标准输入不是终端时是错误。再调用一次只改等待时间
+pub fn enable_raw(wait_ms: int) -> ()! {
+    tenths = if wait_ms <= 0 { 0 } else if wait_ms >= 25500 { 255 } else { (wait_ms + 99) / 100 }
+    e = lark_term_raw(tenths)
+    if e != 0 { return Err("进入原始模式失败：#{strerror(e)}") }
+    Ok()
+}
+
+// 离开备用屏幕、恢复原来的模式；没改过时什么都不做
+pub fn restore() -> ()! {
+    e = lark_term_restore()
+    if e != 0 { return Err("恢复终端失败：#{strerror(e)}") }
+    Ok()
+}
+
+// 读标准输入，最多 max 个字节（一次可能读到好几个键，也可能是半个转义序列）
+pub fn read(max: int) -> str! { try_fd_read(0, max) }
+
+// 上次调用以来窗口大小有没有变过
+pub fn was_resized() -> bool { lark_term_resizes() > 0 }
+
+// 换到备用屏幕 / 换回来。直接写到终端：用 io.stdout() 写的内容要先 flush
+pub fn enter_alt_screen() { lark_term_alt(1) }
+
+pub fn leave_alt_screen() { lark_term_alt(0) }
+
+pub fn supports_color(fd: int) -> bool {
+    is_tty(fd) && (os.env("NO_COLOR") ?? "") == "" && (os.env("TERM") ?? "") != "dumb"
+}
+
+// ---------- 转义序列 ----------
+
+pub const CLEAR = "\e[2J"           // 清屏（光标不动）
+pub const CLEAR_LINE = "\e[K"       // 从光标清到行尾
+pub const HOME = "\e[H"
+pub const HIDE_CURSOR = "\e[?25l"
+pub const SHOW_CURSOR = "\e[?25h"
+pub const RESET = "\e[0m"
+
+pub const BLACK = 0
+pub const RED = 1
+pub const GREEN = 2
+pub const YELLOW = 3
+pub const BLUE = 4
+pub const MAGENTA = 5
+pub const CYAN = 6
+pub const WHITE = 7
+
+// 把光标移到第 row 行、第 col 列（都从 1 开始）
+pub fn move_to(row: int, col: int) -> str { "\e[#{row};#{col}H" }
+
+// 前景色：0..7 是上面的八种颜色，8..15 是亮的那八种，16..255 是 256 色
+pub fn color(s: str, c: int) -> str {
+    code = if c < 8 { "3#{c}" } else if c < 16 { "9#{c - 8}" } else { "38;5;#{c}" }
+    style(s, code)
+}
+
+pub fn bold(s: str) -> str { style(s, "1") }
+
+// 任意的 SGR 参数，如 "1;31"（粗体红色）、"4"（下划线）、"7"（反色）
+pub fn style(s: str, sgr: str) -> str { "\e[#{sgr}m#{s}\e[0m" }
+
+// 去掉 ESC [ … 字母 这样的控制序列（以及 ESC 后面跟一个字符的短序列），用来算显示宽度或者写进日志
+pub fn strip_ansi(s: str) -> str {
+    if !has_esc(s) { return s }
+    out = ""
+    i = 0
+    start = 0
+    n = len(s)
+    for i < n {
+        if byte_at(s, i) != 0x1B {
+            i += 1
+            continue
+        }
+        out += slice(s, start, i)
+        i += 1
+        if i < n && byte_at(s, i) == '[' {
+            i += 1
+            // 参数和中间字节是 0x20..0x3F，以 0x40..0x7E 的一个字节结尾
+            for i < n && (byte_at(s, i) < 0x40 || byte_at(s, i) > 0x7E) { i += 1 }
+        }
+        if i < n { i += 1 }
+        start = i
+    }
+    out + slice(s, start, n)
+}
+
+fn has_esc(s: str) -> bool {
+    for i in 0..len(s) {
+        if byte_at(s, i) == 0x1B { return true }
+    }
+    false
+}

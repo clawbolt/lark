@@ -1,0 +1,58 @@
+// 自定义析构 fn drop(inout x: T)（需要 lark1 及以后的版本）
+// 值被销毁时（离开作用域、被覆盖、所在的列表被释放……）自动调用，然后再释放各个字段。
+// 被移走的值不会再调用：析构只对每个值调用一次。
+
+type File {
+    name: str
+    fd: int
+}
+
+fn open(name: str) -> File {
+    print("打开 #{name}")
+    File(name: name, fd: 3)
+}
+
+fn drop(inout f: File) {
+    print("关闭 #{f.name}")
+}
+
+fn read_file_name(f: File) { print("读取 #{f.name}") }
+
+// take：拿走所有权，函数结束时关闭
+fn consume(take f: File) { print("接管 #{f.name}") }
+
+// 枚举也可以有析构
+enum Conn {
+    Open(id: int)
+    Closed
+}
+
+fn drop(inout c: Conn) {
+    match c {
+        Open(id) => print("断开连接 #{id}")
+        Closed => print("（已关闭的连接）")
+    }
+}
+
+// 包含资源的结构体：不用写析构，释放它时会自动释放里面的 File
+type Job {
+    title: str
+    out: File
+}
+
+fn main() {
+    a = open("a.txt")
+    read_file_name(a)
+    if true {
+        _b = open("b.txt")
+        print("内层作用域结束")
+    }
+    c = open("c.txt")
+    consume(c)
+    a = open("a2.txt")
+    _files = [open("x"), open("y")]
+    _k = Open(7)
+    _z = Closed
+    _j = Job(title: "导出", out: open("out.csv"))
+    print("main 结束")
+}

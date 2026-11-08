@@ -1,0 +1,75 @@
+// LSP（Language Server Protocol）基础协议的分帧：每条消息是若干行消息头（每行以 \r\n 结尾）、一个空行、再是 JSON 内容。
+// 必须有 Content-Length（只能有一个），别的头（Content-Type）不管。
+// 先证明再写：对应 formal/Lark/Lsp.lean 的第 1 部分，函数和定义一一对应：
+//   frame ↔ frame（parse_frame：写出来再读回来不变，几条消息接在一起时一条一条读出来，一个字节不多读）
+//   parse ↔ parse / headers（parse_some：读成功时内容和剩下的正好是输入的一段后缀）
+//   crlf ↔ line（一行到第一个 \r\n 为止）、num ↔ num（ASCII 数字，可以有开头的 0）
+// 模型里 “数据还不够” 和 “格式不对” 都是 none，这里分开：More 是再读一些再试，Err 是格式不对。
+// 模型里没有的一条：消息头超过 MAX_HEADER 字节还没读到空行时报错，不让坏的输入一直攒着。
+// 数字超过 MAX_LEN 时马上报错（再往后读值只会更大，结果和模型一样），不会溢出。
+
+// 内容最长 64 MiB（maxLen）
+pub const MAX_LEN = 67108864
+pub const MAX_HEADER = 8192
+const HDR = "Content-Length: "
+
+pub fn frame(body: str) -> str { "Content-Length: #{len(body)}\r\n\r\n" + body }
+
+pub enum Got {
+    Msg(body: str, next: int)    // 一条完整的消息，后面的数据从 next 开始
+    More                         // 数据还不够
+}
+
+// 从 d[at] 起第一个 \r\n 的 \r 的下标；没有时是 -1
+fn crlf(d: str, at: int) -> int {
+    j = at
+    for j + 1 < len(d) {
+        if byte_at(d, j) == 13 && byte_at(d, j + 1) == 10 { return j }
+        j += 1
+    }
+    -1
+}
+
+// d[a..b) 是一串 ASCII 数字
+fn num(d: str, a: int, b: int) -> int! {
+    if a >= b { return Err("LSP 消息头：Content-Length 后面没有数字") }
+    n = 0
+    for i in a..b {
+        c = byte_at(d, i)
+        if c < 48 || c > 57 { return Err("LSP 消息头：Content-Length 后面不是数字") }
+        n = n * 10 + (c - 48)
+        if n > MAX_LEN { return Err("LSP 消息：内容超过 #{MAX_LEN} 字节") }
+    }
+    Ok(n)
+}
+
+// d[a..b) 这一行以 "Content-Length: " 开头（hdrName.isPrefixOf）
+fn is_len_header(d: str, a: int, b: int) -> bool {
+    b - a >= len(HDR) && slice(d, a, a + len(HDR)) == HDR
+}
+
+// 从 d[at] 读一条消息
+pub fn parse(d: str, at: int) -> Got! {
+    n = -1    // 读到的 Content-Length，还没读到时是 -1
+    i = at
+    for i - at <= MAX_HEADER {
+        j = crlf(d, i)
+        if j < 0 {
+            if len(d) - at > MAX_HEADER { break }
+            return Ok(More)
+        }
+        if j == i {
+            // 空行：消息头结束
+            if n < 0 { return Err("LSP 消息头里没有 Content-Length") }
+            start = j + 2
+            if len(d) - start < n { return Ok(More) }
+            return Ok(Msg(body: slice(d, start, start + n), next: start + n))
+        }
+        if is_len_header(d, i, j) {
+            if n >= 0 { return Err("LSP 消息头里有两个 Content-Length") }
+            n = num(d, i + len(HDR), j)?
+        }
+        i = j + 2
+    }
+    Err("LSP 消息头超过 #{MAX_HEADER} 字节还没有结束")
+}

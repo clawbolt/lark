@@ -1,0 +1,28 @@
+// std/str 的查找、切开和去头去尾（需要 lark1 及以后的版本）。查找都是逐字节比较，不切出子串
+import "std/str"
+
+fn show(x: int?) -> str {
+    match x {
+        Some(i) => int_str(i)
+        None => "无"
+    }
+}
+
+fn main() {
+    s = "a,b,,c,b"
+    b = "b"
+    x = "x"
+    print("find b：#{show(str.find(s, b))}，从 3 起：#{show(str.find_from(s, b, 3))}，最后一个：#{show(str.rfind(s, b))}，找 x：#{show(str.find(s, x))}")
+    print("数逗号：#{str.count(s, ",")}，aaaa 里的 aa：#{str.count("aaaa", "aa")}")
+    print("#{str.split("一, 二, , 三", ", ")} #{str.split("abc", "")}")
+    pad = "  x  "
+    print("[#{str.trim_start(pad)}] [#{str.trim_end(pad)}]")
+    print("#{str.trim_prefix("v1.2", "v")} #{str.trim_prefix("1.2", "v")} #{str.trim_suffix("main.lark", ".lark")}")
+    print("#{str.replace_all("中文中文", "文", "国")} #{str.replace_all("aaa", "a", "bb")} #{str.replace_all("abc", "x", "y")}")
+    empty = ""
+    print("#{str.starts_with(empty, empty)} #{str.ends_with("ab", "abc")} #{str.contains("hello", empty)} #{show(str.find(empty, empty))}")
+    // 二十万个字节里找最后的 c：以前每个位置都切出一个子串，现在只比一个字节
+    big = str.repeat("ab", 100000) + "c"
+    c = "c"
+    print(show(str.find(big, c)))
+}

@@ -1,0 +1,47 @@
+len = 11，字符数 = 4
+chars：["云", "雀", "a", "🎵"]
+each：<云><雀><a><🎵>
+code_points：[20013, 233, 33]，from_code_point：中é🎵
+slice_chars(1, 3) = 雀a，slice_chars(2, 100) = a🎵，slice_chars(-5, 1) = 云
+reverse：🎵a雀云
+is_valid：true false false false，坏字节也算字符：2
+堆：8 个，最小 Some(0)
+取出 Some(0) Some(1)，剩下从小到大：[2, 3, 5, 7, 8, 9]
+字符串：["apple", "fig", "pear"]
+按优先级：救火 → 回邮件 → 扫地
+空堆：None true
+deque：[0, 1, 2, 3, 4]
+pop_front Some(0)，pop_back Some(4)
+13 个，front Some(109)，back Some(3)，get(10) Some(1)，get(13) None，和 1051
+转 5 次：[104, 103, 102, 101, 100, 1, 2, 3, 109, 108, 107, 106, 105]
+clear 之后：true None
+字符串：甲、乙、丙
+[] → loud=false name=世界 times=1 rest=[]
+["-l", "--name=云雀", "-t", "3", "x", "y"] → loud=true name=云雀 times=3 rest=["x", "y"]
+["a", "--", "-l", "--x"] → loud=false name=世界 times=1 rest=["a", "-l", "--x"]
+["--times", "x"] → 错误：参数 --times 要一个整数，得到的是 "x"
+["--loud=yes"] → 错误：参数 --loud 只能是 true 或 false，得到的是 "yes"
+["--color"] → 错误：未知的参数 --color
+["-n"] → 错误：参数 -n 缺少值
+["-ll", "z"] → loud=true name=世界 times=1 rest=["z"]
+["-lq"] → 错误：未知的参数 -q（在 -lq 里）
+["-lt", "3"] → loud=true name=世界 times=3 rest=[]
+["-h"] → 错误：help
+用法：greet [选项] [参数…]
+向某人问好
+
+选项：
+  -l, --loud          全部大写
+  -n, --name <value>  要问候的人（默认 世界）
+  -t, --times <int>   重复几次（默认 1）
+  -h, --help          显示这段说明
+种子 42：[71, 51, 4, 96, 38, 92, 77, 3]
+同一个种子得到同一串数：true
+range(10, 20)：都在区间里 true，10 个值都出现了 true
+next_float：都在 [0, 1) 里 true，均值接近 0.5 true
+next_bool(0.3)：10000 次里 2800 到 3200 次 true
+大范围：true
+打乱：[9, 5, 2, 8, 10, 4, 6, 7, 1, 3]
+sample 3：["戊", "甲", "乙"]，sample 9：5 个
+空列表的 choice：None
+负数种子：0 2 5

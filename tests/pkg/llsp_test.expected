@@ -1,0 +1,38 @@
+通过  分帧：写出来再读回来（Lsp.lean 的 parse_frame）
+通过  分帧：Content-Type、数据不够、格式不对
+通过  分帧：一个字节一个字节地到
+通过  位置：a😀b\r\nc（和 Lsp.lean 的 #guard 一样）
+通过  位置：随机的文档来回换（pos_off、off_pos、off_boundary）
+通过  修改：didChange 的增量修改（edit_len、edit_noop、edit_all）
+通过  生命周期：一次完整的会话（和 LspRpc.lean 的 #guard 一样）
+通过  消息的分类：不是请求的 JSON、字符串 id、客户端的回复
+通过  回复的 JSON；initialize 时商量列的单位
+通过  stdin 的字节流：分帧、一个字节一个字节地到、exit 以后不再读
+通过  打开的文档：打开、修改、关闭（和 LspDoc.lean 的 #guard 一样）
+通过  打开的文档：随机的修改（change_split、change_mono、step_other）
+通过  打开的文档：经过服务器的 JSON 通知
+通过  诊断的位置：编译器的行列 → LSP 的位置（和 LspDiag.lean 的 #guard 一样）
+通过  诊断的位置：随机的文档（c_round、cOff_le、diag_round）
+通过  编译器的错误行（parse_fmt）
+通过  什么时候发诊断（pubs_latest、pubs_quiet、pubs_len）
+通过  诊断的 JSON；经过服务器
+通过  诊断：真的运行编译器
+通过  跳到定义：声明和光标下的词（和 LspDef.lean 的 #guard 一样）
+通过  跳到定义：随机的文档（word_bounds、word_end、decls_word、find_word）
+通过  跳到定义：经过服务器
+通过  跳到定义：模块.名字，找 import 进来的文件
+通过  文档大纲：声明和种类（和 LspSym.lean 的 #guard 一样）
+通过  文档大纲：随机的文档（symbols_decls、symbols_word、symbols_in）
+通过  文档大纲：经过服务器
+通过  格式化：只换不一样的那段（和 LspFmt.lean 的 #guard 一样）
+通过  格式化：随机的文档（fmt_edit、fmt_change）
+通过  格式化：经过服务器、真的运行格式化工具
+通过  补全：前缀和候选（和 LspComp.lean 的 #guard 一样）
+通过  补全：随机的文档（complete_iff、complete_nodup、local_sound）
+通过  补全：经过服务器、模块.名字
+通过  语义高亮：找词和编码（和 LspSem.lean 的 #guard 一样）
+通过  语义高亮：随机的文档（scan_word、scan_disjoint、decode_encode）
+通过  语义高亮：每个词的种类
+通过  语义高亮：match 的模式、闭包的参数、test / lock / defer、常量
+通过  语义高亮：经过服务器
+37 项测试：37 项通过，0 项失败

@@ -1,0 +1,136 @@
+// llua 的单元测试：每个测试运行一小段 Lua，比较它打印出来的内容。预期结果按真 Lua 5.4 的输出写
+import "lua/parse"
+import "lua/interp"
+import "lua/value"
+
+// 运行 src，得到标准输出；出错时末尾接上“错误：…”
+fn lua(src: str) -> str {
+    prog = match take parse.parse(src, "t") {
+        Ok(p) => p
+        Err(e) => return "语法错误：#{e}"
+    }
+    vm = interp.new_vm("t")
+    r = interp.run_main(&vm, prog, [])
+    out = vm.out
+    match r {
+        Ok => out
+        Err(value.Str(s)) => out + "错误：" + s
+        Err(_) => out + "错误：（不是字符串）"
+    }
+}
+
+test "数字和算术" {
+    assert_eq(lua("print(1 + 2, 7 // 2, 7 % 3, -7 // 2, -7 % 3, 7 / 2, 2^10, 10 / 2)"), "3\t3\t1\t-4\t2\t3.5\t1024.0\t5.0\n")
+    assert_eq(lua("print(math.maxinteger + 1 == math.mininteger, 3 == 3.0, \"10\" + 5, \"3.5\" * 2)"), "true\ttrue\t15\t7.0\n")
+    assert_eq(lua("print(1e15, 1e16, 0.1, 1/3, -0.0, 10 // 0.0, 2^63)"), "1e+15\t1e+16\t0.1\t0.33333333333333\t-0.0\tinf\t9.2233720368548e+18\n")
+    assert_eq(lua("print(math.type(1), math.type(1.0), math.type(\"1\"), 0x10, 0xff // 2)"), "integer\tfloat\tnil\t16\t127\n")
+    assert_eq(lua("print(7 & 3, 7 | 8, 5 ~ 3, ~0, 1 << 62, 256 >> 4, 1 << 64, -1 >> 63)"), "3\t15\t6\t-1\t4611686018427387904\t16\t0\t1\n")
+    assert_eq(lua("print(math.floor(3.7), math.ceil(3.2), math.floor(-3.5), math.abs(-4), math.max(1, 5, 3), math.min(2.5, 1))"),
+        "3\t4\t-4\t4\t5\t1\n")
+}
+
+test "字符串" {
+    assert_eq(lua("print(#\"hello\", (\"x\"):rep(3), string.sub(\"hello\", 2, -2), (\"abc\"):upper(), (\"x\"):rep(3, \",\"))"),
+        "5\txxx\tell\tABC\tx,x,x\n")
+    assert_eq(lua("print(string.format(\"%d|%5.2f|%s|%-4s|%x|%q|%g\", 42, 3.14159, \"hi\", \"ab\", 255, 'a\"b', 0.5))"),
+        "42| 3.14|hi|ab  |ff|\"a\\\"b\"|0.5\n")
+    assert_eq(lua("print(string.byte(\"A\"), string.char(72, 105), (\"a,b\"):find(\",\", 1, true), (\"hello\"):find(\"l\"))"),
+        "65\tHi\t2\t3\t3\n")
+    assert_eq(lua("print(\"a\" .. 1 .. 2.5, tostring(nil), tonumber(\"0x10\"), tonumber(\"  12  \"), tonumber(\"z\", 36), tonumber(\"abc\"))"),
+        "a12.5\tnil\t16\t12\t35\tnil\n")
+    assert_eq(lua("print(\"a\\tb\\65\\x41\\u{48}\", [[\nline]], #[==[]==], 'q')"), "a\tbAAH\tline\t0\tq\n")
+}
+
+test "表" {
+    src = "local t = {10, 20, 30, x = 1}\n" +
+        "t[#t + 1] = 40\n" +
+        "table.insert(t, 1, 5)\n" +
+        "print(#t, t[1], t[5], t.x, table.remove(t), #t)\n" +
+        "print(table.concat(t, \",\"), table.unpack({1, 2, 3}))\n" +
+        "local keys = {}\n" +
+        "for k, v in pairs({a = 1, b = 2, c = 3}) do keys[#keys + 1] = k .. \"=\" .. v end\n" +
+        "table.sort(keys)\n" +
+        "print(table.concat(keys, \" \"))\n" +
+        "local s = 0\n" +
+        "for _, v in ipairs({1, 2, 3, nil, 5}) do s = s + v end\n" +
+        "local xs = {3, 1, 2}\n" +
+        "table.sort(xs, function(a, b) return a > b end)\n" +
+        "print(s, table.concat(xs, \" \"), \#{n = 1}, ({[1.0] = \"one\"})[1])\n"
+    assert_eq(lua(src), "5\t5\t40\t1\t40\t4\n5,10,20,30\t1\t2\t3\na=1 b=2 c=3\n6\t3 2 1\t0\tone\n")
+}
+
+test "遍历时删除" {
+    src = "local t = {}\n" +
+        "for i = 1, 10 do t[\"k\" .. i] = i end\n" +
+        "for k, v in pairs(t) do if v % 2 == 0 then t[k] = nil end end\n" +
+        "local n, sum = 0, 0\n" +
+        "for k, v in pairs(t) do n = n + 1; sum = sum + v end\n" +
+        "print(n, sum, next({}))\n"
+    assert_eq(lua(src), "5\t25\tnil\n")
+}
+
+test "闭包和可变参数" {
+    src = "local function counter() local n = 0 return function() n = n + 1 return n end end\n" +
+        "local c1, c2 = counter(), counter()\n" +
+        "print(c1(), c1(), c2())\n" +
+        "local fs = {}\n" +
+        "for i = 1, 3 do fs[i] = function() return i end end\n" +
+        "print(fs[1](), fs[3]())\n" +
+        "local function f(...) return select(\"#\", ...), ... end\n" +
+        "print(f(1, nil, 3))\n" +
+        "local function g() return 1, 2 end\n" +
+        "print(g(), g())\n" +
+        "print((g()), \#{g(), g()}, select(-1, g()))\n"
+    assert_eq(lua(src), "1\t2\t1\n1\t3\n3\t1\tnil\t3\n1\t1\t2\n1\t3\t2\n")
+}
+
+test "元表" {
+    src = "local V = {}\n" +
+        "V.__index = V\n" +
+        "function V.new(x, y) return setmetatable({x = x, y = y}, V) end\n" +
+        "function V.__add(a, b) return V.new(a.x + b.x, a.y + b.y) end\n" +
+        "function V.__eq(a, b) return a.x == b.x and a.y == b.y end\n" +
+        "function V:len() return self.x + self.y end\n" +
+        "V.__tostring = function(v) return \"(\" .. v.x .. \",\" .. v.y .. \")\" end\n" +
+        "local v = V.new(1, 2) + V.new(3, 4)\n" +
+        "print(tostring(v), v:len(), v == V.new(4, 6), getmetatable(v) == V)\n" +
+        "local d = setmetatable({}, {__index = function(t, k) return k .. \"!\" end, __call = function(self, a) return a * 2 end})\n" +
+        "print(d.hi, d(21), rawget(d, \"hi\"))\n"
+    assert_eq(lua(src), "(4,6)\t10\ttrue\ttrue\nhi!\t42\tnil\n")
+}
+
+test "错误和 pcall" {
+    assert_eq(lua("print(pcall(error, \"boom\"))"), "false\tboom\n")
+    assert_eq(lua("print(pcall(function() error(\"boom\") end))"), "false\tt:1: boom\n")
+    assert_eq(lua("local ok, e = pcall(error, {code = 42}) print(ok, e.code)"), "false\t42\n")
+    assert_eq(lua("print(pcall(function() local x = nil; return x.y end))"), "false\tt:1: attempt to index a nil value (local 'x')\n")
+    assert_eq(lua("print(pcall(function() return 1 + {} end))"), "false\tt:1: attempt to perform arithmetic on a table value\n")
+    assert_eq(lua("print(select(2, pcall(function() undefined_fn() end)))"), "t:1: attempt to call a nil value (global 'undefined_fn')\n")
+    assert_eq(lua("print(pcall(assert, false, \"msg\"))\nprint(pcall(assert, nil))"), "false\tmsg\nfalse\tassertion failed!\n")
+    assert_eq(lua("print(1 < 2, \"a\" < \"b\", pcall(function() return 1 < \"2\" end))"), "true\ttrue\tfalse\tt:1: attempt to compare number with string\n")
+    assert_eq(lua("print(\"x\")\nerror(\"stop\")"), "x\n错误：t:2: stop")
+}
+
+test "控制流" {
+    src = "local s = 0\n" +
+        "for i = 10, 1, -3 do s = s + i end\n" +
+        "for x = 1.0, 2.0, 0.5 do io.write(x, \" \") end\n" +
+        "print(s)\n" +
+        "local i = 0\n" +
+        "repeat local j = i; i = i + 1 until j >= 3\n" +
+        "print(i)\n" +
+        "while true do i = i + 1 if i > 10 then break end end\n" +
+        "print(i)\n" +
+        "for k = math.maxinteger - 1, math.maxinteger do io.write(k, \" \") end\n" +
+        "print()\n" +
+        "local function fib(n) if n < 2 then return n end return fib(n - 1) + fib(n - 2) end\n" +
+        "print(fib(20))\n"
+    assert_eq(lua(src), "1 1.5 2 22\n4\n11\n9223372036854775806 9223372036854775807 \n6765\n")
+}
+
+test "语法错误" {
+    assert_eq(lua("x = = 1"), "语法错误：t:1: unexpected symbol near '='")
+    assert_eq(lua("if x then"), "语法错误：t:1: 'end' expected near '<eof>'")
+    assert_eq(lua("goto done"), "语法错误：t:1: llua 还不支持 goto near 'goto'")
+    assert_eq(lua("local s = \"abc"), "语法错误：t:1: unfinished string near '<eof>'")
+}

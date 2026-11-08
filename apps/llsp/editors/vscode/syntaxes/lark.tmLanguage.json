@@ -1,0 +1,124 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Lark",
+  "scopeName": "source.lark",
+  "fileTypes": ["lark"],
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#char" },
+    { "include": "#number" },
+    { "include": "#declaration" },
+    { "include": "#test" },
+    { "include": "#keyword" },
+    { "include": "#type" },
+    { "include": "#constant" },
+    { "include": "#call" },
+    { "include": "#operator" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.double-slash.lark",
+      "match": "//.*$"
+    },
+    "escape": {
+      "name": "constant.character.escape.lark",
+      "match": "\\\\(?:[ntr0e\\\\\"'#]|x[0-9a-fA-F]{2})"
+    },
+    "string": {
+      "name": "string.quoted.double.lark",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "include": "#escape" },
+        {
+          "name": "meta.interpolation.lark",
+          "begin": "#\\{",
+          "end": "\\}",
+          "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.lark" } },
+          "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.lark" } },
+          "contentName": "source.lark",
+          "patterns": [{ "include": "#braces" }, { "include": "$self" }]
+        }
+      ]
+    },
+    "braces": {
+      "begin": "\\{",
+      "end": "\\}",
+      "patterns": [{ "include": "#braces" }, { "include": "$self" }]
+    },
+    "char": {
+      "name": "string.quoted.single.lark",
+      "match": "'(?:\\\\(?:[ntr0e\\\\\"'#]|x[0-9a-fA-F]{2})|[^\\\\'])'"
+    },
+    "number": {
+      "patterns": [
+        { "name": "constant.numeric.hex.lark", "match": "\\b0x[0-9a-fA-F_]+\\b" },
+        { "name": "constant.numeric.octal.lark", "match": "\\b0o[0-7_]+\\b" },
+        { "name": "constant.numeric.binary.lark", "match": "\\b0b[01_]+\\b" },
+        { "name": "constant.numeric.float.lark", "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*(?:[eE][+-]?[0-9_]+)?\\b" },
+        { "name": "constant.numeric.integer.lark", "match": "\\b[0-9][0-9_]*(?:[eE][+-]?[0-9_]+)?\\b" }
+      ]
+    },
+    "declaration": {
+      "patterns": [
+        {
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": { "1": { "name": "keyword.declaration.function.lark" }, "2": { "name": "entity.name.function.lark" } }
+        },
+        {
+          "match": "\\b(type|enum|interface)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": { "1": { "name": "keyword.declaration.type.lark" }, "2": { "name": "entity.name.type.lark" } }
+        },
+        {
+          "match": "\\b(const)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": { "1": { "name": "keyword.declaration.const.lark" }, "2": { "name": "variable.other.constant.lark" } }
+        },
+        {
+          "match": "\\b(import)\\b",
+          "captures": { "1": { "name": "keyword.control.import.lark" } }
+        }
+      ]
+    },
+    "test": {
+      "match": "^\\s*(test)(?=\\s+\")",
+      "captures": { "1": { "name": "keyword.other.test.lark" } }
+    },
+    "keyword": {
+      "patterns": [
+        { "name": "keyword.control.lark", "match": "\\b(if|else|match|for|in|return|break|continue|select|scope)\\b" },
+        { "name": "keyword.control.lark", "match": "\\b(defer|lock)(?=\\s*\\{)" },
+        { "name": "keyword.control.lark", "match": "\\b(after|done)(?=\\s*\\()" },
+        { "name": "storage.modifier.lark", "match": "\\b(pub|take|inout|fn|type|enum|interface|const)\\b" },
+        { "name": "storage.modifier.lark", "match": "\\b(shared|dyn)(?=\\s+[A-Za-z_])" },
+        { "name": "storage.modifier.lark", "match": "^\\s*(extern)\\b" },
+        { "name": "keyword.operator.as.lark", "match": "\\bas\\b" }
+      ]
+    },
+    "type": {
+      "patterns": [
+        { "name": "support.type.primitive.lark", "match": "\\b(int|float|u8|bool|str)\\b" },
+        { "name": "support.type.lark", "match": "\\bFn(?=\\s*\\()" },
+        { "name": "support.type.lark", "match": "\\bSelf\\b" }
+      ]
+    },
+    "constant": {
+      "patterns": [
+        { "name": "constant.language.boolean.lark", "match": "\\b(true|false)\\b" },
+        { "name": "support.constant.lark", "match": "\\b(Some|None|Ok|Err)\\b" },
+        { "name": "variable.other.constant.lark", "match": "\\b[A-Z][A-Z0-9_]*[A-Z0-9]\\b" },
+        { "name": "entity.name.type.lark", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" }
+      ]
+    },
+    "call": {
+      "match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "captures": { "1": { "name": "entity.name.function.call.lark" } }
+    },
+    "operator": {
+      "patterns": [
+        { "name": "keyword.operator.lark", "match": "\\?\\?|->|=>|\\.\\.|[+\\-*]%|==|!=|<=|>=|&&|\\|\\||<<=|>>>=|>>=|<<|>>>|>>|[-+*/%&|^]=|[-+*/%&|^!<>=?]" },
+        { "name": "punctuation.accessor.lark", "match": "\\." }
+      ]
+    }
+  }
+}

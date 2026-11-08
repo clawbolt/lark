@@ -1,0 +1,62 @@
+// std/time：时钟、时长、日期（需要 lark1 及以后的版本）
+import "std/time"
+
+fn show(r: int!) -> str {
+    s = match r {
+        Ok(v) => "#{v}"
+        Err(e) => "错误：#{e}"
+    }
+    s
+}
+
+// 星期几的名字是给人看的显示文字，不在标准库里（Date 的 weekday：0 是星期日）
+fn weekday_name(d: time.Date) -> str {
+    names = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"]
+    names[d.weekday].copy()
+}
+
+fn main() {
+    // 固定的时间点，输出才可复现：2026-10-26 07:52:00.123 UTC
+    ms = 1_793_001_120_123
+    d = time.date_utc(ms)
+    print("#{d.format()}，#{d.format_iso()}，#{weekday_name(d)}")
+    print("北京时间：#{time.date_at(ms, 8 * 60).format()}")
+    print("转回毫秒数相等：#{time.to_unix_ms(d) == ms}")
+    print("1970 年以前：#{time.date_utc(-1).format_iso()} #{weekday_name(time.date_utc(-1))}，起点：#{time.date_utc(0).format_iso()} #{weekday_name(time.date_utc(0))}")
+
+    // 往返：从公元前后到很远的将来，每隔约 1000 天取一个
+    ok = true
+    for i in 0..2000 {
+        t = (i * 1000 - 1_000_000) * 86_400_000 + 12_345
+        if time.to_unix_ms(time.date_utc(t)) != t { ok = false }
+    }
+    print("往返 2000 个日期：#{ok}")
+    print("闰年：#{time.days_in_month(2024, 2)} #{time.days_in_month(2100, 2)} #{time.days_in_month(2000, 2)}")
+
+    // 解析
+    leap = time.parse_iso("2024-02-29")
+    print("2024-02-29：#{show(leap)}")
+    match leap {
+        Ok(v) => print("  -> #{time.date_utc(v).format()} #{weekday_name(time.date_utc(v))}")
+        Err(_) => print("  解析失败")
+    }
+    same = time.parse_iso("2026-10-26T07:52:00.123Z")
+    print("带毫秒：#{show(same)}，空格分隔：#{show(time.parse_iso("2026-10-26 07:52:00"))}")
+    print(show(time.parse_iso("2023-02-29")))
+    print(show(time.parse_iso("2026-10-26T7:52")))
+    print(show(time.parse_iso("2026-10-26T07:52:00Zx")))
+
+    // 时长
+    ds = [999, 1_500, 12_345_678, 1_000_000_000, 90_000_000_000, 120_000_000_000, 3_600_000_000_000, 7_500_000_000_000, -2_000_000]
+    outs: [str] = []
+    for n in ds { outs.push(time.format_dur(n)) }
+    print(join(outs, " "))
+
+    // 真实的时钟：只打印不随时间变化的结论
+    t0 = time.now()
+    sleep_ms(20)
+    print("睡了至少 20ms：#{time.elapsed_ms(t0) >= 20}，elapsed_ns 非负：#{time.elapsed_ns(t0) >= 0}")
+    now = time.unix_ms()
+    gap = time.unix_ns() / 1_000_000 - now
+    print("墙上时间在 2023 年以后：#{now > 1_700_000_000_000}，纳秒和毫秒对得上：#{gap >= 0 && gap < 1000}")
+}

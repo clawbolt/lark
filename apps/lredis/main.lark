@@ -1,0 +1,296 @@
+// lredis：用 Lark 写的简单 Redis。协议（RESP）和真 Redis 兼容，redis-cli、redis-benchmark 都能连上来。
+// 构建：在 apps/lredis 里 lark build，得到 build/lredis
+//
+//   lredis [--port 端口] [--bind 地址]          启动服务器（默认 127.0.0.1:6379；端口给 0 时由系统挑）
+//   lredis cli [-h 主机] [-p 端口] [命令 参数…]   客户端：执行一条命令；不给命令时从标准输入一行一条地读
+//
+// 支持的命令：PING ECHO SELECT DBSIZE FLUSHDB FLUSHALL INFO KEYS DEL UNLINK EXISTS TYPE
+//   EXPIRE PEXPIRE TTL PTTL PERSIST，字符串 GET SET（NX XX GET EX PX EXAT PXAT KEEPTTL）SETNX GETSET GETDEL MGET MSET
+//   INCR DECR INCRBY DECRBY APPEND STRLEN，列表 LPUSH RPUSH LPOP RPOP LLEN LRANGE LINDEX，
+//   哈希 HSET HGET HDEL HGETALL HKEYS HVALS HLEN HEXISTS，以及 QUIT、SHUTDOWN（不保存，直接退出）。
+//
+// 线程：一个线程拥有数据库（store_loop），一个线程接受连接（accept_loop），每个连接一个线程（serve_conn）。
+// 连接线程把命令连同回复用的 Chan 发给数据库线程，等回复再写回客户端。线程之间不共享可变的数据。
+// 另有一个任务等 SIGINT / SIGTERM（on_signal），收到就写日志退出，和 SHUTDOWN 一样不保存。
+import "std/net"
+import "std/io"
+import "std/str"
+import "std/time"
+import "std/log"
+import "std/signal"
+import "db/resp"
+import "db/store"
+
+type Req {
+    args: [str]
+    reply: Chan[str]
+}
+
+// ---------- 数据库线程 ----------
+
+fn store_loop(take reqs: Chan[Req]) {
+    db = store.new_db()
+    for {
+        select {
+            q <- reqs => {
+                if str.to_lower(q.args[0]) == "shutdown" {
+                    log.new("lredis").info("收到 SHUTDOWN，退出")
+                    exit(0)
+                }
+                r = store.exec(&db, q.args, time.unix_ms())
+                q.reply.send(r)
+            }
+            // 每 100 毫秒删一次过期的键（读写时也会顺便检查）
+            after 100 => store.sweep(&db, time.unix_ms())
+            done => break
+        }
+    }
+}
+
+// ---------- 连接 ----------
+
+type Client {
+    c: net.Conn
+    reqs: Chan[Req]
+}
+
+fn serve_conn(take cl: Client) {
+    match session(&cl) {
+        Ok => {}
+        Err(_) => {}        // 客户端断开、超时这些都不用管
+    }
+}
+
+// 读到的数据先攒在 buf 里，一次可能有好几条命令（流水线），逐条执行，回复攒起来一起写回去
+fn session(inout cl: Client) -> ()! {
+    rc: Chan[str] = chan()
+    buf = ""
+    for true {
+        chunk = cl.c.read(65536)?
+        if chunk == "" { return Ok() }
+        buf += chunk
+        pos = 0
+        out = ""
+        for true {
+            args, at, err = resp.parse(buf, pos)
+            if at == -1 { break }
+            if at == -2 {
+                cl.c.write(out + resp.error(err))?
+                return Ok()
+            }
+            pos = at
+            if len(args) == 0 { continue }
+            if str.to_lower(args[0]) == "quit" {
+                cl.c.write(out + resp.ok())?
+                return Ok()
+            }
+            cl.reqs.send(Req(args: args, reply: rc.copy()))
+            out += rc.recv() ?? resp.error("ERR lredis 的数据库线程已经结束")
+        }
+        if out != "" { cl.c.write(out)? }
+        buf = slice(buf, pos, len(buf))
+    }
+}
+
+type Acceptor {
+    l: net.Listener
+    reqs: Chan[Req]
+}
+
+fn accept_loop(take a: Acceptor) {
+    scope {
+        for true {
+            r = a.l.accept()
+            c = match take r {
+                Ok(x) => x
+                Err(e) => {
+                    log.new("lredis").log(log.ERROR, "accept 出错，不再接受新连接", ["err", e.copy()])
+                    break
+                }
+            }
+            spawn(serve_conn, Client(c: c, reqs: a.reqs.copy()))
+        }
+    }
+}
+
+fn run_server(host: str, port: int) -> ()! {
+    // 先登记信号再告诉别人准备好了：之后的 Ctrl-C、kill 都由 on_signal 处理
+    sigs = signal.notify([signal.INT, signal.TERM])?
+    l = net.listen(host, port)?
+    p = l.local_port()?
+    // 先写出来再开始等：测试脚本靠这一行知道端口
+    w = io.stdout()
+    w.write_line("lredis 在 #{host}:#{p} 上等待连接")?
+    w.flush()?
+    reqs: Chan[Req] = chan()
+    db_side = reqs.copy()
+    scope {
+        spawn(on_signal, sigs)
+        spawn(store_loop, db_side)
+        spawn(accept_loop, Acceptor(l: l, reqs: reqs))
+    }
+}
+
+// 收到 SIGINT（Ctrl-C）或 SIGTERM（kill）：写一行日志就退出，不等进行中的连接
+fn on_signal(take s: signal.Signals) {
+    n = s.wait() ?? signal.TERM
+    log.new("lredis").info("收到 #{signal.name(n)}，退出")
+    exit(0)
+}
+
+// ---------- 客户端 ----------
+
+fn read_exact(inout c: net.Conn, n: int) -> str! {
+    s = ""
+    for len(s) < n {
+        chunk = c.read(n - len(s))?
+        if chunk == "" { return Err("连接被服务器关闭了") }
+        s += chunk
+    }
+    Ok(s)
+}
+
+// redis-cli 的显示方法：双引号括起来，\ " 和不可打印的字节转义
+fn quoted(s: str) -> str {
+    out = "\""
+    for i in 0..len(s) {
+        ch = byte_at(s, i)
+        if ch == '\\' {
+            out += "\\\\"
+        } else if ch == '"' {
+            out += "\\\""
+        } else if ch == '\n' {
+            out += "\\n"
+        } else if ch == '\r' {
+            out += "\\r"
+        } else if ch == '\t' {
+            out += "\\t"
+        } else if ch < 32 || ch > 126 {
+            out += "\\x" + hex2(ch)
+        } else {
+            out += slice(s, i, i + 1)
+        }
+    }
+    out + "\""
+}
+
+fn hex2(n: int) -> str {
+    digits = "0123456789abcdef"
+    slice(digits, n / 16, n / 16 + 1) + slice(digits, n % 16, n % 16 + 1)
+}
+
+// 读一个回复，按 redis-cli 的样子排成几行
+fn read_reply(inout c: net.Conn) -> [str]! {
+    line = match c.read_line() {
+        Some(s) => s
+        None => return Err("连接被服务器关闭了")
+    }
+    if len(line) == 0 { return Err("回复的格式不对：空行") }
+    kind = byte_at(line, 0)
+    rest = slice(line, 1, len(line))
+    if kind == '+' { return Ok([rest]) }
+    if kind == '-' { return Ok(["(error) " + rest]) }
+    if kind == ':' { return Ok(["(integer) " + rest]) }
+    if kind == '$' {
+        n = try_parse_int(rest) ?? -1
+        if n < 0 { return Ok(["(nil)"]) }
+        body = read_exact(&c, n + 2)?
+        return Ok([quoted(slice(body, 0, n))])
+    }
+    if kind == '*' {
+        n = try_parse_int(rest) ?? -1
+        if n < 0 { return Ok(["(nil)"]) }
+        if n == 0 { return Ok(["(empty array)"]) }
+        width = len("#{n}")
+        out: [str] = []
+        for k in 1..n + 1 {
+            sub = read_reply(&c)?
+            label = str.pad_start("#{k}", width, " ") + ") "
+            pad = str.repeat(" ", len(label))
+            for j in 0..len(sub) { out.push(if j == 0 { label + sub[j] } else { pad + sub[j] }) }
+        }
+        return Ok(out)
+    }
+    Err("回复的格式不对：#{line}")
+}
+
+fn run_one(inout c: net.Conn, args: [str]) -> ()! {
+    c.write(resp.command(args))?
+    // SHUTDOWN 之后服务器直接退出，没有回复
+    if str.to_lower(args[0]) == "shutdown" { return Ok() }
+    for ln in read_reply(&c)? { print(ln) }
+}
+
+fn cmd_cli(av: [str]) -> ()! {
+    host = "127.0.0.1"
+    port = 6379
+    k = 2
+    for k + 1 < len(av) && (av[k] == "-h" || av[k] == "-p") {
+        if av[k] == "-h" {
+            host = av[k + 1].copy()
+        } else {
+            port = try_parse_int(av[k + 1]) ?? -1
+            if port < 0 { return Err("端口不对：#{av[k + 1]}") }
+        }
+        k += 2
+    }
+    c = net.connect(host, port)?
+    c.set_timeout_ms(10000)?
+    if k < len(av) {
+        args: [str] = []
+        for j in k..len(av) { args.push(av[j].copy()) }
+        return run_one(&c, args)
+    }
+    // 从标准输入一行一条地读（空行跳过）
+    input = io.stdin()
+    for true {
+        line = match input.read_line() {
+            Some(s) => s
+            None => break
+        }
+        args = match take resp.split_args(line) {
+            Some(xs) => xs
+            None => {
+                print("(error) 引号没有配对：#{line}")
+                continue
+            }
+        }
+        if len(args) > 0 { run_one(&c, args)? }
+    }
+}
+
+fn usage() {
+    eprint("用法：lredis [--port 端口] [--bind 地址]\n      lredis cli [-h 主机] [-p 端口] [命令 参数…]")
+    exit(2)
+}
+
+fn main() {
+    av = args()
+    r = if len(av) >= 2 && av[1] == "cli" {
+        cmd_cli(av)
+    } else {
+        host = "127.0.0.1"
+        port = 6379
+        k = 1
+        for k < len(av) {
+            if k + 1 >= len(av) { usage() }
+            if av[k] == "--port" {
+                port = try_parse_int(av[k + 1]) ?? -1
+                if port < 0 { usage() }
+            } else if av[k] == "--bind" {
+                host = av[k + 1].copy()
+            } else {
+                usage()
+            }
+            k += 2
+        }
+        run_server(host, port)
+    }
+    match r {
+        Ok => {}
+        Err(e) => {
+            eprint("lredis：#{e}")
+            exit(1)
+        }
+    }
+}

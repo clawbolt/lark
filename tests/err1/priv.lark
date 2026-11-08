@@ -1,0 +1,7 @@
+// 期望错误：secret.key 没有 pub，只能在声明它的模块里使用
+import "../mods/secret"
+
+fn main() {
+    print("#{secret.open_door()}")
+    print("#{secret.key()}")
+}

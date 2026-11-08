@@ -1,0 +1,231 @@
+// lterm app：自己开一个窗口的终端（macOS），不用在别的终端里启动。
+// 和 lterm run（live.lark）一样：伪终端里跑 shell，输出喂给我们的终端仿真（vt/term），只是画到窗口里（vt/win、native/gui.c）。
+// 只把变了的行交给窗口（vt/draw 的 diff，VtDraw.lean）；窗口改了大小时仿真的屏幕和伪终端一起改（VtSb.lean 的 resize）。
+// 滚轮往上翻滚动缓冲（vt/view 的 up / down / window，VtView.lean），按任何键回到最下面。
+// ⌘V 粘贴（里面的程序打开括号粘贴时带着标记），⌘Q / ⌘W 或者点关闭按钮关窗口；shell 退出时窗口也关掉。
+// 输入法（中文、日文）在 native/gui.c 里接：拼字时画在光标那里，选好的字交给 shell。
+// 鼠标选中（vt/sel，VtSel.lean）：拖着选，双击选词，三击选整行；⌘C 复制；打字、改大小时取消。翻看历史时也能选。
+// ⌘+ / ⌘- / ⌘0 改字号（窗口不变，格子数跟着变）；程序用 OSC 0 / 2 设的标题显示在窗口上。
+// 程序打开 ?1000 / 1002 / 1003（vim、htop、codex）时鼠标和滚轮交给程序（vt/mouse，VtMouse.lean），按着 Shift 还是自己选中；
+// 备用屏幕上没开鼠标模式时（less、man）滚轮变成方向键。
+// 没有证明的一层：事件循环本身。没做：菜单栏。
+import "vt/term"
+import "vt/pty"
+import "vt/draw"
+import "vt/view"
+import "vt/mode"
+import "vt/win"
+import "vt/screen"
+import "vt/sel"
+import "vt/mouse"
+import "std/time"
+
+// 绝对行号 l 那一行的字符（vt/sel 用；宽字符的右半是 0）：l 从滚动缓冲最旧的那一行往前数（mode.M 的 pushed）
+fn abs_row(t: term.Term, l: int) -> [int] {
+    nsb = mode.sb_len(t.m)
+    base = t.m.pushed - nsb
+    out: [int] = []
+    cells: [int] = []
+    if l >= t.m.pushed {
+        y = l - t.m.pushed
+        if y < t.m.scr.rows { cells = screen.row(t.m.scr, y) }
+    } else if l >= base {
+        cells = screen.row_fix(t.m.scr.cols, mode.sb_row(t.m, l - base))
+    }
+    for v in cells { out.push(screen.cell_ch(v)) }
+    out
+}
+
+// 选中的字（UTF-8）
+fn sel_text(t: term.Term, s: sel.Sel) -> str {
+    c = t.m.scr.cols
+    first = s.lo / c
+    rows: [[int]] = []
+    for l in first..s.hi / c + 1 { rows.push(abs_row(t, l)) }
+    sel.copy_text(rows, first, c, s)
+}
+
+// 点在绝对位置 p 上、点了 n 下时选中的一段：一下是那一格，两下是那个词，三下是整行
+fn pick(t: term.Term, p: int, n: int) -> sel.Sel {
+    c = t.m.scr.cols
+    l = p / c
+    if n >= 3 { return sel.mk(l * c, l * c + c - 1) }
+    if n == 2 {
+        a, b = sel.word(abs_row(t, l), c, p % c)
+        return sel.mk(l * c + a, l * c + b)
+    }
+    sel.mk(p, p)
+}
+
+// 窗口的鼠标事件换成 vt/mouse 的：按下、松开、拖（按着键）、移动（没按键）
+fn to_ev(m: win.Mouse) -> mouse.Ev {
+    k = if m.kind == 1 { mouse.K_PRESS } else if m.kind == 3 { mouse.K_RELEASE } else { mouse.K_MOTION }
+    mouse.Ev(kind: k, btn: m.btn, held: m.kind == 2, mods: m.mods, x: m.col, y: m.row)
+}
+
+fn span(a: sel.Sel, b: sel.Sel) -> sel.Sel {
+    lo = if a.lo < b.lo { a.lo } else { b.lo }
+    hi = if a.hi > b.hi { a.hi } else { b.hi }
+    sel.Sel(lo: lo, hi: hi)
+}
+
+fn app(cmd: str) -> int {
+    rows = 24
+    cols = 80
+    match win.open(rows, cols, 14) {
+        Ok(_) => {}
+        Err(e) => {
+            eprint("lterm app：#{e}")
+            return 1
+        }
+    }
+    fd = match pty.spawn(cmd, rows, cols) {
+        Ok(x) => x
+        Err(e) => {
+            eprint("lterm app：#{e}")
+            return 1
+        }
+    }
+    t = term.new(rows, cols)
+    pal = win.palette()
+    prev: draw.F? = None
+    v = view.new()
+    dirty = true
+    busy = false
+    cur: sel.Sel? = None        // 选中的一段（绝对位置）
+    anchor = sel.mk(0, 0)       // 按下的那一格（双击是那个词）
+    clicks = 1
+    dragging = false
+    title = ""
+    last = time.now()           // 上一次画的时候
+    for true {
+        // shell 一直在输出时不等窗口的事件
+        if !win.pump(if busy { 0 } else { 8 }) { break }
+        r, c = win.size()
+        if r != t.m.scr.rows || c != t.m.scr.cols {
+            term.resize(&t, r, c)
+            pty.resize(fd, r, c)
+            win.grid(r, c)
+            cur = None
+            prev = None
+            dirty = true
+        }
+        k = win.keys()
+        if k != "" {
+            v.view = false
+            cur = None
+            v.off = 0
+            _k = try_fd_write(fd, k)
+            dirty = true
+        }
+        // 鼠标：窗口第 y 行的绝对行号是 top + y（翻看时往上挪了 off 行）
+        top = t.m.pushed - (if v.view { view.clamp(mode.sb_len(t.m), v.off) } else { 0 })
+        for true {
+            ev = match win.mouse() {
+                Some(e) => e.copy()
+                None => break
+            }
+            // 程序打开了鼠标模式（vt/mouse）：交给程序；按着 Shift 时还是自己选中（和别的终端一样）
+            if t.mouse.track != mouse.OFF && !v.view && (ev.mods & 1) == 0 {
+                rep = mouse.report(t.mouse, to_ev(ev))
+                if rep != "" { _m = try_fd_write(fd, rep) }
+                continue
+            }
+            // 自己选中：只用左键；不按键的移动不管
+            if ev.btn != 0 || ev.kind == 4 { continue }
+            p = (top + ev.row) * t.m.scr.cols + ev.col
+            if ev.kind == 1 {
+                clicks = if ev.clicks > 0 { ev.clicks } else { 1 }
+                anchor = pick(t, p, clicks)
+                // 单击只是放下光标的位置，拖了才算选中
+                cur = if clicks >= 2 { Some(anchor.copy()) } else { None }
+                dragging = true
+            } else if ev.kind == 2 && dragging {
+                cur = Some(span(anchor, pick(t, p, clicks)))
+            } else if ev.kind == 3 {
+                dragging = false
+            }
+            dirty = true
+        }
+        if win.copy_req() {
+            match cur.copy() {
+                Some(s) => win.clip(sel_text(t, s))
+                None => {}
+            }
+        }
+        sc = win.scroll()
+        if sc != 0 {
+            n = if sc > 0 { sc } else { 0 - sc }
+            if t.mouse.track != mouse.OFF && !v.view {
+                // 滚轮交给程序：往上滚是 64、往下是 65，每行一个
+                wy, wx, wm = win.wheel_at()
+                e = mouse.Ev(kind: mouse.K_WHEEL, btn: if sc > 0 { 0 } else { 1 }, held: false, mods: wm, x: wx, y: wy)
+                rep = mouse.report(t.mouse, e)
+                for _i in 0..n {
+                    if rep != "" { _w = try_fd_write(fd, rep) }
+                }
+            } else if mode.in_alt(t.m) && !v.view {
+                // 备用屏幕上（less、man 这些没开鼠标模式的全屏程序）：滚轮变成方向键
+                k = if sc > 0 { (if t.ckm { "\x1bOA" } else { "\x1b[A" }) } else { (if t.ckm { "\x1bOB" } else { "\x1b[B" }) }
+                for _i in 0..n { _w = try_fd_write(fd, k) }
+            } else {
+                nsb = mode.sb_len(t.m)
+                v.off = if sc > 0 { view.up(nsb, sc, v.off) } else { view.down(0 - sc, v.off) }
+                v.view = v.off > 0
+                dirty = true
+            }
+        }
+        busy = false
+        if pty.ready(fd, 0) {
+            // 有多少读多少（最多 1MB 或者 8 毫秒），读完再画一次：htop 这类程序一次重画整个屏幕，
+            // 到这边是很多小段，每段都画一次的话画不过来，越积越多就不响应了
+            t0 = time.now()
+            total = 0
+            eof = false
+            for true {
+                // shell 退出以后读到的是 EOF 或者 EIO
+                got = try_fd_read(fd, 65536) ?? ""
+                if got == "" {
+                    eof = true
+                    break
+                }
+                term.feed(&t, got)
+                total += len(got)
+                if total >= 1048576 || time.elapsed_ms(t0) >= 8 || !pty.ready(fd, 0) { break }
+            }
+            if eof && total == 0 { break }
+            rep = term.take_reply(&t)
+            if rep != "" { _r = try_fd_write(fd, rep) }
+            dirty = true
+            busy = true
+        } else if pty.exited() {
+            break
+        }
+        // 一直有输出时最多每 16 毫秒画一次（60 帧），停下来就马上画
+        if dirty && (!busy || time.elapsed_ms(last) >= 16) {
+            nsb = mode.sb_len(t.m)
+            n0 = if v.view { view.mark(view.window(t.m, v.off), v.off, nsb) } else { draw.frame(t.m.scr) }
+            top2 = t.m.pushed - (if v.view { view.clamp(nsb, v.off) } else { 0 })
+            n = match cur.copy() {
+                Some(s) => sel.mark(n0, s, top2)
+                None => n0
+            }
+            if t.title != title {
+                title = t.title.copy()
+                win.title(if title == "" { "lterm" } else { title.copy() })
+            }
+            cmds = match prev {
+                Some(o) => if o.rows == n.rows && o.cols == n.cols { draw.diff(o, n) } else { draw.full(n) }
+                None => draw.full(n)
+            }
+            win.put(pal, cmds)
+            win.cursor(t.m.scr.x, t.m.scr.y, t.m.tcem && !v.view)
+            win.modes(t.ckm, t.m.paste)
+            win.show()
+            prev = Some(n)
+            dirty = false
+            last = time.now()
+        }
+    }
+    0
+}

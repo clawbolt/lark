@@ -1,0 +1,5 @@
+通过  escape_query
+通过  unescape_query
+通过  format_query 和 parse_query
+通过  随机字节的往返
+4 项测试：4 项通过，0 项失败

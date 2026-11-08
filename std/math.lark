@@ -1,0 +1,122 @@
+// Lark 标准库 · 数学（用 Lark 自己写）
+// 用法：import "std/math"，之后写 math.abs(x)、math.pow(2, 10) 等。
+// int 运算的结果超出范围时和普通运算一样 panic（见 README 的“整数溢出”）。
+// abs、min、max、clamp、sign、sum 也有 float 的版本（按第一个参数的类型重载）；float 的乘方是内置的 float_pow(x, y)；
+// sqrt、floor、sin 等是内置函数，不用 import（见 README 的“浮点数”）。
+
+pub const MAX = 9223372036854775807
+pub const MIN = -MAX - 1
+
+// math.MIN 没有相反数，abs(math.MIN) 和 -x 一样会 panic（同 Rust 的 i64::abs）
+pub fn abs(x: int) -> int { if x < 0 { -x } else { x } }
+
+pub fn min(a: int, b: int) -> int { if a < b { a } else { b } }
+
+pub fn max(a: int, b: int) -> int { if a > b { a } else { b } }
+
+// 把 x 限制在 [lo, hi] 里
+pub fn clamp(x: int, lo: int, hi: int) -> int { min(max(x, lo), hi) }
+
+// 符号：负数 -1，零 0，正数 1
+pub fn sign(x: int) -> int { if x < 0 { -1 } else if x > 0 { 1 } else { 0 } }
+
+// base 的 e 次方（e >= 0），快速幂
+pub fn pow(base: int, e: int) -> int {
+    if e < 0 { panic("math.pow：指数不能为负") }
+    r = 1
+    b = base
+    k = e
+    for k > 0 {
+        if k % 2 == 1 { r = r * b }
+        k = k / 2
+        if k > 0 { b = b * b }
+    }
+    r
+}
+
+pub fn gcd(a: int, b: int) -> int {
+    x = abs(a)
+    y = abs(b)
+    for y != 0 {
+        t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+
+pub fn lcm(a: int, b: int) -> int {
+    if a == 0 || b == 0 { return 0 }
+    abs(a / gcd(a, b) * b)
+}
+
+// 不超过 √n 的最大整数（n >= 0），二分查找
+pub fn isqrt(n: int) -> int {
+    if n < 0 { panic("math.isqrt：参数不能为负") }
+    lo = 0
+    hi = min(n, 3037000499)      // √MAX 向下取整，hi * hi 不会溢出
+    for lo < hi {
+        mid = lo + (hi - lo + 1) / 2
+        if mid * mid <= n {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    lo
+}
+
+// 向下取整的除法和总是非负的余数（a / b 和 a % b 是向零取整的）
+pub fn floor_div(a: int, b: int) -> int {
+    q = a / b
+    if (a % b != 0) && ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+pub fn floor_mod(a: int, b: int) -> int {
+    r = a % b
+    if r != 0 && ((r < 0) != (b < 0)) { r + b } else { r }
+}
+
+pub fn sum(xs: [int]) -> int {
+    s = 0
+    for x in xs { s += x }
+    s
+}
+
+// ---------- float ----------
+
+pub const PI = 3.141592653589793
+pub const E = 2.718281828459045
+pub const INF = 1.0 / 0.0
+pub const NAN = 0.0 / 0.0
+
+pub fn abs(x: float) -> float { if x < 0.0 { -x } else { x } }
+
+pub fn min(a: float, b: float) -> float { if a < b { a } else { b } }
+
+pub fn max(a: float, b: float) -> float { if a > b { a } else { b } }
+
+pub fn clamp(x: float, lo: float, hi: float) -> float { min(max(x, lo), hi) }
+
+// 负数 -1.0，零 0.0，正数 1.0（nan 也是 0.0）
+pub fn sign(x: float) -> float { if x < 0.0 { -1.0 } else if x > 0.0 { 1.0 } else { 0.0 } }
+
+pub fn sum(xs: [float]) -> float {
+    s = 0.0
+    for x in xs { s += x }
+    s
+}
+
+// nan 和自己不相等
+pub fn is_nan(x: float) -> bool { x != x }
+
+pub fn is_inf(x: float) -> bool { x == INF || x == -INF }
+
+// 既不是 inf 也不是 nan（这两种减去自己都不是 0）
+pub fn is_finite(x: float) -> bool { x - x == 0.0 }
+
+// 两个数足够接近：差的绝对值不超过 eps 乘以两者中较大的绝对值（两者都很小时直接和 eps 比）
+pub fn approx(a: float, b: float, eps: float) -> bool {
+    d = abs(a - b)
+    d <= eps || d <= eps * max(abs(a), abs(b))
+}

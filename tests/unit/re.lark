@@ -1,0 +1,180 @@
+// std/re 的测试：基本的写法在 apps/lgrep 的测试里（和 grep -E 逐字对比过），这里测找全部、替换、切开、分组、次数、非贪心
+import "std/re"
+import "std/str"
+
+fn rx(p: str) -> re.Re {
+    match take re.compile(p) {
+        Ok(r) => r
+        Err(e) => panic(e)
+    }
+}
+
+test "找全部、替换、切开" {
+    r = rx("[0-9]+")
+    assert_eq(len(re.find_all(r, "a1b22c333")), 3)
+    assert_eq(re.replace_all(r, "a1b22c333", "#"), "a#b#c#")
+    assert_eq(join(re.split(rx(",\\s*"), "a, b,c,  d"), "|"), "a|b|c|d")
+    // 空的匹配：每个位置都换一次
+    assert_eq(re.replace_all(rx("x*"), "ab", "-"), "-a-b-")
+    assert(!re.is_match(rx("^b"), "ab"))
+}
+
+test "从某个位置开始找" {
+    r = rx("[0-9]+")
+    a, b = re.find_at(r, "a1b22", 2) ?? (-1, -1)
+    assert_eq(a, 3)
+    assert_eq(b, 5)
+    assert(re.find_at(r, "a1b22", 5) == None)
+    assert(re.find_at(r, "abc", 0) == None)
+}
+
+test "忽略大小写：(?i)" {
+    r = rx("(?i)HELLO|w[O-R]+ld")
+    assert(r.fold)
+    assert(re.is_match(r, "say Hello"))
+    assert(re.is_match(r, "the WORLD"))
+    a, _b = re.find_at(r, "xx hello", 0) ?? (-1, -1)
+    assert_eq(a, 3)
+    assert_eq(re.replace_all(r, "Hello hello", "hi"), "hi hi")
+    // 只在最前面算；不忽略时照常区分
+    assert(!re.is_match(rx("hello"), "HELLO"))
+    assert_eq(bad("a(?i)"), "(?i) 只能写在最前面（第 2 个字节）")
+    // casefold：不忽略大小写时原样返回
+    assert_eq(re.casefold(r, "AbC"), "abc")
+    assert_eq(re.casefold(rx("x"), "AbC"), "AbC")
+}
+
+test "写错的模式" {
+    match re.compile("[a") {
+        Ok(_) => panic("应该出错")
+        Err(e) => assert_eq(e, "[ 没有配对的 ]")
+    }
+    match re.compile("(?i)[a") {
+        Ok(_) => panic("应该出错")
+        Err(e) => assert_eq(e, "[ 没有配对的 ]")
+    }
+}
+
+test "在一段里找" {
+    r = rx("^b+$")
+    s = "aa\nbbb\ncc"
+    // 第二行是 [3, 6)：^ 和 $ 指这一段的两头
+    a, b = re.find_in(r, s, 3, 6, 3) ?? (-1, -1)
+    assert_eq(a, 3)
+    assert_eq(b, 6)
+    assert(re.is_match_in(r, s, 3, 6))
+    assert(!re.is_match_in(r, s, 0, 2))
+    assert(re.find_in(r, s, 7, 9, 7) == None)
+}
+
+fn bad(p: str) -> str {
+    match re.compile(p) {
+        Ok(_) => "<成功>"
+        Err(e) => e
+    }
+}
+
+// 第一处匹配的原文，没有时是 "-"
+fn first(p: str, s: str) -> str {
+    a, b = re.find_at(rx(p), s, 0) ?? (-1, -1)
+    if a < 0 { "-" } else { slice(s, a, b) }
+}
+
+fn caps(p: str, s: str) -> [str] { re.captures(rx(p), s) ?? [] }
+
+test "分组" {
+    assert(caps("(\\w+)=(\\d+)", "x a=1 b=22") == ["a=1", "a", "1"])
+    // 重复里的分组记最后一次；(?:…) 不算分组
+    assert(caps("(a|b)+", "abba") == ["abba", "a"])
+    r = rx("(?:ab)+(c)")
+    assert_eq(r.groups, 1)
+    assert(caps("(?:ab)+(c)", "ababc") == ["ababc", "c"])
+    // 没有参与匹配的分组：原文是 ""，位置是 (-1, -1)
+    assert(caps("x(y)?z", "xz") == ["xz", ""])
+    assert((re.captures_at(rx("(a)|b"), "xb", 0) ?? []) == [(1, 2), (-1, -1)])
+    assert(re.captures(rx("(a)"), "b") == None)
+    // 括号里的 | 和 ^
+    assert_eq(first("c|(?:^|-)b", "a-b"), "-b")
+    assert_eq(first("gr(a|e)y", "grey"), "grey")
+}
+
+test "次数和非贪心" {
+    assert_eq(first("a{2}", "a aa aaa"), "aa")
+    assert_eq(first("a{2,}", "a aaaa"), "aaaa")
+    assert_eq(first("a{1,2}", "aaa"), "aa")
+    assert_eq(first("x{0}y", "xy"), "y")
+    // 不是 {m}、{m,}、{m,n} 的 { 是普通字节
+    assert_eq(first("a{,2}", "a{,2}"), "a{,2}")
+    assert_eq(first("a+?", "aaa"), "a")
+    assert_eq(first("<.*?>", "<a><b>"), "<a>")
+    assert_eq(first("<.*>", "<a><b>"), "<a><b>")
+    assert_eq(first("a{2,3}?", "aaaa"), "aa")
+    assert_eq(first("a??b", "ab"), "ab")
+    // 选项按写的顺序，靠前的优先
+    assert_eq(first("a|ab", "ab"), "a")
+    assert_eq(first("(?:ab|a)c", "ac"), "ac")
+}
+
+test "不会变成指数时间" {
+    // 回溯的实现在这两个上要试 2 的 30 次方种分法
+    assert(!re.is_match(rx("(a*)*b"), str.repeat("a", 30)))
+    assert(re.is_match(rx("(?:a?){30}a{30}"), str.repeat("a", 30)))
+}
+
+test "替换里的 $1" {
+    assert_eq(re.replace_all(rx("(\\w+)@(\\w+)"), "ann@x bob@y", "$2:$1"), "x:ann y:bob")
+    // $$ 是 $；$ 后面不是数字时原样留着；$0 是整个匹配；没有的分组是空的
+    assert_eq(re.replace_all(rx("a"), "ba", "[$$][$z][$0][$9]"), "b[$][$z][a][]")
+}
+
+test "写错的模式：分组和次数" {
+    assert_eq(bad("(ab"), "( 没有配对的 )（第 1 个字节）")
+    assert_eq(bad("ab)"), "多了一个 )（第 3 个字节）")
+    assert_eq(bad("a**"), "重复后面又跟了 *（第 3 个字节）；要重复一个重复，先用 (?:…) 括起来")
+    assert_eq(bad("a{3,2}"), "{3,2} 的次数反了（第 2 个字节）")
+    assert_eq(bad("a{1001}"), "重复次数最多 1000（第 2 个字节）")
+    assert_eq(bad("(?=a)"), "不支持 (? 这种写法，只有 (?:…) 和最前面的 (?i)（第 1 个字节）")
+    assert_eq(bad("^*"), "^ 和 $ 后面不能跟重复（第 2 个字节）")
+    assert_eq(bad("{2}"), "{ 前面没有可以重复的东西（第 1 个字节）")
+    assert_eq(bad("(?:a{1000}){1000}"), "模式展开以后太大（{m,n} 套得太多）")
+    // 套 2 万层括号：报错，不把栈用完；1000 层还可以
+    assert_eq(bad(str.repeat("(", 20000) + "a" + str.repeat(")", 20000)), "括号套得太深，最多 1000 层（第 1001 个字节）")
+    assert_eq(bad(str.repeat("(?:", 1000) + "a" + str.repeat(")", 1000)), "<成功>")
+}
+
+// 只能从段首开头的（^ 在每条路的最前面）、只能在段尾匹配上的（$），跳过别的位置以后结果不变
+test "段首和段尾" {
+    assert_eq(first("^b", "ab"), "-")
+    assert_eq(first("^ *$", "  "), "  ")
+    assert_eq(first("^ *$", "  x"), "-")
+    assert((re.find_at(rx("^ *$"), "", 0) ?? (-1, -1)) == (0, 0))
+    assert((re.find_at(rx("x*$"), "ab", 0) ?? (-1, -1)) == (2, 2))
+    assert((re.find_at(rx("$"), "ab", 0) ?? (-1, -1)) == (2, 2))
+    // 一条路有 ^、一条没有：不算只能从段首开头
+    assert_eq(first("^a|b", "cb"), "b")
+    assert_eq(first("(?:^|x)a", "ba xa"), "xa")
+    // find_in 的段首是 lo
+    assert((re.find_in(rx("^pub"), "x\npub", 2, 5, 2) ?? (-1, -1)) == (2, 5))
+    assert(re.find_in(rx("^pub"), "x pub", 0, 5, 2) == None)
+}
+
+// Matcher 在几次匹配之间留着线程表：结果要和 Re 版的一样，换了段、换了起点也一样
+test "复用的 Matcher" {
+    text = "a1 b22\nccc\n\nx333y 4\n(?)55"
+    for p in ["[0-9]+", "^c+$", "^$", "(a|x)\\d*", "\\d+\\s", "(?i)C", "y?$"] {
+        r = rx(p)
+        subj = re.casefold(r, text)
+        m = re.matcher(r)
+        lo = 0
+        for lo <= len(subj) {
+            hi = lo
+            for hi < len(subj) && byte_at(subj, hi) != '\n' { hi += 1 }
+            assert_eq(re.is_match_in(&m, subj, lo, hi), re.is_match_in(r, subj, lo, hi))
+            for at in lo..(hi + 1) {
+                assert(re.find_in(&m, subj, lo, hi, at) == re.find_in(r, subj, lo, hi, at))
+            }
+            lo = hi + 1
+        }
+    }
+    assert_eq("#{re.matcher(rx("[0-9]+"))}", "Matcher(\"[0-9]+\")")
+}

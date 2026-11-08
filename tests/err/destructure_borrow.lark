@@ -1,0 +1,9 @@
+// 期望错误：p 是借用的，解构会把它移走（报错里给出不用复制的写法）
+fn show_all(pairs: [(str, [int])]) {
+    for p in pairs {
+        name, xs = p
+        print("#{name} #{len(xs)}")
+    }
+}
+
+fn main() {}

@@ -1,0 +1,93 @@
+// std/net：TCP 服务器和客户端（需要 lark1 及以后的版本）
+// 在本机监听一个系统挑的空闲端口；服务器线程把收到的每一行转成大写发回去，收到 bye 时道别并关闭连接。
+// 只有客户端打印，所以输出的顺序是确定的
+import "std/net"
+import "std/str"
+
+fn handle(l: net.Listener) -> ()! {
+    c = l.accept()?
+    c.set_timeout_ms(5000)?
+    for true {
+        line = match c.read_line() {
+            Some(s) => s
+            None => break
+        }
+        if line == "bye" {
+            c.write_line("再见")?
+            break
+        }
+        c.write_line(str.to_upper(line))?
+    }
+    c.close()?
+}
+
+fn serve(take l: net.Listener) {
+    match handle(l) {
+        Ok => {}
+        Err(e) => eprint("服务器出错：#{e}")
+    }
+}
+
+fn talk(port: int) -> ()! {
+    c = net.connect("127.0.0.1", port)?
+    c.set_timeout_ms(5000)?
+    for msg in ["hello", "Lark 云雀 tcp", ""] {
+        c.write_line(msg)?
+        reply = c.read_line() ?? "（没有回复）"
+        print("发 \"#{msg}\"，收到 \"#{reply}\"")
+    }
+    // 一次写两行，分两次读回来
+    c.write("one\ntwo\n")?
+    a = c.read_line() ?? "?"
+    b = c.read_line() ?? "?"
+    print("两行：#{a} #{b}")
+    c.write_line("bye")?
+    bye = c.read_line() ?? "?"
+    print("道别：#{bye}")
+    // 服务器关闭了连接：再读得到 None，read_all 得到空串
+    after = c.read_line()
+    print("关闭之后 read_line：#{after}，错误信息为空：#{c.last_error() == ""}")
+    rest = c.read_all()?
+    print("read_all：#{len(rest)} 字节")
+    c.close()?
+}
+
+fn client(take port: int) {
+    match talk(port) {
+        Ok => {}
+        Err(e) => print("客户端出错：#{e}")
+    }
+}
+
+fn run() -> ()! {
+    l = net.listen("127.0.0.1", 0)?
+    port = l.local_port()?
+    print("端口在范围里：#{port > 0 && port < 65536}")
+    // scope 里不能写 ?：两边各自处理自己的错误
+    scope {
+        spawn(serve, l)
+        spawn(client, port)
+    }
+
+    // 服务器线程结束时 Listener 被释放，端口没人监听了：连接被拒绝
+    match net.connect("127.0.0.1", port) {
+        Ok(_) => print("不应该连上")
+        Err(e) => print("服务器关掉之后连接报错：#{len(e) > 0}")
+    }
+    match net.listen("127.0.0.1", 70000) {
+        Ok(_) => print("不应该成功")
+        Err(e) => print("端口超出范围：#{e}")
+    }
+    match net.connect("no-such-host.invalid", 80) {
+        Ok(_) => print("不应该连上")
+        Err(_) => print("解析不了的主机名报错了")
+    }
+    Ok()
+}
+
+fn main() {
+    match run() {
+        Ok => {}
+        Err(e) => print("出错：#{e}")
+    }
+}

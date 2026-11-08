@@ -1,0 +1,31 @@
+通过  ChaCha20 块函数（RFC 8439 第 2.3.2 节）
+通过  ChaCha20 加密（第 2.4.2 节）
+通过  Poly1305（第 2.5.2 节）
+通过  ChaCha20-Poly1305（第 2.8.2 节）
+通过  AEAD 随机往返
+通过  HKDF-SHA256（RFC 5869 附录 A.1 到 A.3）
+通过  HKDF 的长度和 Expand-Label 的格式（Tls.lean 的 expand_len、labelInfo）
+通过  X25519（RFC 7748 第 5.2 节）
+通过  X25519 交换密钥（第 6.1 节）
+通过  X25519 随机的两方算出同一个密钥
+通过  RFC 8448：X25519 和共享的秘密
+通过  RFC 8448：记录和握手消息的格式
+通过  记录：坏的输入只返回错误
+通过  内层明文和 nonce
+通过  加密的记录：解得开、改了就认证不过
+通过  RFC 8448：密钥计算
+通过  客户端状态机（Tls13.lean 的 handshake_order）
+通过  RFC 8448：ClientHello 和 ServerHello 解析再写回去一样
+通过  我们的 ClientHello 和 ServerHello
+通过  Hello：坏的输入只返回错误
+通过  在内存里完整握手一次
+通过  服务器的 Finished 被改了：走不到 Connected（bad_fin）
+通过  CertificateVerify：用错的公钥、改了签名，走不到 Connected（bad_cv）
+通过  Ed25519：RFC 8032 的 TEST 1、2、3、SHA(abc)
+通过  Ed25519：验证不过的签名（verify_len、verify_big_s、decode_big_y）
+通过  Ed25519：随机的签了再验
+通过  DER：长度只认最短的写法（Der.lean 的 decLen_encLen、decLen_some）
+通过  DER：元素写出来再读回来（parseTlv_tlv、parseTlv_some）
+通过  RFC 8410：Ed25519 公钥和证书（parseSpki_some、parseCert_some）
+通过  证书：自己签发再解析，坏的输入只返回错误（parseCert_certW）
+30 项测试：30 项通过，0 项失败

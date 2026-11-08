@@ -1,0 +1,310 @@
+// lark-apicov：标准库公开函数的测试覆盖检查（用 Lark 自己写）
+// 构建并运行：make apicov（make check 也会跑）
+//
+//   lark-apicov            列出没有任何测试用到的公开函数；有的话以 1 退出
+//   lark-apicov --all      再按模块列出覆盖的比例
+//   lark-apicov --unused   列出只有测试和示例在用的公开函数（给人审，不算失败；make apicov U=1）
+//
+// 规则：std/名字.lark 里的每个 pub fn，至少要在一个 import 了 "std/名字" 的测试文件里出现：
+// 写成 名字.函数(…)、x.函数(…)（方法调用）或者直接 函数(…)（协议函数）。测试文件是 tests/unit/*.lark、
+// examples/*.lark 和 apps/*/tests.lark。只看调用写没写，不看那一行有没有真的跑到。
+// 实在没法自动测的（要真终端、读标准输入的）写进 tools/apicov.allow，每行 “模块.函数  原因”。
+// 另外检查分层（docs/std.md 第三节）：std 模块只能 import 同一层或下层的模块，不能成环；新模块要先在 layer_of 里登记。
+import "std/os"
+import "std/str"
+import "std/sort"
+
+type Module {
+    name: str
+    fns: [str]
+}
+
+fn main() {
+    av = args()
+    all = len(av) > 1 && av[1] == "--all"
+    mods = match take modules() {
+        Ok(m) => m
+        Err(e) => {
+            eprint("lark-apicov：#{e}")
+            exit(2)
+        }
+    }
+    if len(av) > 1 && av[1] == "--unused" {
+        match report_unused(mods) {
+            Ok(_) => {}
+            Err(e) => {
+                eprint("lark-apicov：#{e}")
+                exit(2)
+            }
+        }
+        return
+    }
+    corpus = match take test_files() {
+        Ok(c) => c
+        Err(e) => {
+            eprint("lark-apicov：#{e}")
+            exit(2)
+        }
+    }
+    allow = allowed()
+    texts: [str] = []
+    for f in corpus { texts.push(os.read(f) ?? "") }
+    missing: [str] = []
+    total = 0
+    covered = 0
+    for m in mods {
+        // 只看 import 了这个模块的文件
+        users: [str] = []
+        for i in 0..len(corpus) {
+            if str.contains(texts[i], "import \"std/#{m.name}\"") { users.push(texts[i].copy()) }
+        }
+        hit = 0
+        gaps: [str] = []
+        for f in m.fns {
+            q = "#{m.name}.#{f}"
+            if used(users, f) || contains_name(allow, q) {
+                hit += 1
+            } else {
+                gaps.push(f.copy())
+                missing.push(q)
+            }
+        }
+        total += len(m.fns)
+        covered += hit
+        if all {
+            tail = if len(gaps) == 0 { "" } else { "  缺：" + join(gaps, " ") }
+            print("#{str.pad_end(m.name, 8, " ")} #{str.pad_start("#{hit}", 3, " ")}/#{str.pad_start("#{len(m.fns)}", 3, " ")}#{tail}")
+        }
+    }
+    // 允许名单里写了、但已经不存在或者已经测到的条目，提醒删掉
+    stale: [str] = []
+    for q in allow {
+        if !exists_fn(mods, q) { stale.push(q.copy()) }
+    }
+    if all { print("合计 #{covered}/#{total}（允许名单 #{len(allow)} 个）") }
+    for q in stale { print("tools/apicov.allow 里的 #{q} 已经没有这个函数了，请删掉") }
+    // 几项检查都做完再退出，一次看到全部问题
+    failed = false
+    if len(missing) > 0 {
+        print("下面 #{len(missing)} 个公开函数没有测试用到（写进 tests/unit/ 的测试，或者在 tools/apicov.allow 里写明原因）：")
+        for q in missing { print("  #{q}") }
+        failed = true
+    }
+    if len(stale) > 0 { failed = true }
+    bad = match take check_layers(mods) {
+        Ok(xs) => xs
+        Err(e) => {
+            eprint("lark-apicov：#{e}")
+            exit(2)
+        }
+    }
+    if len(bad) > 0 {
+        print("标准库的分层不对（见 docs/std.md 第三节）：")
+        for b in bad { print("  #{b}") }
+        failed = true
+    }
+    if failed { exit(1) }
+    print("标准库的公开函数都有测试用到：共 #{total} 个")
+}
+
+fn modules() -> [Module]! {
+    out: [Module] = []
+    for path in os.glob("std/*.lark")? {
+        text = os.read(path)?
+        fns: [str] = []
+        for line in str.lines(text) {
+            if str.starts_with(line, "pub fn ") {
+                rest = slice(line, 7, len(line))
+                e = 0
+                for e < len(rest) && ident(byte_at(rest, e)) { e += 1 }
+                name = slice(rest, 0, e)
+                if !contains_name(fns, name) { fns.push(name) }
+            }
+        }
+        out.push(Module(name: os.stem(path), fns: fns))
+    }
+    Ok(out)
+}
+
+fn test_files() -> [str]! {
+    out: [str] = []
+    for p in os.glob("tests/unit/*.lark")? { out.push(p.copy()) }
+    for p in os.glob("examples/*.lark")? { out.push(p.copy()) }
+    for p in os.glob("apps/*/tests.lark")? { out.push(p.copy()) }
+    sort.sort(&out)
+    Ok(out)
+}
+
+// tools/apicov.allow：每行 “模块.函数  原因”，# 开头的是注释
+fn allowed() -> [str] {
+    out: [str] = []
+    text = os.read("tools/apicov.allow") ?? ""
+    for line in str.lines(text) {
+        t = str.trim(line)
+        if t == "" || str.starts_with(t, "#") { continue }
+        ws = str.words(t)
+        out.push(ws[0].copy())
+    }
+    out
+}
+
+fn ident(b: int) -> bool { (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' }
+
+fn contains_name(xs: [str], x: str) -> bool {
+    for y in xs {
+        if y == x { return true }
+    }
+    false
+}
+
+fn exists_fn(mods: [Module], q: str) -> bool {
+    for m in mods {
+        for f in m.fns {
+            if "#{m.name}.#{f}" == q { return true }
+        }
+    }
+    false
+}
+
+// f 后面紧跟 ( 或 [（泛型），前面是 . 或者不是标识符的字符。
+// show 由插值 "#{x}" 隐式调用，搜不到 show(：import 了这个模块的测试文件里有插值就算（tests/unit/show.lark 逐个类型插值过）
+fn used(texts: [str], f: str) -> bool {
+    for t in texts {
+        if f == "show" && str.contains(t, "\#{") { return true }
+        i = str.find_from(t, f, 0) ?? -1
+        for i >= 0 {
+            after = i + len(f)
+            before_ok = i == 0 || !ident(byte_at(t, i - 1))
+            after_ok = after < len(t) && (byte_at(t, after) == '(' || byte_at(t, after) == '[')
+            if before_ok && after_ok { return true }
+            i = str.find_from(t, f, after) ?? -1
+        }
+    }
+    false
+}
+
+// --unused：只有测试和示例在用的公开函数（标准库自己、tools/、apps/ 里除了 tests.lark 的代码都没有调用）。
+// 只是给人审的清单，不算失败：编码配解码、压缩配解压这样成对的，一半没人用也该留着（见 docs/std.md 的“函数的取舍”）
+fn report_unused(mods: [Module]) -> ()! {
+    srcs: [str] = []
+    for p in os.glob("tools/*.lark")? { srcs.push(p.copy()) }
+    for p in os.glob("apps/**/*.lark")? {
+        if !str.ends_with(p, "/tests.lark") && !str.contains(p, "/build/") && !str.contains(p, "/tests/") { srcs.push(p.copy()) }
+    }
+    texts: [str] = []
+    for p in srcs { texts.push(os.read(p)?) }
+    std_texts: [str] = []
+    for m in mods { std_texts.push(os.read("std/#{m.name}.lark")?) }
+    n = 0
+    for k in 0..len(mods) {
+        name = mods[k].name.copy()
+        users: [str] = []
+        for t in texts {
+            if str.contains(t, "import \"std/#{name}\"") { users.push(t.copy()) }
+        }
+        // 别的 std 模块 import 了它；模块自己里面的调用（不带模块名）也算
+        for j in 0..len(mods) {
+            if j != k && str.contains(std_texts[j], "import \"#{name}\"") { users.push(std_texts[j].copy()) }
+        }
+        users.push(std_texts[k].copy())
+        idle: [str] = []
+        for f in mods[k].fns {
+            if !implicit(f) && !called(users, f) { idle.push(f.copy()) }
+        }
+        if len(idle) > 0 {
+            print("#{str.pad_end(name, 8, " ")} #{join(idle, " ")}")
+            n += len(idle)
+        }
+    }
+    print("合计 #{n} 个公开函数只有测试和示例在用")
+    Ok()
+}
+
+// 会被隐式调用的名字（for in、x[i]、"#{x}"、运算符……）：搜不到调用处，但有人用（和编译器的“没有用到”警告用同一份清单，见 README）
+fn implicit(f: str) -> bool {
+    for n in ["next", "iter_len", "iter_at", "index", "set_index", "show", "eq", "cmp", "hash", "drop", "from", "add", "sub", "mul", "div", "rem", "neg"] {
+        if f == n { return true }
+    }
+    false
+}
+
+// 和 used 一样，但不算定义它的那一行（fn f( 或 fn f[）
+fn called(texts: [str], f: str) -> bool {
+    for t in texts {
+        i = str.find_from(t, f, 0) ?? -1
+        for i >= 0 {
+            after = i + len(f)
+            before_ok = i == 0 || !ident(byte_at(t, i - 1))
+            after_ok = after < len(t) && (byte_at(t, after) == '(' || byte_at(t, after) == '[')
+            is_def = i >= 3 && slice(t, i - 3, i) == "fn "
+            if before_ok && after_ok && !is_def { return true }
+            i = str.find_from(t, f, after) ?? -1
+        }
+    }
+    false
+}
+
+// 每个 std 模块在哪一层：0 计算、1 系统、2 格式和协议；和 docs/std.md 第三节的表一致。没登记的是 -1
+fn layer_of(m: str) -> int {
+    for n in ["str", "utf8", "math", "fmt", "sort", "iter", "map", "set", "deque", "heap", "treemap", "rand", "bytes", "semver"] {
+        if m == n { return 0 }
+    }
+    for n in ["os", "io", "time", "net", "proc", "term", "signal", "timer", "sync"] {
+        if m == n { return 1 }
+    }
+    for n in ["json", "csv", "base64", "url", "digest", "zlib", "re", "diff", "flag", "log", "http"] {
+        if m == n { return 2 }
+    }
+    -1
+}
+
+fn layer_name(k: int) -> str { if k == 0 { "计算" } else if k == 1 { "系统" } else { "格式和协议" } }
+
+// 模块 import 的 std 模块（std 里互相 import 时写 "map"，别处写 "std/map"）
+fn imports_of(text: str) -> [str] {
+    out: [str] = []
+    for line in str.lines(text) {
+        if !str.starts_with(line, "import \"") { continue }
+        rest = slice(line, 8, len(line))
+        q = str.find(rest, "\"") ?? len(rest)
+        name = str.trim_prefix(slice(rest, 0, q), "std/")
+        out.push(name)
+    }
+    out
+}
+
+// 往上层 import、没有登记层、成环的都列出来
+fn check_layers(mods: [Module]) -> [str]! {
+    names: [str] = []
+    deps: [[str]] = []
+    for m in mods {
+        names.push(m.name.copy())
+        deps.push(imports_of(os.read("std/#{m.name}.lark")?))
+    }
+    bad: [str] = []
+    for i in 0..len(names) {
+        li = layer_of(names[i])
+        if li < 0 {
+            bad.push("std/#{names[i]} 没有在 tools/apicov.lark 的 layer_of 里登记层（也要写进 docs/std.md 第三节的表）")
+            continue
+        }
+        for d in deps[i] {
+            ld = layer_of(d)
+            if ld > li { bad.push("std/#{names[i]}（#{layer_name(li)}层）import 了上层的 #{d}（#{layer_name(ld)}层）") }
+        }
+        if reaches(names, deps, names[i], names[i], 0) { bad.push("std/#{names[i]} 的 import 成环了") }
+    }
+    Ok(bad)
+}
+
+// 从 from 的依赖出发能不能走到 target（depth 防止已经成环的别的模块让这里转不出来）
+fn reaches(names: [str], deps: [[str]], from: str, target: str, depth: int) -> bool {
+    if depth > len(names) { return false }
+    k = 0
+    for k < len(names) && names[k] != from { k += 1 }
+    if k == len(names) { return false }
+    for d in deps[k] {
+        if d == target || reaches(names, deps, d, target, depth + 1) { return true }
+    }
+    false
+}

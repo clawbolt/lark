@@ -1,0 +1,7 @@
+// 期望错误：“或”模式里不能绑定名字
+fn main() {
+    x: int? = Some(1)
+    match x {
+        Some(n) | None => print("x")
+    }
+}

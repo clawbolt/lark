@@ -1,0 +1,171 @@
+// Lark 标准库 · 子进程（用 Lark 自己写，底下是运行时里的几个 C 函数）
+// 用法：import "std/proc"
+//
+//   o = proc.run(["git", "status", "--short"])?   // 等它结束：o.code、o.out（标准输出）、o.err（标准错误）
+//   o = proc.run_with(["sort"], "b\na\n", "sub")?  // 标准输入给一个字符串，在 sub 目录里运行（"" 是当前目录）
+//   s = proc.output(["uname", "-s"])?              // 只要标准输出；退出码不为 0 时是错误，错误里带着标准错误
+//   code = proc.status(["make", "test"])?          // 和当前程序共用终端，只要退出码
+//   o = proc.opts()                                 // 更多选项：env、timeout_ms，还有 input、dir
+//   o.env = ["LANG=C", "HOME"]                     // "名字=值" 设置，只写 "名字" 是去掉
+//   o.timeout_ms = 5000                            // 到时间连同它启动的进程一起结束，返回错误
+//   r = proc.run_opts(["make"], o)?
+//   cmd = proc.join_cmd(["echo", "a b"])           // 拼成给 sh 的命令："echo 'a b'"（配合 os.shell / os.shell_output）
+//
+// 参数直接交给程序，不经过 sh：空格、引号、$ 都没有特殊含义，也不用转义。程序名里没有 / 时在 PATH 里找。
+// 启动不了（找不到程序、目录不存在）时是错误；启动了就返回结果，退出码不为 0 不算错误（output 除外）。
+// 被信号终止时退出码是 128 + 信号编号。等待的时候占着一个系统线程（和 os.shell 一样）
+
+extern "c" {
+    fn strerror(e: c_int) -> str
+    fn lark_proc_run(argv: str, argc: c_int, input: [u8], in_len: int, dir: str, capture: c_int, env: str, envc: c_int, timeout_ms: int) -> int
+    fn lark_proc_code(h: int) -> int
+    fn lark_proc_timed_out(h: int) -> c_int
+    fn lark_proc_len(h: int, k: c_int) -> int
+    fn lark_proc_copy(h: int, k: c_int, inout dst: [u8]) -> ()
+    fn lark_proc_free(h: int) -> ()
+}
+
+pub type Output { pub code: int, pub out: str, pub err: str }
+
+// run_opts 的选项：从 proc.opts() 开始，改要用的几项
+pub type Opts {
+    pub input: str          // 标准输入；"" 时是 /dev/null
+    pub dir: str            // 在哪个目录里运行；"" 是当前目录
+    pub env: [str]          // 在当前的环境变量上改："名字=值" 设置或覆盖，只写 "名字" 是去掉；同一个名字写几次时最后一次算
+    pub timeout_ms: int     // 过了这么多毫秒还没结束，就连同它启动的进程一起结束，返回错误；0 是不限
+}
+
+pub fn opts() -> Opts { Opts(input: "", dir: "", env: no_env(), timeout_ms: 0) }
+
+fn no_env() -> [str] {
+    e: [str] = []
+    e
+}
+
+pub fn run(argv: [str]) -> Output! { launch(argv, "", "", no_env(), 0, true) }
+
+pub fn run_with(argv: [str], input: str, dir: str) -> Output! { launch(argv, input, dir, no_env(), 0, true) }
+
+pub fn run_opts(argv: [str], o: Opts) -> Output! {
+    if o.timeout_ms < 0 { return Err("超时不能是负数：#{o.timeout_ms}") }
+    for e in o.env {
+        if len(e) == 0 || byte_at(e, 0) == '=' || has_nul(e) {
+            return Err("环境变量的写法不对：#{quoted(e)}（要写 名字=值，或者只写 名字 表示去掉）")
+        }
+    }
+    launch(argv, o.input, o.dir, o.env, o.timeout_ms, true)
+}
+
+pub fn output(argv: [str]) -> str! {
+    o = run(argv)?
+    if o.code != 0 {
+        msg = "命令失败：#{join_cmd(argv)}（退出码 #{o.code}）"
+        e = brief(o.err)
+        return Err(if e == "" { msg } else { "#{msg}：#{e}" })
+    }
+    Ok(replace(&o.out, ""))
+}
+
+pub fn status(argv: [str]) -> int! {
+    o = launch(argv, "", "", no_env(), 0, false)?
+    Ok(o.code)
+}
+
+// 给 sh 用的引号：只有字母、数字和 -_./=:,+@% 时原样返回，否则用单引号括起来（里面的 ' 写成 '\''）
+pub fn quote(s: str) -> str {
+    if len(s) > 0 && all_safe(s) { return s }
+    out = "'"
+    start = 0
+    for i in 0..len(s) {
+        if byte_at(s, i) == '\'' {
+            out += slice(s, start, i)
+            out += "'\\''"
+            start = i + 1
+        }
+    }
+    out + slice(s, start, len(s)) + "'"
+}
+
+pub fn join_cmd(argv: [str]) -> str {
+    parts: [str] = []
+    for a in argv { parts.push(quote(a)) }
+    join(parts, " ")
+}
+
+fn all_safe(s: str) -> bool {
+    for i in 0..len(s) {
+        b = byte_at(s, i)
+        ok = (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '-' || b == '_' ||
+            b == '.' || b == '/' || b == '=' || b == ':' || b == ',' || b == '+' || b == '@' || b == '%'
+        if !ok { return false }
+    }
+    true
+}
+
+fn has_nul(s: str) -> bool {
+    for i in 0..len(s) {
+        if byte_at(s, i) == 0 { return true }
+    }
+    false
+}
+
+// 错误信息里放的标准错误：去掉两头的空白，太长时只留开头
+fn brief(s: str) -> str {
+    a = 0
+    b = len(s)
+    for a < b && byte_at(s, a) <= ' ' { a += 1 }
+    for b > a && byte_at(s, b - 1) <= ' ' { b -= 1 }
+    if b - a > 400 { slice(s, a, a + 400) + "…" } else { slice(s, a, b) }
+}
+
+fn launch(argv: [str], input: str, dir: str, env: [str], timeout_ms: int, capture: bool) -> Output! {
+    if len(argv) == 0 { return Err("没有要运行的命令") }
+    packed = ""
+    for a in argv {
+        if has_nul(a) { return Err("命令行参数里不能有 0 字节：#{quote(a)}") }
+        packed += a
+        packed += "\0"
+    }
+    if has_nul(dir) { return Err("目录名里不能有 0 字节") }
+    envs = ""
+    for e in env {
+        envs += e
+        envs += "\0"
+    }
+    h = lark_proc_run(packed, len(argv), input.to_bytes(), len(input), dir, if capture { 1 } else { 0 }, envs, len(env), timeout_ms)
+    if h < 0 {
+        // 2 是 ENOENT：程序或者目录不存在
+        if -h == 2 {
+            return Err(if dir == "" { "找不到程序 #{argv[0]}" } else { "找不到程序 #{argv[0]} 或目录 #{dir}" })
+        }
+        at_dir = if dir == "" { "" } else { "（在目录 #{dir} 里）" }
+        return Err("无法运行 #{argv[0]}#{at_dir}：#{strerror(-h)}")
+    }
+    timed_out = lark_proc_timed_out(h) != 0
+    o = Output(code: lark_proc_code(h), out: take_buf(h, 0), err: take_buf(h, 1))
+    lark_proc_free(h)
+    if timed_out { return Err("命令超时：#{join_cmd(argv)}（#{timeout_ms} 毫秒内没有结束，已经结束它）") }
+    Ok(o)
+}
+
+fn take_buf(h: int, k: int) -> str {
+    n = lark_proc_len(h, k)
+    if n == 0 { return "" }
+    b: [u8] = []
+    b.reserve(n)
+    for _i in 0..n { b.push(0) }
+    lark_proc_copy(h, k, &b)
+    from_bytes(b)
+}
+
+// "#{o}"：Output(code: 0, out: "ok", err: "")，和构造它的写法一样（字符串加引号，和列表里的一样不转义）
+pub fn show(o: Output) -> str { "Output(code: #{o.code}, out: #{quoted(o.out)}, err: #{quoted(o.err)})" }
+
+// "#{o}"：Opts(input: "", dir: "", env: ["LANG=C"], timeout_ms: 0)
+pub fn show(o: Opts) -> str { "Opts(input: #{quoted(o.input)}, dir: #{quoted(o.dir)}, env: #{o.env}, timeout_ms: #{o.timeout_ms})" }
+
+// 字符串在容器里的写法：借列表的插值（加引号），再去掉两边的方括号
+fn quoted(s: str) -> str {
+    q = "#{[s.copy()]}"
+    slice(q, 1, len(q) - 1)
+}

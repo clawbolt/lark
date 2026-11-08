@@ -1,0 +1,220 @@
+// ltar：用 Lark 写的 tar。读写 tar 和 tar.gz（POSIX ustar 格式，格式见 tar/tar.lark），和系统的 tar 互相认得
+// 构建：在 apps/ltar 里 lark build，得到 build/ltar
+//
+//   ltar c [-z] -f 包 路径…        打包：目录递归进去（按名字排序），符号链接存成链接，不跟进去；-z 用 gzip 压缩
+//   ltar x [-f 包] [-C 目录]       解包到目录（默认当前目录）；gzip 压缩的包自动认出来，-z 写不写都行
+//   ltar t [-v] -f 包              列出包里的文件；-v 同时显示权限、大小和链接指向
+//
+// 短选项可以写在一起：ltar c -zf a.tgz src、ltar x -f a.tgz -C out。
+// 记录的：内容、权限位（rwx）、修改时间、符号链接。不记录属主（uid、gid 写 0）。解包时恢复文件和目录的修改时间；
+// 别的 tar 打的包里的硬链接也解成硬链接（打包时不认硬链接，每个名字都存一份内容）。
+// 解包时跳过绝对路径、带 .. 的名字和要经过符号链接的路径（不会写到 -C 给的目录外面），跳过设备文件，
+// 跳过指向符号链接、指向包外或者指向还没解开的文件的硬链接；
+// 跳过了东西时退出码是 1。整个包读进内存再处理，适合不太大的包。
+import "std/flag"
+import "std/os"
+import "std/str"
+import "std/zlib"
+import "tar/tar"
+
+fn main() {
+    p = flag.new("ltar", "读写 tar 和 tar.gz 包")
+    c = flag.new("c", "打包：ltar c [-z] -f 包 路径…")
+    c.add_str("file", "f", "", "包的文件名")
+    c.add_bool("gzip", "z", "用 gzip 压缩")
+    p.add_command(c)
+    c = flag.new("x", "解包：ltar x -f 包 [-C 目录]")
+    c.add_str("file", "f", "", "包的文件名")
+    c.add_str("dir", "C", ".", "解到这个目录")
+    c.add_bool("gzip", "z", "可以不写：gzip 压缩的包会自动认出来")
+    p.add_command(c)
+    c = flag.new("t", "列出包里的文件：ltar t [-v] -f 包")
+    c.add_str("file", "f", "", "包的文件名")
+    c.add_bool("verbose", "v", "同时显示权限、大小和链接指向")
+    c.add_bool("gzip", "z", "可以不写：gzip 压缩的包会自动认出来")
+    p.add_command(c)
+    a = p.parse_or_exit()
+    r = if a.command == "c" {
+        create(a)
+    } else if a.command == "x" {
+        extract(a)
+    } else {
+        list(a)
+    }
+    match r {
+        Ok => {}
+        Err(e) => {
+            eprint("ltar：#{e}")
+            exit(1)
+        }
+    }
+}
+
+// ---------- 打包 ----------
+
+fn create(a: flag.Args) -> ()! {
+    pkg = a.get_str("file")
+    if pkg == "" { return Err("要用 -f 给出包的文件名") }
+    if len(a.rest) == 0 { return Err("没有给要打包的路径") }
+    out: [u8] = []
+    for path in a.rest {
+        // 和 tar 一样去掉开头的 /，解包时才不会写到根目录去
+        name = os.clean(path)
+        if str.starts_with(name, "/") {
+            for str.starts_with(name, "/") { name = slice(name, 1, len(name)) }
+            eprint("ltar：去掉了 #{path} 开头的 /")
+        }
+        if name == "" { name = "." }
+        add_path(&out, path, name, pkg)?
+    }
+    tar.finish(&out)
+    data = if a.get_bool("gzip") { zlib.gzip(out) } else { out }
+    os.write(pkg, from_bytes(data))
+}
+
+// 把 path 记成包里的 name；目录递归进去
+fn add_path(inout out: [u8], path: str, name: str, pkg: str) -> ()! {
+    st = os.lstat(path)?
+    mt = st.mtime_ms / 1000
+    if st.is_symlink {
+        target = os.read_link(path)?
+        tar.write_entry(&out, tar.symlink(name, target, mt))?
+    } else if st.is_dir {
+        tar.write_entry(&out, tar.dir(name, st.mode & 0o7777, mt))?
+        children = os.read_dir(path)?
+        for child in children {
+            add_path(&out, os.join_path(path, child), os.join_path(name, child), pkg)?
+        }
+    } else if st.is_file {
+        // 正在写的包自己不放进去
+        if os.clean(path) == os.clean(pkg) { return Ok() }
+        text = os.read(path)?
+        tar.write_entry(&out, tar.file(name, st.mode & 0o7777, mt, text.to_bytes()))?
+    } else {
+        eprint("ltar：跳过 #{path}：不是普通文件、目录或符号链接")
+    }
+    Ok()
+}
+
+// ---------- 解包、列出 ----------
+
+// 读包；开头是 gzip 的两个字节（1f 8b）时先解压
+fn load(pkg: str) -> [tar.Entry]! {
+    if pkg == "" { return Err("要用 -f 给出包的文件名") }
+    raw = os.read(pkg)?
+    d = raw.to_bytes()
+    if len(d) >= 2 && d[0] == 0x1f && d[1] == 0x8b {
+        d = match take zlib.gunzip(d) {
+            Ok(x) => x
+            Err(e) => { return Err("#{pkg}：#{e}") }
+        }
+    }
+    match take tar.parse(d) {
+        Ok(es) => Ok(es)
+        Err(e) => Err("#{pkg}：#{e}")
+    }
+}
+
+fn extract(a: flag.Args) -> ()! {
+    es = load(a.get_str("file"))?
+    root = a.get_str("dir")
+    os.mkdir_all(root)?
+    // 目录的权限最后再设：先设成只读的话，里面的文件就写不进去了
+    dirs: [str] = []
+    modes: [int] = []
+    times: [int] = []
+    skipped = 0
+    for e in es {
+        why = tar.unsafe_reason(e.name)
+        if why == "" && through_link(root, e.name) { why = "要经过符号链接" }
+        if why == "" && e.kind == "hardlink" { why = hard_reason(root, e) }
+        if why == "" && e.kind != "file" && e.kind != "dir" && e.kind != "symlink" && e.kind != "hardlink" { why = "不支持 #{e.kind}" }
+        if why != "" {
+            eprint("ltar：跳过 #{e.name}：#{why}")
+            skipped += 1
+            continue
+        }
+        dest = os.join_path(root, e.name)
+        if e.kind == "dir" {
+            os.mkdir_all(dest)?
+            dirs.push(dest)
+            modes.push(e.mode)
+            times.push(e.mtime)
+            continue
+        }
+        os.mkdir_all(os.dir(dest))?
+        // 已经有的文件或链接先删掉：不能顺着旧的符号链接写到别处去
+        match take os.lstat(dest) {
+            Ok(st) => {
+                if st.is_dir { return Err("#{dest} 已经是一个目录") }
+                os.remove(dest)?
+            }
+            Err(_) => {}
+        }
+        if e.kind == "symlink" {
+            os.symlink(e.link, dest)?
+        } else if e.kind == "hardlink" {
+            // 和目标是同一个文件，权限和时间跟着目标
+            os.hard_link(os.join_path(root, e.link), dest)?
+        } else {
+            os.write(dest, from_bytes(e.data))?
+            os.chmod(dest, e.mode & 0o777)?
+            os.set_mtime(dest, e.mtime * 1000)?
+        }
+    }
+    // 目录的时间也最后设：往目录里写文件会改它的修改时间。符号链接不设（set_mtime 改的是它指向的文件）
+    for i in 0..len(dirs) {
+        os.chmod(dirs[i], modes[i] & 0o777)?
+        os.set_mtime(dirs[i], times[i] * 1000)?
+    }
+    if skipped > 0 { return Err("有 #{skipped} 项没有解开（见上面）") }
+    Ok()
+}
+
+// 硬链接要指向包里前面已经解开的普通文件：目标的名字照样检查；不能是符号链接，不然会链到 -C 给的目录外面去
+fn hard_reason(root: str, e: tar.Entry) -> str {
+    why = tar.unsafe_reason(e.link)
+    if why != "" { return "链接目标#{why}" }
+    if e.link == e.name { return "链接到自己" }
+    if through_link(root, e.link) { return "链接目标要经过符号链接" }
+    match take os.lstat(os.join_path(root, e.link)) {
+        Ok(st) => {
+            if !st.is_file { return "链接目标 #{e.link} 不是普通文件" }
+        }
+        Err(_) => { return "链接目标 #{e.link} 不在前面解开的文件里" }
+    }
+    ""
+}
+
+// root 下面 name 的上级目录里有没有符号链接
+fn through_link(root: str, name: str) -> bool {
+    parts = str.split(name, "/")
+    cur = root.copy()
+    last = len(parts) - 1
+    for i in 0..last {
+        cur = os.join_path(cur, parts[i])
+        match take os.lstat(cur) {
+            Ok(st) => {
+                if st.is_symlink { return true }
+            }
+            Err(_) => { return false }
+        }
+    }
+    false
+}
+
+fn list(a: flag.Args) -> ()! {
+    es = load(a.get_str("file"))?
+    verbose = a.get_bool("verbose")
+    for e in es {
+        name = if e.kind == "dir" { e.name + "/" } else { e.name.copy() }
+        if !verbose {
+            print(name)
+            continue
+        }
+        tail = if e.link != "" { " -> " + e.link } else { "" }
+        size = str.pad_start(int_str(e.size), 8, " ")
+        print("#{tar.mode_text(e)} #{size} #{name}#{tail}")
+    }
+    Ok()
+}

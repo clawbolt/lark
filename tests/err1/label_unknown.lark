@@ -1,0 +1,8 @@
+// 期望错误：break 后面的标签要是外层某个循环的
+fn main() {
+    outer: for i in 0..3 {
+        for j in 0..3 {
+            if i + j == 3 { break outr }
+        }
+    }
+}

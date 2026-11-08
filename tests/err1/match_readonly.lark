@@ -1,0 +1,11 @@
+// 期望错误：借用的 match 拆出来的名字是只读的，报错里提示改用 match take
+fn grow(inout xs: [int]) { xs.push(1) }
+
+fn make() -> [int]? { Some([1]) }
+
+fn main() {
+    match make() {
+        Some(xs) => grow(&xs)
+        None => {}
+    }
+}

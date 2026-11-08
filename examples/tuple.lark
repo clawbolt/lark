@@ -1,0 +1,58 @@
+// 元组 (A, B, …)（需要 lark1 及以后的版本）
+// 构造 (a, b)，取元素 t.0 / t.1，解构 a, b = t（声明新变量，_ 表示丢弃）。
+// 元组按值存放，和结构体一样可以复制、比较、放进列表和 Map。
+
+fn divmod(a: int, b: int) -> (int, int) { (a / b, a % b) }
+
+// 返回多个值：最小值、最大值和它们的位置
+fn min_max(xs: [int]) -> (int, int, (int, int)) {
+    lo = xs[0]
+    hi = xs[0]
+    li = 0
+    hi_i = 0
+    for i in 0..len(xs) {
+        if xs[i] < lo {
+            lo = xs[i]
+            li = i
+        }
+        if xs[i] > hi {
+            hi = xs[i]
+            hi_i = i
+        }
+    }
+    (lo, hi, (li, hi_i))
+}
+
+// 泛型也能用元组
+fn swap[A, B](take p: (A, B)) -> (B, A) {
+    a, b = p
+    (b, a)
+}
+
+fn zip_names(names: [str], ages: [int]) -> [(str, int)] {
+    out: [(str, int)] = []
+    for i in 0..len(names) { out.push((names[i].copy(), ages[i])) }
+    out
+}
+
+fn main() {
+    q, r = divmod(17, 5)
+    print("17 = 5 × #{q} + #{r}")
+
+    t = min_max([4, 9, -2, 7])
+    print("最小 #{t.0}，最大 #{t.1}，位置 #{t.2.0} 和 #{t.2.1}")
+    lo, _, pos = t
+    print("解构：lo = #{lo}，最大值的位置 #{pos.1}")
+
+    s = swap(("你好", 42))
+    print("swap：#{s.0}，#{s.1}")
+
+    people = zip_names(["阿青", "小林"], [30, 25])
+    for p in people { print("#{p.0} #{p.1} 岁") }
+
+    // 元组可以比较、可以有可选元素
+    same = divmod(10, 3) == (3, 1)
+    maybe: (str, int?) = ("没有年龄", None)
+    age = maybe.1 ?? -1
+    print("divmod(10, 3) == (3, 1)：#{same}，#{maybe.0}：#{age}")
+}

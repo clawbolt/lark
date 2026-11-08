@@ -1,0 +1,6 @@
+// 期望错误：类型参数 T 既是 int 又是 str
+fn same[T](a: T, b: T) -> bool { a == b }
+
+fn main() {
+    x = same(1, "1")
+}

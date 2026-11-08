@@ -1,0 +1,376 @@
+// Lark 标准库 · 命令行参数（用 Lark 自己写）
+// 用法：import "std/flag"
+//
+//   p = flag.new("greet", "向某人问好")
+//   p.add_bool("loud", "l", "全部大写")                 // 开关：--loud 或 -l
+//   p.add_str("name", "n", "世界", "要问候的人")        // 带值：--name=x、--name x、-n x
+//   p.add_int("times", "t", 1, "重复几次")
+//   a = p.parse_or_exit()                                // 解析 args()；出错时打印原因和用法、退出码 2，-h 时打印用法、退出码 0
+//   a.get_bool("loud")、a.get_str("name")、a.get_int("times")、a.rest（位置参数）
+//
+// 子命令（lark build、lgit log）：每个命令是一个单独的 Parser，名字就是命令名，选项只在这个命令后面有效：
+//
+//   p = flag.new("lark", "Lark 的构建工具")
+//   b = flag.new("build", "编译当前目录的项目")
+//   b.add_bool("release", "", "开优化")
+//   p.add_command(b)
+//   a = p.parse_or_exit()                                // lark build --release → a.command == "build"
+//
+// 有子命令时，第一个位置参数必须是命令名；它前面只能写 p 自己的选项（全局选项），后面两种都能写。
+// 要自己处理错误时用 p.parse()（解析 args()，跳过程序名）或 p.parse_from(xs)，它们返回 Err，
+// -h / --help 返回 Err("help")，写在命令后面时是 Err("help 命令名")；对应的说明是 p.usage() 和 p.usage_of(命令名)。
+//
+// 规则：`--` 之后的都是位置参数，a.dash 记着它们从 rest 的哪里开始（下标 >= a.dash 的是 `--` 后面的；没写 `--` 时 a.dash 是 -1）；单独的 `-` 也是位置参数。
+// 几个短开关可以写在一起：-rn 就是 -r -n；要值的字母后面剩下的就是值，没剩下时取下一个参数（-zf 包、-n5，和 getopt 一样）。
+// 没给的参数取默认值；未知的参数、未知的命令、缺值、int 参数不是整数时返回 Err，信息里带着参数名。
+// get_* 的名字没有声明过（包括属于另一个命令的选项）、或者类型不对时 panic（这是程序写错了，不是用户输错了）。
+
+pub type Spec {
+    long: str
+    short: str      // "" 表示没有短名
+    kind: str       // "bool" / "str" / "int"
+    def: str        // 默认值（bool 是 "false"）
+    help: str
+}
+
+pub type Parser {
+    prog: str
+    about: str
+    specs: [Spec]
+    cmds: [str]         // 子命令的名字、说明和选项，下标一一对应
+    cmd_abouts: [str]
+    cmd_specs: [[Spec]]
+}
+
+pub type Args {
+    names: [str]        // 全局选项在前，选中的命令的选项在后；和 kinds、vals 一一对应
+    kinds: [str]
+    vals: [str]
+    pub command: str    // 选中的子命令；没有子命令的 Parser 是 ""。模块外只读
+    pub rest: [str]     // 位置参数（不含命令名）；模块外只读
+    pub dash: int       // rest 里 `--` 后面第一个参数的下标，没写 `--` 时是 -1（lgit diff 版本 -- 路径）；模块外只读
+}
+
+pub fn new(prog: str, about: str) -> Parser {
+    Parser(prog: prog, about: about, specs: [], cmds: [], cmd_abouts: [], cmd_specs: [])
+}
+
+pub fn add_bool(inout p: Parser, long: str, short: str, help: str) {
+    add_spec(&p, Spec(long: long, short: short, kind: "bool", def: "false", help: help))
+}
+
+pub fn add_str(inout p: Parser, long: str, short: str, def: str, help: str) {
+    add_spec(&p, Spec(long: long, short: short, kind: "str", def: def, help: help))
+}
+
+pub fn add_int(inout p: Parser, long: str, short: str, def: int, help: str) {
+    add_spec(&p, Spec(long: long, short: short, kind: "int", def: int_str(def), help: help))
+}
+
+// 加一个子命令：c 用 flag.new(命令名, 说明) 建，add_* 加它自己的选项。c 不能再有子命令；
+// 它的选项不能和全局选项重名（两边都能写在命令后面，重名就分不清了），重名或命令名重复时 panic
+pub fn add_command(inout p: Parser, c: Parser) {
+    if len(c.cmds) > 0 { panic("flag：子命令 #{c.prog} 不能再有子命令") }
+    if find_cmd(p, c.prog) >= 0 { panic("flag：命令 #{c.prog} 重复声明") }
+    ss: [Spec] = []
+    for s in c.specs {
+        if clashes(p.specs, s) { panic("flag：命令 #{c.prog} 的参数 #{s.long} 和全局参数重复") }
+        ss.push(Spec(long: s.long.copy(), short: s.short.copy(), kind: s.kind.copy(), def: s.def.copy(), help: s.help.copy()))
+    }
+    p.cmds.push(c.prog.copy())
+    p.cmd_abouts.push(c.about.copy())
+    p.cmd_specs.push(ss)
+}
+
+fn add_spec(inout p: Parser, take s: Spec) {
+    bad = clashes(p.specs, s)
+    for cs in p.cmd_specs {
+        if clashes(cs, s) { bad = true }
+    }
+    if bad { panic("flag：参数 #{s.long} 重复声明") }
+    p.specs.push(s)
+}
+
+fn clashes(specs: [Spec], s: Spec) -> bool {
+    for o in specs {
+        if o.long == s.long || (s.short != "" && o.short == s.short) { return true }
+    }
+    false
+}
+
+pub fn parse(p: Parser) -> Args! {
+    av = args()
+    xs: [str] = []
+    for i in 1..len(av) { xs.push(av[i]) }
+    parse_from(p, xs)
+}
+
+// 解析 args()，命令行程序一般用这个：-h / --help 时把用法（写在命令后面时是这个命令的用法）打印到标准输出，退出码 0；
+// 出错时往标准错误打印“程序名：原因”和用法，退出码 2
+pub fn parse_or_exit(p: Parser) -> Args {
+    match take parse(p) {
+        Ok(a) => a
+        Err(e) => {
+            if e == "help" {
+                print(usage(p))
+                exit(0)
+            }
+            if len(e) > 5 && slice(e, 0, 5) == "help " {
+                print(usage_of(p, slice(e, 5, len(e))))
+                exit(0)
+            }
+            eprint("#{p.prog}：#{e}")
+            eprint(usage(p))
+            exit(2)
+        }
+    }
+}
+
+pub fn parse_from(p: Parser, xs: [str]) -> Args! {
+    a = Args(names: [], kinds: [], vals: [], command: "", rest: [], dash: -1)
+    push_specs(&a, p.specs)
+    cmd = -1
+    i = 0
+    for i < len(xs) {
+        x = xs[i]
+        i += 1
+        if x == "--" {
+            a.dash = len(a.rest)
+            for i < len(xs) {
+                a.rest.push(xs[i])
+                i += 1
+            }
+        } else if x == "-h" || x == "--help" {
+            if cmd < 0 { return Err("help") }
+            return Err("help " + p.cmds[cmd])
+        } else if len(x) > 2 && slice(x, 0, 2) == "--" {
+            body = slice(x, 2, len(x))
+            eq = find_byte(body, 61)
+            name = if eq < 0 { body } else { slice(body, 0, eq) }
+            k = find_long(p, cmd, name)
+            if k < 0 { return Err("未知的参数 --#{name}") }
+            if eq >= 0 {
+                v = slice(body, eq + 1, len(body))
+                set_val(&a, k, "--#{name}", v)?
+            } else if a.kinds[k] == "bool" {
+                a.vals[k] = "true"
+            } else {
+                if i >= len(xs) { return Err("参数 --#{name} 缺少值") }
+                set_val(&a, k, "--#{name}", xs[i])?
+                i += 1
+            }
+        } else if len(x) > 1 && byte_at(x, 0) == 45 {
+            name = slice(x, 1, len(x))
+            k = find_short(p, cmd, name)
+            if k < 0 && len(name) > 1 {
+                // -rn：几个开关写在一起。要值的字母取这一组剩下的部分，没剩下时取下一个参数（和 getopt 一样：-zf 包、-n5）
+                j = 0
+                for j < len(name) {
+                    c = slice(name, j, j + 1)
+                    kj = find_short(p, cmd, c)
+                    if kj < 0 { return Err("未知的参数 -#{c}（在 #{x} 里）") }
+                    j += 1
+                    if a.kinds[kj] == "bool" {
+                        a.vals[kj] = "true"
+                    } else if j < len(name) {
+                        set_val(&a, kj, "-#{c}", slice(name, j, len(name)))?
+                        j = len(name)
+                    } else {
+                        if i >= len(xs) { return Err("参数 -#{c} 缺少值") }
+                        set_val(&a, kj, "-#{c}", xs[i])?
+                        i += 1
+                    }
+                }
+                continue
+            }
+            if k < 0 { return Err("未知的参数 -#{name}") }
+            if a.kinds[k] == "bool" {
+                a.vals[k] = "true"
+            } else {
+                if i >= len(xs) { return Err("参数 -#{name} 缺少值") }
+                set_val(&a, k, "-#{name}", xs[i])?
+                i += 1
+            }
+        } else if cmd < 0 && len(p.cmds) > 0 {
+            cmd = find_cmd(p, x)
+            if cmd < 0 { return Err("未知的命令 #{x}（可以用的有 #{cmd_list(p)}）") }
+            a.command = x.copy()
+            push_specs(&a, p.cmd_specs[cmd])
+        } else {
+            a.rest.push(x)
+        }
+    }
+    if cmd < 0 && len(p.cmds) > 0 { return Err("缺少命令（可以用的有 #{cmd_list(p)}）") }
+    Ok(a)
+}
+
+fn push_specs(inout a: Args, specs: [Spec]) {
+    for s in specs {
+        a.names.push(s.long)
+        a.kinds.push(s.kind)
+        a.vals.push(s.def)
+    }
+}
+
+// 写入第 k 个参数的值，检查 bool / int 的格式
+fn set_val(inout a: Args, k: int, shown: str, v: str) -> ()! {
+    if a.kinds[k] == "int" {
+        ok = match try_parse_int(v) {
+            Ok(_) => true
+            Err(_) => false
+        }
+        if !ok { return Err("参数 #{shown} 要一个整数，得到的是 \"#{v}\"") }
+    } else if a.kinds[k] == "bool" && v != "true" && v != "false" {
+        return Err("参数 #{shown} 只能是 true 或 false，得到的是 \"#{v}\"")
+    }
+    a.vals[k] = v
+}
+
+fn find_byte(s: str, b: int) -> int {
+    for i in 0..len(s) {
+        if byte_at(s, i) == b { return i }
+    }
+    -1
+}
+
+// 长名 / 短名在 Args 里的下标：先找全局选项，再找第 cmd 个命令的（cmd < 0 表示还没遇到命令）
+fn find_long(p: Parser, cmd: int, name: str) -> int {
+    k = index_long(p.specs, name)
+    if k >= 0 || cmd < 0 { return k }
+    j = index_long(p.cmd_specs[cmd], name)
+    if j < 0 { -1 } else { len(p.specs) + j }
+}
+
+fn find_short(p: Parser, cmd: int, name: str) -> int {
+    k = index_short(p.specs, name)
+    if k >= 0 || cmd < 0 { return k }
+    j = index_short(p.cmd_specs[cmd], name)
+    if j < 0 { -1 } else { len(p.specs) + j }
+}
+
+fn index_long(specs: [Spec], name: str) -> int {
+    for i in 0..len(specs) {
+        if specs[i].long == name { return i }
+    }
+    -1
+}
+
+fn index_short(specs: [Spec], name: str) -> int {
+    for i in 0..len(specs) {
+        if specs[i].short != "" && specs[i].short == name { return i }
+    }
+    -1
+}
+
+fn find_cmd(p: Parser, name: str) -> int {
+    for i in 0..len(p.cmds) {
+        if p.cmds[i] == name { return i }
+    }
+    -1
+}
+
+fn cmd_list(p: Parser) -> str { join(p.cmds, "、") }
+
+fn val_of(a: Args, name: str, kind: str) -> str {
+    for i in 0..len(a.names) {
+        if a.names[i] == name {
+            if a.kinds[i] != kind { panic("flag：参数 #{name} 是 #{a.kinds[i]}，不是 #{kind}") }
+            return a.vals[i]
+        }
+    }
+    panic("flag：没有声明参数 #{name}")
+}
+
+pub fn get_bool(a: Args, name: str) -> bool { val_of(a, name, "bool") == "true" }
+
+pub fn get_str(a: Args, name: str) -> str { val_of(a, name, "str") }
+
+pub fn get_int(a: Args, name: str) -> int { parse_int(val_of(a, name, "int")) }
+
+// 用法说明，每个参数一行：短名、长名、值的形式、说明、默认值。有子命令时先列出命令，每个一行
+pub fn usage(p: Parser) -> str {
+    if len(p.cmds) == 0 {
+        lines = ["用法：#{p.prog} [选项] [参数…]"]
+        if p.about != "" { lines.push(p.about) }
+        lines.push("")
+        push_options(&lines, p, -1)
+        return join(lines, "\n")
+    }
+    lines = ["用法：#{p.prog} <命令> [选项] [参数…]"]
+    if p.about != "" { lines.push(p.about) }
+    lines.push("")
+    lines.push("命令：")
+    w = 0
+    for c in p.cmds {
+        if len(c) > w { w = len(c) }
+    }
+    for k in 0..len(p.cmds) {
+        lines.push("  " + p.cmds[k] + spaces(w - len(p.cmds[k]) + 2) + p.cmd_abouts[k])
+    }
+    lines.push("")
+    push_options(&lines, p, -1)
+    lines.push("")
+    lines.push("每个命令的选项：#{p.prog} <命令> -h")
+    join(lines, "\n")
+}
+
+// 一个子命令的用法说明：它自己的选项和全局选项。cmd 没有声明过时 panic
+pub fn usage_of(p: Parser, cmd: str) -> str {
+    k = find_cmd(p, cmd)
+    if k < 0 { panic("flag：没有声明命令 #{cmd}") }
+    lines = ["用法：#{p.prog} #{cmd} [选项] [参数…]"]
+    if p.cmd_abouts[k] != "" { lines.push(p.cmd_abouts[k]) }
+    lines.push("")
+    push_options(&lines, p, k)
+    join(lines, "\n")
+}
+
+// “选项：”和下面每个参数一行（全局的在前，cmd >= 0 时再加第 cmd 个命令的），最后是 -h
+fn push_options(inout lines: [str], p: Parser, cmd: int) {
+    lines.push("选项：")
+    heads: [str] = []
+    helps: [str] = []
+    describe(&heads, &helps, p.specs)
+    if cmd >= 0 { describe(&heads, &helps, p.cmd_specs[cmd]) }
+    hh = "  -h, --help"
+    w = len(hh)
+    for h in heads {
+        if len(h) > w { w = len(h) }
+    }
+    for i in 0..len(heads) {
+        lines.push(heads[i] + spaces(w - len(heads[i]) + 2) + helps[i])
+    }
+    lines.push(hh + spaces(w - len(hh) + 2) + "显示这段说明")
+}
+
+fn describe(inout heads: [str], inout helps: [str], specs: [Spec]) {
+    for s in specs {
+        sh = if s.short == "" { "    " } else { "-#{s.short}, " }
+        arg = if s.kind == "bool" { "" } else if s.kind == "int" { " <int>" } else { " <value>" }
+        heads.push("  #{sh}--#{s.long}#{arg}")
+        d = if s.kind == "bool" || s.def == "" { "" } else { "（默认 #{s.def}）" }
+        helps.push(s.help + d)
+    }
+}
+
+fn spaces(n: int) -> str {
+    parts: [str] = []
+    for _ in 0..n { parts.push(" ") }
+    join(parts, "")
+}
+
+// "#{p}"：Parser(lgrep, 5 个选项)，有子命令时 Parser(lark, 0 个选项, 5 个命令)；完整的说明用 p.usage()
+pub fn show(p: Parser) -> str {
+    if len(p.cmds) == 0 { return "Parser(#{p.prog}, #{len(p.specs)} 个选项)" }
+    "Parser(#{p.prog}, #{len(p.specs)} 个选项, #{len(p.cmds)} 个命令)"
+}
+
+// "#{a}"：Args(ignore-case=true, context=2, rest: ["x"])：每个选项的值，再加位置参数（写了 `--` 时再加 dash: 下标）；有子命令时最前面是 command: build
+pub fn show(a: Args) -> str {
+    parts: [str] = []
+    if a.command != "" { parts.push("command: #{a.command}") }
+    for i in 0..len(a.names) { parts.push("#{a.names[i]}=#{a.vals[i]}") }
+    parts.push("rest: #{a.rest}")
+    if a.dash >= 0 { parts.push("dash: #{a.dash}") }
+    "Args(" + join(parts, ", ") + ")"
+}

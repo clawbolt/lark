@@ -1,0 +1,4 @@
+# 测试用的本地依赖包：有两个模块和一个 C 源文件
+name = util
+version = 0.2.0
+c_src = native/twice.c

@@ -1,0 +1,65 @@
+// 运算符重载（需要 lark1 及以后的版本）
+// 左操作数是结构体或枚举时：a + b 调用 fn add(a, b)，- sub、* mul、/ div、% rem，一元 -a 调用 neg(a)。
+// a < b、<=、>、>= 调用 fn cmp(a, b) -> int 再和 0 比；有 cmp 的类型满足 Ord。
+// fn eq(a: T, b: T) -> bool 取代逐字段的 ==（列表、可选值、Map 的键里的比较也用它）。
+// 运算符函数的参数都是只读的；第二个参数可以是别的类型，比如 Vec * int。
+// 编译：lark1 examples/ops.lark -o out.c
+
+type Vec {
+    x: int
+    y: int
+}
+
+fn add(a: Vec, b: Vec) -> Vec { Vec(x: a.x + b.x, y: a.y + b.y) }
+fn sub(a: Vec, b: Vec) -> Vec { Vec(x: a.x - b.x, y: a.y - b.y) }
+fn mul(a: Vec, k: int) -> Vec { Vec(x: a.x * k, y: a.y * k) }
+fn neg(a: Vec) -> Vec { Vec(x: -a.x, y: -a.y) }
+fn vstr(v: Vec) -> str { "(#{v.x}, #{v.y})" }
+
+// 分数（分母为正）：1/2 和 2/4 相等
+type Frac {
+    n: int
+    d: int
+}
+
+fn eq(a: Frac, b: Frac) -> bool { a.n * b.d == b.n * a.d }
+fn cmp(a: Frac, b: Frac) -> int { a.n * b.d - b.n * a.d }
+fn add(a: Frac, b: Frac) -> Frac { Frac(n: a.n * b.d + b.n * a.d, d: a.d * b.d) }
+
+// T: Ord 现在也接受定义了 cmp 的类型
+fn biggest[T: Ord](xs: [T]) -> int {
+    best = 0
+    for i in 1..len(xs) {
+        if xs[best] < xs[i] { best = i }
+    }
+    best
+}
+
+fn main() {
+    a = Vec(x: 1, y: 2)
+    b = Vec(x: 10, y: 20)
+    c = a + b * 2 - Vec(x: 1, y: 1)
+    print("c = #{vstr(c)}")
+    d = -c
+    print("-c = #{vstr(d)}")
+    pts = [a.copy(), b.copy(), c.copy()]
+    s = Vec(x: 0, y: 0)
+    for i in 0..len(pts) {
+        s += pts[i]
+    }
+    print("和 = #{vstr(s)}")
+
+    h = Frac(n: 1, d: 2)
+    q = Frac(n: 2, d: 4)
+    r1 = h == q
+    r2 = h < Frac(n: 2, d: 3)
+    r3 = h >= q
+    print("1/2 == 2/4：#{r1}，1/2 < 2/3：#{r2}，1/2 >= 2/4：#{r3}")
+    r4 = [h.copy()] == [q.copy()]
+    print("列表里也用 eq：#{r4}")
+    fs = [Frac(n: 3, d: 4), Frac(n: 5, d: 6), Frac(n: 1, d: 3)]
+    i = biggest(fs)
+    print("最大的是第 #{i} 个")
+    hq = h + q
+    print("1/2 + 2/4 = #{hq.n}/#{hq.d}")
+}

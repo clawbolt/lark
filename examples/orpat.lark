@@ -1,0 +1,61 @@
+// match 的“或”模式：A | B => …，任一个选项匹配就走这个分支（需要 lark1 及以后的版本）
+// 能用在整数、字符串、布尔和变体上，也能嵌在字段里（Some(1 | 2)）。“或”模式里不能绑定名字。
+// 编译：lark1 examples/orpat.lark -o out.c
+
+enum Shape {
+    Circle(r: int)
+    Square(a: int)
+    Tri(a: int, b: int, c: int)
+    Dot
+}
+
+fn kind(n: int) -> str {
+    match n {
+        0 => "零"
+        1 | 3 | 5 | 7 | 9 => "奇数"
+        2 | 4 | 6 | 8 => "偶数"
+        _ => "大数"
+    }
+}
+
+fn corners(s: Shape) -> int {
+    match s {
+        Circle(_) | Dot => 0
+        Square(_) => 4
+        Tri(_, _, _) => 3
+    }
+}
+
+fn small(x: int?) -> bool {
+    match x {
+        Some(1 | 2 | 3) => true
+        Some(_) | None => false
+    }
+}
+
+fn weekend(d: str) -> bool {
+    match d {
+        "六" | "日" => true
+        _ => false
+    }
+}
+
+fn main() {
+    ks: [str] = []
+    for n in 0..11 { ks.push(kind(n)) }
+    print("#{ks}")
+    shapes = [Circle(1), Square(2), Tri(3, 4, 5), Dot]
+    cs: [int] = []
+    for s in shapes { cs.push(corners(s)) }
+    print("角：#{cs}")
+    print("small：#{small(Some(2))} #{small(Some(7))} #{small(None)}")
+    print("周末：#{weekend("六")} #{weekend("一")}")
+    // match take：不绑定名字的“或”模式和 _ 一样，整个值在分支开头释放
+    sh = Tri(1, 1, 1)
+    msg = match take sh {
+        Circle(r) => "圆，半径 #{r}"
+        Square(_) | Tri(_, _, _) => "多边形"
+        Dot => "点"
+    }
+    print(msg)
+}

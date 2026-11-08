@@ -1,0 +1,251 @@
+// Lark 标准库 · 网络：TCP、UDP、Unix 域套接字、DNS（用 Lark 自己写，底下是内置的 try_tcp_*、try_sock_*，和运行时里的 lark_udp_* 等几个 C 函数）
+// 用法：import "std/net"
+//
+//   l = net.listen("127.0.0.1", 8080)?    // Listener；端口给 0 时由系统挑一个空闲的，用 l.local_port()? 查
+//   c = l.accept()?                       // Conn：等一个连接进来
+//   c2 = net.connect("example.com", 80)?  // Conn：主机名会被解析（IPv4 或 IPv6）
+//   c.write("GET / HTTP/1.0\r\n\r\n")?    // 全部发出去；c.write_line(s) 末尾加 \n
+//   line = c.read_line()                  // str?：一行（不含 \n、\r），对方关闭或出错时 None，错误在 c.last_error()
+//   chunk = c.read(4096)?                 // 最多读这么多字节；对方关闭时得到 ""
+//   rest = c.read_all()?                  // 读到对方关闭为止
+//   c.set_timeout_ms(5000)?                  // 读写超过 5 秒就报错；0 表示不超时
+//   c.close()?                            // 不调用的话离开作用域时也会关闭
+//
+// 读是带缓冲的（和 std/io 的 Reader 一样），写不带缓冲：每次 write 都直接发出去。
+// 对方已经关闭时 write 返回错误，不会让程序因为 SIGPIPE 退出。
+// Listener 和 Conn 都可以 spawn 到别的线程（移进去）；服务器的写法见 examples/net.lark。
+//
+//   l = net.listen_unix("/tmp/app.sock")?  // Unix 域套接字：用法和 TCP 一样，得到的也是 Listener、Conn
+//   c = net.connect_unix("/tmp/app.sock")?
+//   u = net.listen_udp("127.0.0.1", 0)?   // UdpSocket；u.local_port()?
+//   u.send_to("127.0.0.1", 9000, "ping")?
+//   d = u.recv_from(1500)?                // Datagram：d.data、d.host、d.port（发送方）
+//   addrs = net.lookup("localhost")?     // ["127.0.0.1", "::1"] 这样的地址，按系统给的顺序
+//
+// listen_unix 的路径已经存在时报错（不替你删文件，删掉旧的再监听）；关闭 Listener 也不删文件。
+// 收数据报时没有数据就挂起任务，和 TCP 的读一样；数据报比 max 长时多出来的丢掉。connect、lookup 等的时候占着一个系统线程。
+import "io"
+
+extern "c" {
+    fn lark_net_error() -> str
+    fn lark_udp_bind(host: str, port: int) -> int
+    fn lark_udp_send(fd: int, host: str, port: int, data: [u8], n: int) -> int
+    fn lark_udp_recv(fd: int, inout buf: [u8], cap: int) -> int
+    fn lark_udp_peer() -> str
+    fn lark_unix_listen(path: str) -> int
+    fn lark_unix_connect(path: str) -> int
+    fn lark_lookup(host: str) -> str
+}
+
+pub type Listener {
+    fd: int
+}
+
+pub type Conn {
+    fd: int
+    r: io.Reader    // 读缓冲；不负责关闭 fd
+}
+
+fn conn(fd: int) -> Conn { Conn(fd: fd, r: io.from_fd(fd)) }
+
+// ---------- 服务器 ----------
+
+// host 是要监听的地址："127.0.0.1" 只接受本机的连接，"" 监听所有地址
+pub fn listen(host: str, port: int) -> Listener! {
+    fd = try_tcp_listen(host, port)?
+    Ok(Listener(fd: fd))
+}
+
+pub fn local_port(l: Listener) -> int! { try_sock_port(l.fd) }
+
+pub fn accept(l: Listener) -> Conn! {
+    if l.fd < 0 { return Err("net：Listener 已经关闭") }
+    fd = try_tcp_accept(l.fd)?
+    Ok(conn(fd))
+}
+
+// accept 最多等这么久（毫秒，0 表示一直等）；到点返回的错误 is_timeout 为真。http.serve 用它定时看看是不是该停了
+pub fn set_timeout_ms(l: Listener, ms: int) -> ()! {
+    _r = try_sock_timeout(l.fd, ms)?
+}
+
+pub fn close(inout l: Listener) -> ()! {
+    if l.fd >= 0 {
+        fd = l.fd
+        l.fd = -1
+        _r = try_fd_close(fd)?
+    }
+}
+
+fn drop(inout l: Listener) {
+    if l.fd >= 0 { _r = try_fd_close(l.fd) }
+}
+
+// ---------- 连接 ----------
+
+pub fn connect(host: str, port: int) -> Conn! {
+    fd = try_tcp_connect(host, port)?
+    Ok(conn(fd))
+}
+
+pub fn write(c: Conn, s: str) -> ()! {
+    if c.fd < 0 { return Err("net：连接已经关闭") }
+    _r = try_sock_write(c.fd, s)?
+}
+
+pub fn write_line(c: Conn, s: str) -> ()! { write(c, s + "\n") }
+
+pub fn read_line(inout c: Conn) -> str? { io.read_line(&c.r) }
+
+pub fn read_all(inout c: Conn) -> str! { io.read_all(&c.r) }
+
+// 先交出已经缓冲的内容，没有时再从连接读一次
+pub fn read(inout c: Conn, max: int) -> str! {
+    if max <= 0 { return Err("net：read 的 max 要大于 0") }
+    buffered = io.read_buffered(&c.r, max)
+    if len(buffered) > 0 { return Ok(buffered) }
+    if c.fd < 0 { return Err("net：连接已经关闭") }
+    try_fd_read(c.fd, max)
+}
+
+pub fn last_error(c: Conn) -> str { io.last_error(c.r) }
+
+pub fn set_timeout_ms(c: Conn, ms: int) -> ()! {
+    _r = try_sock_timeout(c.fd, ms)?
+}
+
+pub fn close(inout c: Conn) -> ()! {
+    if c.fd >= 0 {
+        fd = c.fd
+        c.fd = -1
+        _r = try_fd_close(fd)?
+    }
+}
+
+fn drop(inout c: Conn) {
+    if c.fd >= 0 { _r = try_fd_close(c.fd) }
+}
+
+// 这个错误是不是超时（set_timeout_ms 设的时间到了）：读、写、accept、recv_from 超时的错误都以“：超时”结尾
+pub fn is_timeout(e: str) -> bool {
+    t = "：超时"
+    len(e) >= len(t) && slice(e, len(e) - len(t), len(e)) == t
+}
+
+// ---------- Unix 域套接字 ----------
+
+pub fn listen_unix(path: str) -> Listener! {
+    fd = lark_unix_listen(path)
+    if fd < 0 { return Err(lark_net_error()) }
+    Ok(Listener(fd: fd))
+}
+
+pub fn connect_unix(path: str) -> Conn! {
+    fd = lark_unix_connect(path)
+    if fd < 0 { return Err(lark_net_error()) }
+    Ok(conn(fd))
+}
+
+// ---------- UDP ----------
+
+pub type UdpSocket {
+    fd: int
+    buf: [u8]       // 收数据报用的缓冲区，第一次 recv_from 时按 max 分配，之后重复用
+}
+
+// 收到的一个数据报
+pub type Datagram {
+    pub data: str
+    pub host: str   // 发送方的地址（"127.0.0.1"、"::1"），回信时原样传给 send_to
+    pub port: int
+}
+
+// 绑定一个 UDP 端口：host 是 "" 时所有地址，port 是 0 时由系统挑（用 local_port 查）。只发不收也要先绑定（给 0）
+pub fn listen_udp(host: str, port: int) -> UdpSocket! {
+    fd = lark_udp_bind(host, port)
+    if fd < 0 { return Err(lark_net_error()) }
+    Ok(UdpSocket(fd: fd, buf: []))
+}
+
+pub fn local_port(u: UdpSocket) -> int! { try_sock_port(u.fd) }
+
+// 发一个数据报（data 太长、超过网络能发的大小时返回错误，不会拆开）
+pub fn send_to(u: UdpSocket, host: str, port: int, data: str) -> ()! {
+    if u.fd < 0 { return Err("net：UdpSocket 已经关闭") }
+    bs = data.to_bytes()
+    if lark_udp_send(u.fd, host, port, bs, len(bs)) < 0 { return Err(lark_net_error()) }
+    Ok()
+}
+
+// 等一个数据报；比 max 长的部分丢掉。超时（set_timeout_ms）时返回错误
+pub fn recv_from(inout u: UdpSocket, max: int) -> Datagram! {
+    if max <= 0 { return Err("net：recv_from 的 max 要大于 0") }
+    if u.fd < 0 { return Err("net：UdpSocket 已经关闭") }
+    for len(u.buf) < max { u.buf.push(0) }
+    n = lark_udp_recv(u.fd, &u.buf, max)
+    if n < 0 { return Err(lark_net_error()) }
+    from = lark_udp_peer()
+    out: [u8] = []
+    out.reserve(n)
+    for i in 0..n { out.push(u.buf[i]) }
+    host = from
+    port = 0
+    sp = last_space(from)
+    if sp >= 0 {
+        host = slice(from, 0, sp)
+        port = parse_int(slice(from, sp + 1, len(from)))
+    }
+    Ok(Datagram(data: from_bytes(out), host: host, port: port))
+}
+
+fn last_space(s: str) -> int {
+    i = len(s) - 1
+    for i >= 0 && byte_at(s, i) != ' ' { i -= 1 }
+    i
+}
+
+pub fn set_timeout_ms(u: UdpSocket, ms: int) -> ()! {
+    _r = try_sock_timeout(u.fd, ms)?
+}
+
+pub fn close(inout u: UdpSocket) -> ()! {
+    if u.fd >= 0 {
+        fd = u.fd
+        u.fd = -1
+        _r = try_fd_close(fd)?
+    }
+}
+
+fn drop(inout u: UdpSocket) {
+    if u.fd >= 0 { _r = try_fd_close(u.fd) }
+}
+
+// ---------- DNS ----------
+
+// host 的所有地址（IPv4 和 IPv6，按系统给的顺序，去掉重复的）；数字地址原样返回
+pub fn lookup(host: str) -> [str]! {
+    r = lark_lookup(host)
+    if len(r) > 0 && byte_at(r, 0) == '-' { return Err(slice(r, 1, len(r))) }
+    body = slice(r, 1, len(r))
+    out: [str] = []
+    start = 0
+    for i in 0..len(body) + 1 {
+        if i == len(body) || byte_at(body, i) == 10 {
+            if i > start { out.push(slice(body, start, i)) }
+            start = i + 1
+        }
+    }
+    Ok(out)
+}
+
+// "#{c}"：Conn(fd 5)
+pub fn show(c: Conn) -> str { "Conn(fd #{c.fd})" }
+
+// "#{l}"：Listener(fd 3)
+pub fn show(l: Listener) -> str { "Listener(fd #{l.fd})" }
+
+// "#{u}"：UdpSocket(fd 6)
+pub fn show(u: UdpSocket) -> str { "UdpSocket(fd #{u.fd})" }
+
+// "#{d}"：Datagram(4 字节，来自 127.0.0.1:9000)
+pub fn show(d: Datagram) -> str { "Datagram(#{len(d.data)} 字节，来自 #{d.host}:#{d.port})" }

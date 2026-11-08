@@ -1,0 +1,70 @@
+// select：同时等几个 Chan（需要 lark1 及以后的版本）
+//   v <- ch => …    ch 先有值就执行这个分支，v 拿到收到的值
+//   after ms => …   等了 ms 毫秒还没有值
+//   done => …       所有通道都结束了（发送方都放手、队列也空了）
+
+type Ticker {
+    name: str
+    every: int
+    times: int
+    out: Chan[str]
+}
+
+fn tick(take t: Ticker) {
+    for i in 0..t.times {
+        sleep_ms(t.every)
+        t.out.send("#{t.name} 第 #{i + 1} 次")
+    }
+}
+
+type Counter {
+    n: int
+    out: Chan[int]
+}
+
+fn count(take c: Counter) {
+    for i in 0..c.n { c.out.send(i) }
+}
+
+fn main() {
+    // 两种类型的通道一起等，直到都结束
+    words: Chan[str] = chan()
+    nums: Chan[int] = chan()
+    got_words = 0
+    sum = 0
+    scope {
+        spawn(tick, Ticker(name: "慢", every: 20, times: 3, out: words.copy()))
+        spawn(count, Counter(n: 100, out: nums.copy()))
+        for {
+            select {
+                w <- words => { got_words += 1 }
+                n <- nums => { sum += n }
+                done => break
+            }
+        }
+    }
+    print("收到 #{got_words} 条消息，数字之和 #{sum}")
+
+    // 超时：没有人发送时，after 分支在 30 毫秒后执行
+    quiet: Chan[int] = chan()
+    _keep = quiet.copy()        // 自己再拿一份，通道就不会“结束”
+    timeouts = 0
+    for _i in 0..3 {
+        select {
+            v <- quiet => print("意外收到 #{v}")
+            after 30 => { timeouts += 1 }
+        }
+    }
+    print("超时 #{timeouts} 次")
+
+    // select 也可以有值：有 done 分支时，各分支的值就是 select 的值
+    last: Chan[int] = chan()
+    scope {
+        spawn(count, Counter(n: 3, out: last.copy()))
+    }
+    first = select {
+        v <- last => v * 10
+        done => -1
+    }
+    print("第一个值 × 10 = #{first}")
+}

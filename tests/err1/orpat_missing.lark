@@ -1,0 +1,13 @@
+// 期望错误：“或”模式也要覆盖所有情况，这里漏了 Dot
+enum S {
+    A
+    B
+    Dot
+}
+
+fn main() {
+    s = A
+    match s {
+        A | B => print("ab")
+    }
+}

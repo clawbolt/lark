@@ -1,0 +1,57 @@
+// 复合赋值：x op= v 就是 x = x op v（需要 lark1 及以后的版本）
+// += -= *= /= %= &= |= ^= <<= >>= >>>=；目标是用户类型时按运算符重载展开（/= 调用 div）
+// 编译：lark1 examples/compound.lark -o out.c
+
+type Money {
+    cents: int
+}
+
+type Label {
+    text: str
+}
+
+fn div(a: Money, n: int) -> Money { Money(cents: a.cents / n) }
+
+fn main() {
+    x = 100
+    x /= 7
+    a = x
+    x %= 5
+    print("100 /= 7 → #{a}，%= 5 → #{x}")
+    f = 0b1100
+    f &= 0b1010
+    g = f
+    f |= 0b0001
+    h = f
+    f ^= 0b1111
+    print("&= #{g}，|= #{h}，^= #{f}")
+    s = 1
+    s <<= 10
+    t = s
+    s >>= 3
+    u = -16
+    u >>>= 60
+    print("<<= #{t}，>>= #{s}，>>>= #{u}")
+    y = 7.5
+    y /= 2.0
+    print("float /= #{y}")
+    m = Money(cents: 1000)
+    m /= 3
+    print("Money /= 3 → #{m.cents}")
+    xs = [10, 20]
+    xs[1] /= 4
+    print("#{xs}")
+    // 字符串的 += 和 s = s + x 原地追加（没有别人引用时不重新分配）。别的变量拿着的旧值不受影响，s += s 也对
+    w = "a" + "b"   // 不是字面量：keep 和 w 共用这一个字符串，w += 时得先复制
+    keep = w
+    w += "c"
+    w += w
+    w = w + "!"
+    lb = Label(text: "L")
+    lb.text += "-1"
+    names = ["x", "y"]
+    names[0] += "1"
+    big = ""
+    for i in 0..1000 { big += "#{i % 10}" }
+    print("#{w} #{keep} #{lb.text} #{names[0]} #{len(big)} #{slice(big, 995, 1000)}")
+}

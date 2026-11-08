@@ -1,0 +1,6 @@
+// 期望错误：match 需要同时覆盖 Ok 和 Err
+fn main() {
+    match try_parse_int("1") {
+        Ok(n) => print("#{n}")
+    }
+}

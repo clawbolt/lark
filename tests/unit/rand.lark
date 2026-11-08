@@ -1,0 +1,88 @@
+// std/rand 的边界：同一个种子可复现、种子为 0、[0, 1) 和 1 个元素的区间、整个 int 的区间、空列表、取的个数比列表还多
+import "std/rand"
+import "std/math"
+import "std/sort"
+
+test "同一个种子得到同一串数" {
+    a = rand.new(42)
+    b = rand.new(42)
+    c = rand.new(43)
+    same = true
+    diff = 0
+    for _i in 0..1000 {
+        x = a.next_int()
+        if x != b.next_int() { same = false }
+        if x != c.next_int() { diff += 1 }
+    }
+    assert(same)
+    assert(diff > 990)
+    // 种子是 0 也能用：SplitMix64 把它展开成不全是 0 的状态
+    z = rand.new(0)
+    nonzero = 0
+    for _i in 0..10 {
+        if z.next_int() != 0 { nonzero += 1 }
+    }
+    assert(nonzero > 0)
+}
+
+test "范围" {
+    r = rand.new(1)
+    counts = [0, 0, 0, 0, 0, 0]
+    outside = 0
+    for _i in 0..60000 {
+        k = r.range(0, 6)
+        if k < 0 || k >= 6 { outside += 1 } else { counts[k] += 1 }
+    }
+    assert_eq(outside, 0)
+    // 每个大约 10000 次（标准差约 91）
+    for n in counts { assert(n > 9000 && n < 11000) }
+    assert_eq(r.range(0, 1), 0)
+    wrong = 0
+    for _i in 0..1000 {
+        v = r.range(-3, -1)
+        if v != -3 && v != -2 { wrong += 1 }
+        f = r.next_float()
+        if f < 0.0 || f >= 1.0 { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+    assert(!r.next_bool(0.0))
+    assert(r.next_bool(1.0))
+    assert(r.range(0, math.MAX) >= 0)
+    // 区间比 MAX 还宽（hi - lo 会溢出）
+    neg = 0
+    for _i in 0..100 {
+        x = r.range(math.MIN, math.MAX)
+        if x < 0 { neg += 1 }
+    }
+    assert(neg > 20 && neg < 80)
+}
+
+test "打乱和随机取" {
+    r = rand.new(5)
+    ten = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    xs = ten.copy()
+    r.shuffle(&xs)
+    assert(sort.sorted(xs.copy()) == ten)
+    e: [int] = []
+    r.shuffle(&e)
+    assert_eq(len(e), 0)
+    one = [7]
+    r.shuffle(&one)
+    assert(one == [7])
+    assert_eq(r.choice(e) ?? -1, -1)
+    assert_eq(r.choice(one) ?? -1, 7)
+    s = r.sample(ten, 3)
+    assert_eq(len(s), 3)
+    assert(s[0] != s[1] && s[1] != s[2] && s[0] != s[2])
+    assert(sort.sorted(r.sample(ten, 100)) == ten)
+    assert_eq(len(r.sample(ten, 0)), 0)
+    assert_eq(len(r.sample(ten, -1)), 0)
+    // 打乱 20 次，至少有一次顺序变了
+    moved = false
+    for _i in 0..20 {
+        ys = ten.copy()
+        r.shuffle(&ys)
+        if !(ys == ten) { moved = true }
+    }
+    assert(moved)
+}

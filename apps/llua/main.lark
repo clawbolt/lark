@@ -1,0 +1,88 @@
+// llua：用 Lark 写的 Lua 5.4 子集解释器。同一个脚本交给 llua 和真 lua 运行，输出应该一样（见 tests/compat.sh）。
+// 构建：在 apps/llua 里 lark build，得到 build/llua
+//
+//   llua 脚本.lua [参数…]      运行脚本；参数在 arg 表和主程序的 ... 里
+//   llua -e '代码'             运行一段代码
+//
+// 支持：Lua 5.4 的全部语句（goto 除外），整数和浮点数两种数（整数运算按 64 位回绕），字符串、表、闭包、可变参数、
+// 多返回值、元表（__index __newindex __call __tostring __eq __lt __le __len __concat、算术和位运算），
+// pcall / error，以及 string、table、math、os、io 库的常用函数（见 lua/interp.lark 的 new_vm）。
+// 还没有：垃圾回收、协程、goto、Lua 的模式匹配（string.find 只能按普通字符串找）、string.gsub / match / gmatch、
+// io.read、load / require。
+import "std/os"
+import "lua/parse"
+import "lua/interp"
+import "lua/value"
+
+// 没被接住的错误显示成什么
+fn error_text(inout vm: interp.Vm, prog: parse.Prog, e: value.Value) -> str {
+    match e {
+        value.Str(s) => return s
+        value.Int(_) | value.Num(_) => return value.num_to_str(e) ?? ""
+        _ => {}
+    }
+    if !value.is_nil(interp.metafield(vm, e, "__tostring")) {
+        match interp.tostring(&vm, prog, e) {
+            Ok(s) => return s
+            Err(_) => {}
+        }
+    }
+    "(error object is a #{value.type_name(e)} value)"
+}
+
+fn run(chunk: str, src: str, script: str, script_args: [str]) -> int {
+    prog = match take parse.parse(src, chunk) {
+        Ok(p) => p
+        Err(e) => {
+            eprint("llua: #{e}")
+            return 1
+        }
+    }
+    vm = interp.new_vm(chunk)
+    // arg 表：arg[0] 是脚本，arg[1..] 是参数
+    at = len(vm.tabs)
+    vm.tabs.push(value.new_table())
+    value.raw_set(&vm.tabs[at], value.Int(0), value.Str(script))
+    vs: [value.Value] = []
+    for i, a in script_args {
+        value.raw_set(&vm.tabs[at], value.Int(i + 1), value.Str(a))
+        vs.push(value.Str(a))
+    }
+    g = vm.globals
+    value.raw_set(&vm.tabs[g], value.Str("arg"), value.Tab(at))
+    r = interp.run_main(&vm, prog, vs)
+    interp.flush_out(&vm)
+    match take r {
+        Ok => 0
+        Err(e) => {
+            msg = error_text(&vm, prog, e)
+            eprint("llua: #{msg}")
+            1
+        }
+    }
+}
+
+fn usage() {
+    eprint("用法：llua 脚本.lua [参数…]\n      llua -e '代码'")
+    exit(2)
+}
+
+fn main() {
+    av = args()
+    if len(av) < 2 { usage() }
+    if av[1] == "-e" {
+        if len(av) < 3 { usage() }
+        exit(run("(command line)", av[2], "-e", []))
+    }
+    path = av[1].copy()
+    src = match os.read(path) {
+        Ok(s) => s
+        Err(e) => {
+            eprint("llua: cannot open #{path}（#{e}）")
+            exit(1)
+        }
+    }
+    rest: [str] = []
+    for j in 2..len(av) { rest.push(av[j].copy()) }
+    exit(run(path, src, path, rest))
+}

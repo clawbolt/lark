@@ -1,0 +1,9 @@
+# 编译产物：make 生成，不进仓库
+build/
+apps/*/build/
+stage0/_build/
+node_modules/
+npm-cache/
+
+# 系统文件
+.DS_Store

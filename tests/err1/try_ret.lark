@@ -1,0 +1,7 @@
+// 期望错误：? 要求当前函数返回 T!
+fn f() -> int {
+    n = try_parse_int("1")?
+    n
+}
+
+fn main() {}

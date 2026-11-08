@@ -1,0 +1,55 @@
+// shared T：引用计数的共享所有权（需要 lark1 及以后的版本）
+// share(x) 放到堆上；.copy() 只是计数加一；最后一个持有者释放时才释放内容。
+// 内容只读：可以读字段、取下标、match，不能经由 shared 修改。内容只读也意味着不会成环，计数不会泄漏。
+// 所以内容里不能有 Mutex 和 Chan（lock、send 会改它们）：要在任务间共用它们，直接传 .copy()。
+
+type Config {
+    name: str
+    level: int
+}
+
+type User {
+    name: str
+    cfg: shared Config
+}
+
+// 子树可以被多个节点共享
+enum Tree {
+    Leaf(v: int)
+    Node(l: shared Tree, r: shared Tree)
+}
+
+fn sum(t: shared Tree) -> int {
+    match t {
+        Leaf(v) => v
+        Node(l, r) => sum(l) + sum(r)
+    }
+}
+
+// 有析构的类型放进 shared：只在最后一个持有者释放时析构一次
+type Res {
+    id: int
+}
+
+fn drop(inout r: Res) { print("释放资源 #{r.id}") }
+
+fn main() {
+    cfg = share(Config(name: "默认", level: 3))
+    a = User(name: "甲", cfg: cfg.copy())
+    b = User(name: "乙", cfg: cfg.copy())
+    print("#{a.name} 的配置：#{a.cfg.name}，#{b.name} 的级别：#{b.cfg.level}")
+    same = a.cfg == b.cfg
+    print("两人的配置相等：#{same}")
+
+    leaf = share(Leaf(1))
+    inner = share(Node(leaf.copy(), share(Leaf(2))))
+    t = share(Node(leaf.copy(), inner))
+    print("树的和：#{sum(t)}")
+
+    s = share([10, 20, 30])
+    print("s[1] = #{s[1]}")
+
+    r = share(Res(id: 9))
+    _r2 = r.copy()
+    print("资源有两个持有者")
+}

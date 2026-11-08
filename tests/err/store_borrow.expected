@@ -1,0 +1,3 @@
+tests/err/store_borrow.lark:6:15: 错误：u 是借用的，不能移走；需要副本请写 u.copy()
+ 6 |     Holder(u: u)
+   |               ^

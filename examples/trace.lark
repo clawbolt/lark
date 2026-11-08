@@ -1,0 +1,19 @@
+// 调用栈：panic 时从里到外打印每一层函数（和闭包）正在执行的 .lark 文件和行（需要 lark1 及以后的版本）
+// 编译：lark1 examples/trace.lark -o out.c
+
+fn check_age(n: int) -> int {
+    if n < 0 { panic("年龄不能是负数：#{n}") }
+    n
+}
+
+fn apply_all(xs: [int], f: fn(int) -> int) -> int {
+    total = 0
+    for x in xs { total += f(x) }
+    total
+}
+
+fn main() {
+    print("和：#{apply_all([1, 2], |x| check_age(x))}")
+    r = apply_all([1, -2], |x| check_age(x * 10))
+    print("不会执行到这里：#{r}")
+}

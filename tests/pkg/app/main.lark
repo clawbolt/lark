@@ -1,0 +1,15 @@
+// lark run 的测试项目（见 tests/pkg/app/lark.pkg）
+import "util"
+
+extern "c" {
+    fn cbrt(x: float) -> float
+}
+
+fn main() {
+    print(util.shout("hello"))
+    print("twice 21 = #{util.twice(21)}")
+    print(util.hi())
+    print("cbrt 27 = #{to_int(cbrt(27.0) + 0.5)}")
+    a = args()
+    print("参数：#{len(a) - 1} 个，第一个是 #{a[1]}")
+}

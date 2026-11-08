@@ -1,0 +1,22 @@
+// 期望错误：Dot 没有实现 Shape，不可能装在 dyn Shape 里
+interface Shape {
+    fn area(s: Self) -> int
+}
+
+type Rect {
+    w: int
+}
+
+type Dot {
+    x: int
+}
+
+fn area(s: Rect) -> int { s.w }
+
+fn main() {
+    s: dyn Shape = Rect(w: 1)
+    match s {
+        d: Dot => print("#{d.x}")
+        _ => print("别的")
+    }
+}

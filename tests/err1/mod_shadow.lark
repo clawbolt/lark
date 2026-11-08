@@ -1,0 +1,6 @@
+// 期望错误：secret 是这个文件导入的模块名，不能用作变量名
+import "../mods/secret"
+
+fn main() {
+    secret = 1
+}

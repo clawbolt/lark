@@ -1,0 +1,9 @@
+// 期望错误：期望 List[int]，Cons 的 head 却给了 str
+enum List[T] {
+    Cons(head: T, tail: List[T])
+    Nil
+}
+
+fn main() {
+    xs: List[int] = Cons("a", Nil)
+}

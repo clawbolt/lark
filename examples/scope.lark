@@ -1,0 +1,74 @@
+// scope / spawn / Chan：结构化并发（需要 lark1 及以后的版本）
+// spawn(f, x) 在新线程里运行 f(x)：x 被移进新线程，所以线程之间没有共享的可变数据。
+// scope 块结束前会等其中 spawn 的所有线程跑完；结果通过 Chan 送回来。
+
+type Job {
+    id: int
+    n: int
+    out: Chan[str]
+}
+
+fn fib(n: int) -> int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }
+
+fn worker(take job: Job) {
+    r = fib(job.n)
+    job.out.send("任务 #{job.id}：fib(#{job.n}) = #{r}")
+}
+
+// shared 的内容只读、计数是原子的，所以也可以交给多个线程一起读
+type Table {
+    words: [str]
+}
+
+type Lookup {
+    table: shared Table
+    i: int
+    out: Chan[int]
+}
+
+fn measure(take q: Lookup) {
+    q.out.send(len(q.table.words[q.i]))
+}
+
+fn main() {
+    results: Chan[str] = chan()
+    scope {
+        for i in 0..4 {
+            spawn(worker, Job(id: i, n: 20 + i, out: results.copy()))
+        }
+    }
+    // 线程都结束了，它们手里的 results 也都放手了：取完队列里的值以后 recv 返回 None
+    lines: [str] = []
+    for {
+        r = results.recv()
+        match r {
+            Some(s) => lines.push(s.copy())
+            None => break
+        }
+    }
+    print("收到 #{len(lines)} 条结果")
+    // 线程完成的先后不确定，按任务号输出
+    for i in 0..4 {
+        for ln in lines {
+            if slice(ln, 0, len("任务 #{i}")) == "任务 #{i}" { print(ln) }
+        }
+    }
+
+    // 边算边收：在 scope 里一直 recv，直到所有线程都放手
+    table = share(Table(words: ["alpha", "be", "gamma", "pi"]))
+    sizes: Chan[int] = chan()
+    total = 0
+    scope {
+        for i in 0..4 {
+            spawn(measure, Lookup(table: table.copy(), i: i, out: sizes.copy()))
+        }
+        for {
+            r2 = sizes.recv()
+            match r2 {
+                Some(n) => { total += n }
+                None => break
+            }
+        }
+    }
+    print("单词总长度：#{total}")
+}

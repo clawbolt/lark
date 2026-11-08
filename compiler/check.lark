@@ -1,0 +1,3003 @@
+// Lark 编译器 stage1 · 类型检查
+// 结果写进 Ctx 的旁表：ety（类型）、vid（变量编号）、rkind/rname/ridx（调用解析）、decl、ampx。
+
+fn expect_ty(c: Ctx, want: int, got: int, line: int, col: int) {
+    if got != 4 && want != got {
+        fail(line, col, "类型不匹配：需要 #{show_ty(c, want)}，实际是 #{show_ty(c, got)}")
+    }
+}
+
+fn join_ty(c: Ctx, a: int, b: int, line: int, col: int) -> int {
+    if a == 4 {
+        b
+    } else if b == 4 || a == b {
+        a
+    } else {
+        hint = if (a == 3 && is_res_unit(c, b)) || (b == 3 && is_res_unit(c, a)) { "；没有值的分支末尾可以写 Ok()" } else { "" }
+        fail(line, col, "分支类型不一致：#{show_ty(c, a)} 与 #{show_ty(c, b)}" + hint)
+        exit(1)
+    }
+}
+
+fn check_expr(inout c: Ctx, e: Expr, expect: int) -> int {
+    t = check_expr_(&c, e, expect)
+    c.ety[e.id] = t
+    // 需要 T? 的地方给了 T：自动包成 Some
+    if expect >= 0 && t != expect && t != 4 && is_box(c, expect) && telem(c, expect) == t {
+        c.wrap[e.id] = true
+        c.wrapt[e.id] = expect
+        expect
+    } else if expect >= 0 && t != expect && t != 4 && t != 5 && is_dyn(c, expect) {
+        // 需要 dyn I 的地方给了实现 I 的值：自动装箱
+        dyn_impl(&c, expect, t, e.line, e.col)
+        c.wrap[e.id] = true
+        c.wrapt[e.id] = expect
+        expect
+    } else {
+        t
+    }
+}
+
+fn check_expr_(inout c: Ctx, e: Expr, expect: int) -> int {
+    match e.kind {
+        EInt(n) => if is_fixed(expect) { fixed_lit(expect, n, e.line, e.col) } else { 0 }
+        EFloat(_) => 9
+        EBool(_) => 1
+        EStr(_) => 2
+        EInterp(parts) => {
+            for x in parts {
+                t = check_expr(&c, x, -1)
+                check_show(&c, t, x.line, x.col)
+            }
+            2
+        }
+        EVar(name) => {
+            if name == "_" { fail(e.line, e.col, "_ 只用来丢弃值，不能读取") }
+            v = lookup(c, name)
+            if v < 0 {
+                ck = find_const(c, name, e.line)
+                if ck >= 0 { return use_const(&c, e, ck) }
+                fvt = check_fn_value(&c, e, name, expect)
+                if fvt >= 0 { return fvt }
+                hint = if name != "" && has(c.fmods, name) { "；要用模块 #{name}，请在这个文件开头 import 它" } else { did_you_mean(name, var_cands(c)) }
+                fail(e.line, e.col, "未定义的变量 #{name}" + hint)
+            }
+            note_use(&c, v)
+            c.vid[e.id] = v
+            c.locals[v].ty
+        }
+        EField(base, name) => {
+            tb0 = check_expr(&c, base, -1)
+            // shared 自动解一层：s.f 读的是里面那个结构体的字段
+            tb = if is_shared(c, tb0) { telem(c, tb0) } else { tb0 }
+            if tkind(c, tb) != "struct" {
+                fail(e.line, e.col, "#{show_ty(c, tb)} 不是结构体，不能访问字段 #{name}")
+            }
+            si = find_struct(c, tname(c, tb))
+            found = -1
+            for i in 0..len(c.structs[si].fnames) {
+                if c.structs[si].fnames[i] == name { found = i }
+            }
+            if found < 0 { fail(e.line, e.col, "#{tname(c, tb)} 没有字段 #{name}" + did_you_mean(name, c.structs[si].fnames)) }
+            field_vis(c, tb, name, e.line, e.col)
+            c.structs[si].ftys[found]
+        }
+        EIndex(base, idx) => {
+            tb0 = check_expr(&c, base, -1)
+            if is_user_ty(c, tb0) {
+                return check_index(&c, e, tb0, idx)
+            }
+            tb = if is_shared(c, tb0) { telem(c, tb0) } else { tb0 }
+            ti = check_expr(&c, idx, 0)
+            expect_ty(c, 0, ti, idx.line, idx.col)
+            if tkind(c, tb) != "list" { fail(e.line, e.col, "#{show_ty(c, tb)} 不能下标访问") }
+            telem(c, tb)
+        }
+        ECall(name, args, method) => check_call(&c, e, name, args, method, expect)
+        EList(items) => {
+            if len(items) == 0 {
+                if expect < 0 || tkind(c, expect) != "list" {
+                    fail(e.line, e.col, "空列表需要类型标注，例如 xs: [int] = []")
+                }
+                expect
+            } else {
+                want = -1
+                if expect >= 0 && tkind(c, expect) == "list" { want = telem(c, expect) }
+                t0 = check_expr(&c, items[0], want)
+                no_fn(c, t0, "列表元素", items[0].line, items[0].col)
+                for i in 1..len(items) {
+                    ti = check_expr(&c, items[i], t0)
+                    expect_ty(c, t0, ti, items[i].line, items[i].col)
+                }
+                intern(&c.tt, "list", "", t0)
+            }
+        }
+        EUnary(op, a) => {
+            if op == "?" {
+                return check_try(&c, e, a)
+            }
+            if op == "!" {
+                // !x：bool 取非，int 按位取反
+                tn = check_expr(&c, a, -1)
+                if tn == 0 { return 0 }
+                if is_fixed(tn) { return tn }
+                expect_ty(c, 1, tn, e.line, e.col)
+                return 1
+            }
+            // i32 的负数字面量：-5 直接是 i32（别的地方 i32 不能取负，先 .to_int()）
+            if op == "-" && expect == 16 {
+                match a.kind {
+                    EInt(n) => {
+                        _ta = check_expr(&c, a, 0)
+                        return fixed_lit(16, 0 - n, e.line, e.col)
+                    }
+                    _ => {}
+                }
+            }
+            want = if op == "-" { 0 } else { 1 }
+            ta = check_expr(&c, a, want)
+            if op == "-" && ta == 9 { return 9 }
+            if op == "-" && is_user_ty(c, ta) {
+                return check_neg(&c, e, ta)
+            }
+            expect_ty(c, want, ta, e.line, e.col)
+            want
+        }
+        EBinary(op, a, b) => check_binary(&c, e, op, a, b)
+        EIf(cond, thn, els) => {
+            tc = check_expr(&c, cond, 1)
+            expect_ty(c, 1, tc, cond.line, cond.col)
+            tt = check_block(&c, thn, expect)
+            match els {
+                Some(eb) => {
+                    te = check_block(&c, eb, expect)
+                    // 需要 ()! 的地方，一边的值是 ()!、另一边没有值：没有值的一边就是 Ok()（代码生成时补上，见 owned_control）
+                    unit_res = is_res_unit(c, expect)
+                    if unit_res && tt == 3 && te == expect {
+                        expect
+                    } else if unit_res && te == 3 && tt == expect {
+                        expect
+                    } else {
+                        join_ty(c, tt, te, e.line, e.col)
+                    }
+                }
+                None => {
+                    // 没有 else 的 if 没有值，分支末尾的结果会被丢掉：if bad { Err("…") } 看起来像返回了错误，其实没有
+                    dropped_result(c, thn)
+                    3
+                }
+            }
+        }
+        EMatch(owning, scrut, arms) => check_match(&c, e, owning, scrut, arms, expect)
+        EBlock(b) => check_block(&c, b, expect)
+        EScope(b) => check_scope(&c, e, b, expect)
+        ELock(m, name, id, b) => check_lock(&c, e, m, name, id, b, expect)
+        ETuple(items) => check_tuple(&c, e, items, expect)
+        ESelect(arms) => check_select(&c, e, arms, expect)
+        EReturn(val) => {
+            if len(c.clo_stack) > 0 { fail(e.line, e.col, "闭包里不能写 return，闭包的值就是它的最后一个表达式") }
+            if c.defer_depth > 0 { fail(e.line, e.col, "defer 里不能写 return：defer 是在离开块的路上执行的") }
+            ret = c.cur_ret
+            match val {
+                Some(rv) => {
+                    tv = check_expr(&c, rv, ret)
+                    expect_ty(c, ret, tv, rv.line, rv.col)
+                }
+                None => {
+                    if ret != 3 && !is_res_unit(c, ret) { fail(e.line, e.col, "需要返回 #{show_ty(c, ret)}") }
+                }
+            }
+            4
+        }
+        EBreak(label) => {
+            if c.loop_depth == 0 { fail(e.line, e.col, "break 只能在循环里使用") }
+            c.ridx[e.id] = jump_depth(c, e, label)
+            4
+        }
+        EContinue(label) => {
+            if c.loop_depth == 0 { fail(e.line, e.col, "continue 只能在循环里使用") }
+            c.ridx[e.id] = jump_depth(c, e, label)
+            4
+        }
+        EClosure(params, body) => check_closure(&c, e, params, body, expect)
+    }
+}
+
+// None / Err 的类型来自上下文；Some(x) / Ok(x) 没有上下文时类型来自 x
+fn check_opt_ctor(inout c: Ctx, e: Expr, name: str, args: [Arg], expect: int) -> int {
+    c.rkind[e.id] = "builtin"
+    c.rname[e.id] = name
+    for a in args {
+        if a.amp || a.label != "" { fail(e.line, e.col, "#{name} 的参数不能带 & 或名字") }
+    }
+    want_kind = if name == "None" || name == "Some" { "opt" } else { "res" }
+    has_ctx = expect >= 0 && tkind(c, expect) == want_kind
+    if name == "None" {
+        if len(args) != 0 { fail(e.line, e.col, "None 不带参数") }
+        if !has_ctx { fail(e.line, e.col, "None 需要类型标注，例如 x: int? = None") }
+        expect
+    } else if name == "Err" {
+        if len(args) != 1 { fail(e.line, e.col, "Err 需要 1 个参数（错误值）") }
+        if !has_ctx { fail(e.line, e.col, "Err 需要类型标注，例如函数返回 int!；要从函数提前返回错误请写 return Err(…)") }
+        et = res_err(c, expect)
+        tm = check_expr(&c, args[0].value, et)
+        expect_ty(c, et, tm, args[0].value.line, args[0].value.col)
+        expect
+    } else if name == "Ok" && len(args) == 0 {
+        if has_ctx && telem(c, expect) != 3 { fail(e.line, e.col, "Ok() 只能用于 ()!，这里需要 #{show_ty(c, expect)}") }
+        if has_ctx { expect } else { intern(&c.tt, "res", "", 3) }
+    } else {
+        if len(args) != 1 { fail(e.line, e.col, "#{name} 需要 1 个参数") }
+        want = if has_ctx { telem(c, expect) } else { -1 }
+        t = check_expr(&c, args[0].value, want)
+        if unit_like(t) { fail(e.line, e.col, "不能把 #{show_ty(c, t)} 包进 #{name}") }
+        if want_kind == "res" {
+            er = if has_ctx { res_err(c, expect) } else { 2 }
+            res_of(&c, t, er)
+        } else {
+            intern(&c.tt, "opt", "", t)
+        }
+    }
+}
+
+fn check_binary(inout c: Ctx, e: Expr, op: str, a: Expr, b: Expr) -> int {
+    if op == "??" {
+        return check_coalesce(&c, e, a, b)
+    }
+    ta = check_expr(&c, a, -1)
+    on = op_fn_name(op)
+    if on != "" && is_user_ty(c, ta) {
+        return check_op(&c, e, op, on, ta, b)
+    }
+    tb = check_expr(&c, b, ta)
+    if ta != tb && ta != 4 && tb != 4 {
+        fail(e.line, e.col, "运算两侧类型不同：#{show_ty(c, ta)} 与 #{show_ty(c, tb)}")
+    }
+    if is_fixed(ta) && (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") {
+        n = fixed_name(ta)
+        fail(e.line, e.col, "#{n} 不能直接做算术：先用 .to_int() 转成 int，算完用 .to_#{n}() 或 .wrap_#{n}() 转回来")
+    }
+    if op == "+" && (is_num(ta) || ta == 2) {
+        ta
+    } else if (op == "-" || op == "*" || op == "/" || op == "%") && is_num(ta) {
+        ta
+    } else if (op == "==" || op == "!=") && is_eq(c, ta) {
+        1
+    } else if (op == "<" || op == "<=" || op == ">" || op == ">=") && (is_num(ta) || ta == 2 || is_fixed(ta)) {
+        1
+    } else if is_bit_op(op) && ta == 0 {
+        0
+    } else if (op == "&" || op == "|" || op == "^") && is_fixed(ta) {
+        ta
+    } else if (op == "&&" || op == "||") && ta == 1 {
+        1
+    } else {
+        fail(e.line, e.col, "运算 #{op} 不支持类型 #{show_ty(c, ta)}")
+        exit(1)
+    }
+}
+
+// 只用于 int 的运算：位运算、移位、回绕的 +% -% *%
+// 定宽整数的字面量：期望类型是 u8、u16、u32、i32 的整数字面量（含 'a' 这样的字符）要在它的范围里
+fn fixed_lit(t: int, n: int, line: int, col: int) -> int {
+    if n < fixed_lo(t) || n > fixed_hi(t) { fail(line, col, "#{n} 超出 #{fixed_name(t)} 的范围 #{fixed_lo(t)}..#{fixed_hi(t)}") }
+    t
+}
+
+fn is_bit_op(op: str) -> bool {
+    op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>" || op == ">>>" || op == "+%" || op == "-%" || op == "*%"
+}
+
+// a ?? b：a 是 T? 或 T!，b 是 T。T 可以复制（int / bool / str / float）时 a 可以是变量，取值时复制一份；
+// 别的 T 只能把值移出来，所以 a 要是临时的值（函数调用的结果等），是变量或字段时报错（不做隐式复制）。
+fn check_coalesce(inout c: Ctx, e: Expr, a: Expr, b: Expr) -> int {
+    ta = check_expr(&c, a, -1)
+    if !is_box(c, ta) { fail(e.line, e.col, "?? 左边需要可选或结果类型，而不是 #{show_ty(c, ta)}") }
+    el = telem(c, ta)
+    if !is_copy(el) && is_place_expr(c, a) {
+        fail(e.line, e.col, "?? 左边是变量或字段时，#{show_ty(c, el)} 的值不能隐式复制：请写 x.copy() ?? 默认值，或者用 match take")
+    }
+    tb = check_expr(&c, b, el)
+    expect_ty(c, el, tb, b.line, b.col)
+    el
+}
+
+// d.downcast()：d 是 dyn I，期望类型是 T?。d 里装的是 T 时得到一份副本，否则 None
+fn check_downcast(inout c: Ctx, e: Expr, args: [Arg], expect: int) -> int {
+    if len(args) != 1 { fail(e.line, e.col, "downcast 只有一个参数，写成 d.downcast()") }
+    if args[0].amp || args[0].label != "" { fail(e.line, e.col, "downcast 的参数不能带 & 或名字") }
+    dt = check_expr(&c, args[0].value, -1)
+    if !is_dyn(c, dt) { fail(e.line, e.col, "downcast 只能用于 dyn 值，而不是 #{show_ty(c, dt)}") }
+    if expect < 0 || tkind(c, expect) != "opt" {
+        fail(e.line, e.col, "downcast 需要知道要转成什么类型，请写类型标注，例如 r: Rect? = s.downcast()")
+    }
+    dyn_impl(&c, dt, telem(c, expect), e.line, e.col)
+    c.rkind[e.id] = "builtin"
+    c.rname[e.id] = "downcast"
+    expect
+}
+
+// 变量、字段、列表元素这类“位置”（而不是临时的值）；用户类型的下标返回新值，不算
+fn is_place_expr(c: Ctx, e: Expr) -> bool {
+    match e.kind {
+        EVar(_) => true
+        EField(_, _) => true
+        EIndex(_, _) => c.rkind[e.id] != "index"
+        _ => false
+    }
+}
+
+// ---------- 运算符重载 ----------
+// 左操作数是结构体或枚举时：a + b 调用 fn add(a, b)，- sub、* mul、/ div、% rem，一元 -a 调用 neg(a)；
+// < <= > >= 调用 cmp(a, b) 再和 0 比。== 和 != 不在这里：它们用 fn eq（见 check_program 和 eq_fn）。
+// 运算符函数的参数都是只读的，所以运算两侧照旧只是读；第二个参数可以是别的类型（Vec * int）。
+// 节点上记 rkind = "op"、rname = 函数的内部名字，代码生成时照着调用。
+
+fn op_fn_name(op: str) -> str {
+    if op == "+" { "add" } else if op == "-" { "sub" } else if op == "*" { "mul" } else if op == "/" { "div" } else if op == "%" { "rem" } else if op == "<" || op == "<=" || op == ">" || op == ">=" { "cmp" } else { "" }
+}
+
+fn is_user_ty(c: Ctx, t: int) -> bool {
+    t >= 0 && (tkind(c, t) == "struct" || tkind(c, t) == "enum")
+}
+
+// 第一个参数类型为 t 的运算符函数：先找类型所在的模块，再找根模块
+fn find_op(c: Ctx, name: str, t: int) -> int {
+    rm = type_mod(c, t)
+    if rm != "" {
+        fi = overload_for(c, rm + "." + name, t)
+        if fi >= 0 { return fi }
+    }
+    overload_for(c, name, t)
+}
+
+fn op_hint(c: Ctx, on: str, ta: int) -> str {
+    ts = show_ty(c, ta)
+    if on == "cmp" { "fn cmp(a: #{ts}, b: #{ts}) -> int" } else if on == "neg" { "fn neg(a: #{ts}) -> #{ts}" } else { "fn #{on}(a: #{ts}, b: #{ts}) -> #{ts}" }
+}
+
+fn op_fn_of(inout c: Ctx, e: Expr, op: str, on: str, ta: int, np: int) -> int {
+    fi = find_op(c, on, ta)
+    if fi < 0 {
+        fail(e.line, e.col, "#{show_ty(c, ta)} 不支持运算 #{op}：可以定义 #{op_hint(c, on, ta)}")
+    }
+    check_fn_vis(c, fi, e.line, e.col)
+    if len(c.fns[fi].ptys) != np {
+        fail(e.line, e.col, "运算符 #{op} 对应的 #{on} 要有 #{np} 个参数，例如 #{op_hint(c, on, ta)}")
+    }
+    for k in 0..np {
+        if c.fns[fi].pmodes[k] != "read" { fail(e.line, e.col, "运算符 #{op} 对应的 #{on} 的参数只能是只读的（不写 take / inout）") }
+    }
+    if unit_like(c.fns[fi].ret) { fail(e.line, e.col, "运算符 #{op} 对应的 #{on} 要有返回值") }
+    c.rkind[e.id] = "op"
+    c.rname[e.id] = c.fns[fi].name
+    opn = c.fns[fi].name.copy()
+    note_mod(&c, opn, e.line)
+    fi
+}
+
+fn check_op(inout c: Ctx, e: Expr, op: str, on: str, ta: int, b: Expr) -> int {
+    fi = op_fn_of(&c, e, op, on, ta, 2)
+    pb = c.fns[fi].ptys[1]
+    tb = check_expr(&c, b, pb)
+    expect_ty(c, pb, tb, b.line, b.col)
+    if on == "cmp" { 1 } else { c.fns[fi].ret }
+}
+
+fn check_neg(inout c: Ctx, e: Expr, ta: int) -> int {
+    fi = op_fn_of(&c, e, "-", "neg", ta, 1)
+    c.fns[fi].ret
+}
+
+// ---------- 下标重载 ----------
+// x 是结构体或枚举时：x[i] 调用 fn index(x: T, i: K) -> V（得到一个新值），
+// x[i] = v 调用 fn set_index(inout x: T, i: K, take v: V)；x[i] += 1 先读后写。
+// index 的结果不是 x 里面的位置，所以不能给它的字段赋值，也不能把它当 inout 参数。
+// 读的节点上记 rkind = "index"，写的语句上记 rkind = "setindex"（rname 都是函数的内部名字）。
+
+// x.f(…) 在接收者类型的模块、当前模块和根模块里都找不到 f 时，再找 import 的模块里的“扩展方法”：
+// 第一个参数的类型是带 Iter / Next 约束的类型参数（如 iter.lazy_map、iter.collect），或者是列表 [T]（如 iter.each）
+// 的 pub 泛型函数。这样列表和自己写的迭代器也能接着 iter 的函数链式调用。找到时返回限定名，否则为 ""
+fn ext_method(c: Ctx, name: str, line: int, col: int) -> str {
+    found = ""
+    for i in 0..len(c.fns) {
+        un = c.fns[i].uname.copy()
+        if has_dot(un) && last_part(un) == name && is_ext_method(c, i) {
+            if found != "" && found != un {
+                m1 = mod_part(found)
+                m2 = mod_part(un)
+                fail(line, col, "#{m1} 和 #{m2} 里都有 #{name}，请写成 #{m1}.#{name}(…) 或 #{m2}.#{name}(…)")
+            }
+            found = un
+        }
+    }
+    found
+}
+
+fn is_ext_method(c: Ctx, fi: int) -> bool {
+    if !is_template(c, fi) || len(c.fns[fi].ptexts) == 0 { return false }
+    if c.fns[fi].tok < 0 || !has(c.pubs, c.toks[c.fns[fi].tok].line) { return false }
+    p0 = c.fns[fi].ptexts[0]
+    for k in 0..len(c.fns[fi].tvars) {
+        tvk = c.fns[fi].tvars[k]
+        if p0 == tvk {
+            for b in split_plus(c.fns[fi].tbounds[k]) {
+                if is_iter_bound(b) { return true }
+            }
+        }
+        if p0 == "[" + tvk + "]" { return true }
+    }
+    false
+}
+
+// 名字为 qn、第一个参数的类型原文能对上 t 的泛型模板（比如 Mapped[I, T, U] 对上 Mapped[Range, int, str] 的实例）；
+// 没有时为 -1。对上指的是：按 t 推出第一个参数里的类型参数后，再解析回来正好是 t。
+// 先找第一个参数写出了形状的（[T]、Mapped[I, T, U]），再找第一个参数只是一个类型参数的（I）：
+// 后者什么类型都对得上，所以 iter.map 收列表的和收迭代器的两个重载里，列表要先选到前一个
+fn template_for(inout c: Ctx, qn: str, t: int, line: int, col: int) -> int {
+    if t < 0 { return -1 }
+    for bare in [false, true] {
+        for i in 0..len(c.fns) {
+            if c.fns[i].uname == qn && is_template(c, i) && len(c.fns[i].ptexts) > 0 && has(c.fns[i].tvars, c.fns[i].ptexts[0]) == bare {
+                tv = c.fns[i].tvars.copy()
+                bound = fill(len(tv), -1)
+                p0 = c.fns[i].ptexts[0].copy()
+                unify(c, tv, &bound, p0, t, line, col)
+                if !unbound_in(p0, tv, bound) {
+                    tl = if c.fns[i].tok >= 0 { c.toks[c.fns[i].tok].line } else { line }
+                    if resolve_with(&c, p0, tv, bound, tl, col) == t { return i }
+                }
+            }
+        }
+    }
+    -1
+}
+
+// 下标、迭代器的 next 用的函数：先找 t 所在的模块，再找根模块；泛型函数（如 map.index）按第一个参数的类型实例化
+fn sub_fn(inout c: Ctx, name: str, t: int, line: int, col: int) -> int {
+    rm = type_mod(c, t)
+    qn = if rm != "" && count_uname(c, rm + "." + name) > 0 { rm + "." + name } else { name }
+    fi = overload_for(c, qn, t)
+    if fi >= 0 { return fi }
+    gi = template_for(&c, qn, t, line, col)
+    if gi < 0 { return -1 }
+    tv = c.fns[gi].tvars.copy()
+    bound = fill(len(tv), -1)
+    p0 = c.fns[gi].ptexts[0].copy()
+    unify(c, tv, &bound, p0, t, line, col)
+    // [I: Iter[T]] 里只出现在约束中的 T（如 Taken[I] 的 next 返回 T?）由 I 的元素类型确定
+    iter_bind(&c, gi, tv, &bound, line, col)
+    if has(bound, -1) { return -1 }
+    check_bounds(&c, gi, bound, line, col)
+    rn = instantiate(&c, gi, bound)
+    find_fn(c, rn)
+}
+
+fn check_index(inout c: Ctx, e: Expr, tb: int, idx: Expr) -> int {
+    ts = show_ty(c, tb)
+    fi = sub_fn(&c, "index", tb, e.line, e.col)
+    if fi < 0 { fail(e.line, e.col, "#{ts} 不能下标访问：可以定义 fn index(x: #{ts}, i: K) -> V") }
+    check_fn_vis(c, fi, e.line, e.col)
+    ok = len(c.fns[fi].ptys) == 2 && c.fns[fi].pmodes[0] == "read" && c.fns[fi].pmodes[1] == "read" &&
+        !unit_like(c.fns[fi].ret)
+    if !ok { fail(e.line, e.col, "下标读取用的 index 要写成 fn index(x: #{ts}, i: K) -> V（参数只读）") }
+    pi = c.fns[fi].ptys[1]
+    ti = check_expr(&c, idx, pi)
+    expect_ty(c, pi, ti, idx.line, idx.col)
+    c.rkind[e.id] = "index"
+    c.rname[e.id] = c.fns[fi].name
+    opn = c.fns[fi].name.copy()
+    note_mod(&c, opn, e.line)
+    c.fns[fi].ret
+}
+
+// 赋值目标 x[i] 的 x 是不是结构体或枚举（会先检查 x）
+fn index_base_user(inout c: Ctx, target: Expr) -> bool {
+    match target.kind {
+        EIndex(b, _) => {
+            tb = check_expr(&c, b, -1)
+            is_user_ty(c, tb)
+        }
+        _ => false
+    }
+}
+
+fn check_set_index(inout c: Ctx, s: Stmt, target: Expr, rhs: Expr) {
+    match target.kind {
+        EIndex(b, idx) => {
+            tb = c.ety[b.id]
+            ts = show_ty(c, tb)
+            if via_index_op(c, b) {
+                fail(s.line, s.col, "x[i] 是 index 返回的新值，不能给它的字段或元素赋值；请取出、修改后再用 x[i] = v 放回")
+            }
+            fi = sub_fn(&c, "set_index", tb, s.line, s.col)
+            if fi < 0 { fail(s.line, s.col, "#{ts} 不能给下标赋值：可以定义 fn set_index(inout x: #{ts}, i: K, take v: V)") }
+            check_fn_vis(c, fi, s.line, s.col)
+            ok = len(c.fns[fi].ptys) == 3 && c.fns[fi].pmodes[0] == "inout" && c.fns[fi].pmodes[1] == "read" &&
+                c.fns[fi].pmodes[2] == "take" && c.fns[fi].ret == 3
+            if !ok { fail(s.line, s.col, "下标赋值用的 set_index 要写成 fn set_index(inout x: #{ts}, i: K, take v: V)") }
+            pi = c.fns[fi].ptys[1]
+            ti = check_expr(&c, idx, pi)
+            expect_ty(c, pi, ti, idx.line, idx.col)
+            pv = c.fns[fi].ptys[2]
+            tr = check_expr(&c, rhs, pv)
+            expect_ty(c, pv, tr, rhs.line, rhs.col)
+            c.ety[target.id] = pv
+            c.rkind[s.id] = "setindex"
+            c.rname[s.id] = c.fns[fi].name
+        }
+        _ => {}
+    }
+}
+
+// 位置表达式里是否经过了重载的下标（那里只是一个临时的新值）
+fn via_index_op(c: Ctx, e: Expr) -> bool {
+    match e.kind {
+        EIndex(b, _) => c.rkind[e.id] == "index" || via_index_op(c, b)
+        EField(b, _) => via_index_op(c, b)
+        _ => false
+    }
+}
+
+// ---------- 常量 ----------
+// const N = 值：值在编译时算出，只能是 int / bool / str / float（float 只支持 + - * / %）。值里可以写字面量、别的常量（可以先使用后声明）、
+// 算术、比较、逻辑运算和字符串的 +。用到常量的地方记 rkind = "const"、ridx = 常量编号，代码生成时直接写出值。
+// 小写的常量名按变量解析；大写的按无参调用解析（和无字段的变体一样），两处都会先找常量。
+
+// 先找本模块，再找根模块；限定名 m.N 原样
+fn find_const(c: Ctx, name: str, line: int) -> int {
+    m = mod_of(c, line)
+    qn = if m != "" && !has_dot(name) { m + "." + name } else { name }
+    k = index_where(c.knames, |n| n == qn)
+    if k >= 0 || qn == name { return k }
+    index_where(c.knames, |n| n == name)
+}
+
+fn use_const(inout c: Ctx, e: Expr, k: int) -> int {
+    check_vis(c, c.knames[k], e.line, e.col)
+    t = const_ty(&c, k, e.line, e.col)
+    c.rkind[e.id] = "const"
+    c.ridx[e.id] = k
+    t
+}
+
+fn is_const_ref(c: Ctx, e: Expr) -> bool {
+    match e.kind {
+        EVar(_) => c.rkind[e.id] == "const"
+        _ => false
+    }
+}
+
+// 按需求值；正在求值时又用到自己就是循环定义
+fn const_ty(inout c: Ctx, k: int, line: int, col: int) -> int {
+    if c.kstate[k] == 1 { fail(line, col, "常量 #{c.knames[k]} 的定义里（直接或间接地）用到了它自己") }
+    if c.kstate[k] == 0 {
+        c.kstate[k] = 1
+        e = c.kexprs[k].copy()
+        v = cval(&c, e)
+        c.ktys[k] = v.ty
+        c.kints[k] = v.i
+        c.kstrs[k] = v.s
+        c.kstate[k] = 2
+    }
+    c.ktys[k]
+}
+
+fn cv_int(n: int) -> CV { CV(ty: 0, i: n, s: "") }
+
+fn cv_bool(b: bool) -> CV { CV(ty: 1, i: if b { 1 } else { 0 }, s: "") }
+
+fn cval(inout c: Ctx, e: Expr) -> CV {
+    match e.kind {
+        EInt(n) => cv_int(n)
+        EFloat(s) => CV(ty: 9, i: 0, s: s)
+        EBool(b) => cv_bool(b)
+        EStr(s) => CV(ty: 2, i: 0, s: s)
+        EVar(n) => cref(&c, n, e)
+        ECall(n, args, method) => {
+            if method || len(args) > 0 { fail(e.line, e.col, "常量的值只能用字面量、别的常量和运算，不能调用函数") }
+            cref(&c, n, e)
+        }
+        EUnary(op, a) => {
+            v = cval(&c, a)
+            if op == "-" && v.ty == 0 {
+                if v.i == int_min() { fail(e.line, e.col, "常量表达式的结果超出 int 的范围") }
+                cv_int(0 - v.i)
+            } else if op == "-" && v.ty == 9 {
+                CV(ty: 9, i: 0, s: "(-" + v.s + ")")
+            } else if op == "!" && v.ty == 0 {
+                cv_int(bit_not(v.i))
+            } else if op == "!" && v.ty == 1 {
+                cv_bool(v.i == 0)
+            } else {
+                fail(e.line, e.col, "常量表达式不支持 #{op}#{show_ty(c, v.ty)}")
+                exit(1)
+            }
+        }
+        EBinary(op, a, b) => cbin(&c, e, op, a, b)
+        _ => {
+            fail(e.line, e.col, "常量的值只能用字面量、别的常量和运算")
+            exit(1)
+        }
+    }
+}
+
+fn cref(inout c: Ctx, name: str, e: Expr) -> CV {
+    k = find_const(c, name, e.line)
+    if k < 0 { fail(e.line, e.col, "常量的值里只能引用别的常量，#{name} 不是常量") }
+    check_vis(c, c.knames[k], e.line, e.col)
+    t = const_ty(&c, k, e.line, e.col)
+    CV(ty: t, i: c.kints[k], s: c.kstrs[k].copy())
+}
+
+fn cbin(inout c: Ctx, e: Expr, op: str, a: Expr, b: Expr) -> CV {
+    x = cval(&c, a)
+    y = cval(&c, b)
+    if x.ty != y.ty { fail(e.line, e.col, "运算两侧类型不同：#{show_ty(c, x.ty)} 与 #{show_ty(c, y.ty)}") }
+    t = x.ty
+    if t == 0 && (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") {
+        if (op == "/" || op == "%") && y.i == 0 { fail(e.line, e.col, "常量表达式里除以 0") }
+        ovf = (op == "+" && !add_ok(x.i, y.i)) || (op == "-" && !sub_ok(x.i, y.i)) || (op == "*" && !mul_ok(x.i, y.i)) ||
+            (op == "/" && x.i == int_min() && y.i == -1)
+        if ovf { fail(e.line, e.col, "常量表达式的结果超出 int 的范围") }
+        r = if op == "+" { x.i + y.i } else if op == "-" { x.i - y.i } else if op == "*" { x.i * y.i } else if op == "/" { x.i / y.i } else { x.i % y.i }
+        return cv_int(r)
+    }
+    if t == 0 && is_bit_op(op) {
+        if (op == "<<" || op == ">>" || op == ">>>") && (y.i < 0 || y.i > 63) {
+            fail(e.line, e.col, "常量表达式里移位数 #{y.i} 超出 0..63")
+        }
+        return cv_int(const_bit(op, x.i, y.i))
+    }
+    if t == 2 && op == "+" { return CV(ty: 2, i: 0, s: x.s + y.s) }
+    if t == 9 {
+        // float 常量不在编译时算（编译器自己没有浮点数），记成 C 的常量表达式，由 C 编译器算
+        if op == "+" || op == "-" || op == "*" || op == "/" { return CV(ty: 9, i: 0, s: "(" + x.s + " " + op + " " + y.s + ")") }
+        if op == "%" { return CV(ty: 9, i: 0, s: "fmod(" + x.s + ", " + y.s + ")") }
+        fail(e.line, e.col, "float 常量只支持 + - * / %，不能比较")
+    }
+    if op == "==" || op == "!=" {
+        same = if t == 2 { x.s == y.s } else { x.i == y.i }
+        return cv_bool(if op == "==" { same } else { !same })
+    }
+    if (t == 0 || t == 2) && (op == "<" || op == "<=" || op == ">" || op == ">=") {
+        d = 0
+        if t == 2 {
+            d = if x.s < y.s { -1 } else if x.s == y.s { 0 } else { 1 }
+        } else {
+            d = if x.i < y.i { -1 } else if x.i == y.i { 0 } else { 1 }
+        }
+        ok = if op == "<" { d < 0 } else if op == "<=" { d <= 0 } else if op == ">" { d > 0 } else { d >= 0 }
+        return cv_bool(ok)
+    }
+    if t == 1 && op == "&&" { return cv_bool(x.i != 0 && y.i != 0) }
+    if t == 1 && op == "||" { return cv_bool(x.i != 0 || y.i != 0) }
+    fail(e.line, e.col, "常量表达式不支持 #{show_ty(c, t)} 的运算 #{op}")
+    exit(1)
+}
+
+// ---------- 自定义迭代器 ----------
+// for x in it：it 不是列表时，它的类型要有 fn next(inout it: T) -> E?。迭代器归循环所有（it 被移走），
+// 每轮调用 next：Some(v) 时 v 归循环变量 x 所有（可以移走），None 时结束。
+// 语句节点上记 rkind = "iter"、rname = next 的内部名字（见 gen_iter_for）。
+//
+// 借用遍历：没有 next、但有 fn iter_len(x: T) -> int 和 fn iter_at(x: T, i: int) -> E（参数只读）时，
+// 循环借用 it（和列表一样，循环期间不能修改），每轮 x 拥有 iter_at(it, i) 给的值，i 从 0 到 iter_len(it) - 1。
+// 语句节点上记 rkind = "at"、rname = iter_at 的内部名字、ridx = iter_len 在 fns 里的下标（见 gen_at_for）。
+fn check_iter(inout c: Ctx, s: Stmt, ti: int, it: Expr) -> int {
+    ts = show_ty(c, ti)
+    fi = if is_user_ty(c, ti) { sub_fn(&c, "next", ti, it.line, it.col) } else { -1 }
+    if fi < 0 && is_user_ty(c, ti) {
+        li = sub_fn(&c, "iter_len", ti, it.line, it.col)
+        ai = sub_fn(&c, "iter_at", ti, it.line, it.col)
+        if li >= 0 && ai >= 0 {
+            check_fn_vis(c, li, it.line, it.col)
+            check_fn_vis(c, ai, it.line, it.col)
+            if !at_sig_ok(c, li, ai) {
+                fail(it.line, it.col, "借用遍历要写成 fn iter_len(x: #{ts}) -> int 和 fn iter_at(x: #{ts}, i: int) -> E（参数只读）")
+            }
+            c.rkind[s.id] = "at"
+            c.rname[s.id] = c.fns[ai].name
+            c.ridx[s.id] = li
+            return c.fns[ai].ret
+        }
+    }
+    if fi < 0 {
+        fail(it.line, it.col, "for in 需要列表，或者定义了 fn next(inout it: #{ts}) -> T? 的迭代器，而不是 #{ts}")
+    }
+    check_fn_vis(c, fi, it.line, it.col)
+    ok = len(c.fns[fi].ptys) == 1 && c.fns[fi].pmodes[0] == "inout" && tkind(c, c.fns[fi].ret) == "opt"
+    if !ok { fail(it.line, it.col, "迭代器的 next 要写成 fn next(inout it: #{ts}) -> T?") }
+    c.rkind[s.id] = "iter"
+    c.rname[s.id] = c.fns[fi].name
+    telem(c, c.fns[fi].ret)
+}
+
+fn at_sig_ok(c: Ctx, li: int, ai: int) -> bool {
+    len(c.fns[li].ptys) == 1 && c.fns[li].pmodes[0] == "read" && c.fns[li].ret == 0 && len(c.fns[ai].ptys) == 2 &&
+        c.fns[ai].pmodes[0] == "read" && c.fns[ai].pmodes[1] == "read" && c.fns[ai].ptys[1] == 0 && !unit_like(c.fns[ai].ret)
+}
+
+// 约束 Iter[T]：类型是 for in 的来源（列表、有 next 的迭代器，或者能借用遍历的类型），元素类型是 T。
+// 约束 Next[T]：只能是有 next 的迭代器，惰性适配器要在里面调用 next(&src)
+fn is_iter_bound(b: str) -> bool {
+    len(b) > 6 && (slice(b, 0, 5) == "Iter[" || slice(b, 0, 5) == "Next[") && byte_at(b, len(b) - 1) == ']'
+}
+
+fn is_next_bound(b: str) -> bool { is_iter_bound(b) && slice(b, 0, 5) == "Next[" }
+
+// 按约束 b（Iter[…] 或 Next[…]）t 的元素类型；不满足时为 -1
+fn bound_elem(inout c: Ctx, b: str, t: int) -> int {
+    if is_next_bound(b) { next_elem(&c, t) } else { iter_elem(&c, t) }
+}
+
+fn iter_miss(c: Ctx, b: str, t: int) -> str {
+    ts = show_ty(c, t)
+    if is_next_bound(b) && tkind(c, t) == "list" {
+        return "#{ts} 不满足 Next：需要定义了 fn next(inout it: T) -> E? 的迭代器；列表可以先用 iter.each(xs) 包成迭代器"
+    }
+    if is_next_bound(b) { "#{ts} 不满足 Next：需要定义了 fn next(inout it: #{ts}) -> T? 的迭代器" } else { "#{ts} 不满足 Iter：需要列表，或者定义了 fn next(inout it: #{ts}) -> T? 的迭代器" }
+}
+
+// t 作为 for in 的来源时元素的类型：列表是元素类型，迭代器是 next 返回的 E? 里的 E，借用遍历是 iter_at 的返回类型；
+// 都不是时为 -1
+fn iter_elem(inout c: Ctx, t: int) -> int {
+    if t < 0 { return -1 }
+    if tkind(c, t) == "list" { return telem(c, t) }
+    e = next_elem(&c, t)
+    if e >= 0 { e } else { at_elem(&c, t) }
+}
+
+// 有 next 的迭代器的元素类型；不是时为 -1
+fn next_elem(inout c: Ctx, t: int) -> int {
+    fi = if is_user_ty(c, t) { sub_fn(&c, "next", t, 0, 0) } else { -1 }
+    if fi < 0 { return -1 }
+    ok = len(c.fns[fi].ptys) == 1 && c.fns[fi].pmodes[0] == "inout" && tkind(c, c.fns[fi].ret) == "opt"
+    if ok { telem(c, c.fns[fi].ret) } else { -1 }
+}
+
+// 能借用遍历的类型的元素类型；不是时为 -1
+fn at_elem(inout c: Ctx, t: int) -> int {
+    if !is_user_ty(c, t) { return -1 }
+    li = sub_fn(&c, "iter_len", t, 0, 0)
+    ai = sub_fn(&c, "iter_at", t, 0, 0)
+    if li < 0 || ai < 0 || !at_sig_ok(c, li, ai) { return -1 }
+    c.fns[ai].ret
+}
+
+fn iter_bind(inout c: Ctx, gi: int, tv: [str], inout bound: [int], line: int, col: int) {
+    for k in 0..len(tv) {
+        bs = c.fns[gi].tbounds[k].copy()
+        if bs != "" && bound[k] >= 0 {
+            bk = bound[k]
+            parts = split_plus(bs)
+            for b in parts {
+                if is_iter_bound(b) {
+                    el = bound_elem(&c, b, bk)
+                    // 这里就报错：否则会先报“无法推断 T”
+                    if el < 0 { fail(line, col, iter_miss(c, b, bk)) }
+                    unify(c, tv, &bound, slice(b, 5, len(b) - 1), el, line, col)
+                }
+            }
+        }
+    }
+}
+
+// ---------- 插值 ----------
+// "#{x}"：int / bool / str / float 直接拼；其它类型先找 fn show(x: T) -> str（按 x 的类型重载，参数只读），
+// 没有的话列表、T?、元组按元素拼成 [1, 2]、Some(x) / None、(a, b)（里面的字符串加引号）。
+// 结构体和枚举要自己写 show。代码生成见 register_show / show_def。
+
+fn show_fn(c: Ctx, t: int) -> int {
+    fi = find_op(c, "show", t)
+    if fi >= 0 && !is_template(c, fi) { return fi }
+    k = index_where(c.show_tys, |s| s == t)
+    if k >= 0 { c.show_fis[k] } else { -1 }
+}
+
+// 插值 "#{x}" 要的 fn show(x: T) -> str。T 是自己的类型、只有泛型的 show（比如 std/map 的 show[K, V]）时，
+// 在这里实例化并记下来（show_tys / show_fis），代码生成时 show_fn 就找得到
+fn check_show(inout c: Ctx, t: int, line: int, col: int) {
+    if t == 0 || t == 1 || t == 2 || t == 9 || is_fixed(t) { return }
+    ts = show_ty(c, t)
+    fi = show_fn(c, t)
+    if fi < 0 && is_user_ty(c, t) {
+        fi = sub_fn(&c, "show", t, line, col)
+        if fi >= 0 {
+            c.show_tys.push(t)
+            c.show_fis.push(fi)
+        }
+    }
+    if fi >= 0 {
+        check_fn_vis(c, fi, line, col)
+        ok = len(c.fns[fi].ptys) == 1 && c.fns[fi].pmodes[0] == "read" && c.fns[fi].ret == 2
+        if !ok { fail(line, col, "插值用的 show 要写成 fn show(x: #{ts}) -> str（参数只读）") }
+        return
+    }
+    k = tkind(c, t)
+    if k == "list" || k == "opt" {
+        check_show(&c, telem(c, t), line, col)
+    } else if is_tuple(c, t) {
+        es = tuple_elems(c, t)
+        for el in es { check_show(&c, el, line, col) }
+    } else {
+        fail(line, col, "#{ts} 不能直接插值：可以定义 fn show(x: #{ts}) -> str")
+    }
+}
+
+fn check_call(inout c: Ctx, e: Expr, name: str, args: [Arg], method: bool, expect: int) -> int {
+    if (name == "None" || name == "Some" || name == "Ok" || name == "Err") && !method {
+        return check_opt_ctor(&c, e, name, args, expect)
+    }
+    // 大写开头的常量解析成无参调用（见 parse_primary），这里认出来
+    ck0 = if method || len(args) > 0 { -1 } else { find_const(c, name, e.line) }
+    if ck0 >= 0 { return use_const(&c, e, ck0) }
+    if name == "spawn" && !method && count_uname(c, name) == 0 {
+        return check_spawn(&c, e, args)
+    }
+    if name == "downcast" && count_uname(c, name) == 0 {
+        return check_downcast(&c, e, args, expect)
+    }
+    if name == "chan" && !method && count_uname(c, name) == 0 {
+        if len(args) != 0 { fail(e.line, e.col, "chan() 不带参数") }
+        if !is_chan(c, expect) { fail(e.line, e.col, "chan() 需要类型标注，例如 ch: Chan[int] = chan()") }
+        c.rkind[e.id] = "builtin"
+        c.rname[e.id] = "chan"
+        return expect
+    }
+    rk = ""
+    rn = name
+    ri = 0
+    pre: [int] = []
+    ofirst = -1     // 重载解析时已经检查过的第一个实参的类型
+    // 调用函数类型的参数 f(x)：局部变量优先于同名函数
+    lv = if method { -1 } else { lookup(c, name) }
+    if lv >= 0 && is_callable(c, c.locals[lv].ty) {
+        note_use(&c, lv)
+        rk = "closure"
+        ri = c.locals[lv].ty
+        c.vid[e.id] = lv
+    }
+    // 名字解析：方法调用先找接收者类型所在的模块（方法属于类型）；
+    // 其它情况：限定名 m.x 原样，否则先找本模块，再找根模块
+    qn = resolve_name(c, name, e.line)
+    if rk != "closure" && method && len(args) > 0 && !has_dot(name) {
+        ofirst = check_expr(&c, args[0].value, -1)
+        rm = type_mod(c, ofirst)
+        if rm != "" && item_exists(c, rm + "." + name) { qn = rm + "." + name }
+        chan_close = name == "close" && is_chan(c, ofirst)
+        if !chan_close && !item_exists(c, qn) && !is_builtin(name) && lookup(c, name) < 0 {
+            ext = ext_method(c, name, e.line, e.col)
+            if ext != "" { qn = ext }
+        }
+    }
+    // ch.close()：通道的 close 只能用方法语法调用，所以 close 这个名字别的模块照样可以用（io.close、net.close）
+    if rk != "closure" && method && name == "close" && ofirst >= 0 && is_chan(c, ofirst) {
+        rk = "builtin"
+        rn = "chan_close"
+    }
+    vname = last_part(name)
+    vis = qn        // 检查可见性用的名字（变体看它的枚举）
+    gti = if rk == "closure" || rk == "builtin" { -1 } else { find_tdecl(c, qn) }
+    if gti >= 0 && c.tdecls[gti].kind != "struct" { gti = -1 }
+    if gti < 0 && rk != "closure" && rk != "builtin" { gti = tvariant_at(c, name, e.line) }
+    if rk == "closure" || rk == "builtin" {
+        // 已在上面解析
+    } else if method && is_dyn(c, ofirst) && dyn_method(c, ofirst, name) >= 0 {
+        // dyn 值的方法：运行时经虚表调用
+        rk = "dyn"
+        rn = name
+        ri = ofirst
+    } else if gti >= 0 {
+        // 泛型结构体 / 变体：确定类型实参后改为构造对应的实例
+        if method { fail(e.line, e.col, "#{name} 不能用方法语法调用") }
+        gvi = if c.tdecls[gti].kind == "struct" { 0 } else { gvariant_index(c, gti, vname) }
+        vis = c.tdecls[gti].name
+        targs = targs_from_expect(c, gti, expect)
+        if len(targs) == 0 {
+            pre = fill(len(args), -1)
+            targs = infer_ctor(&c, gti, gvi, &pre, args, e.line, e.col)
+        }
+        rn = instantiate_type(&c, gti, targs)
+        if c.tdecls[gti].kind == "struct" {
+            rk = "struct"
+        } else {
+            rk = "variant"
+            ri = gvi
+        }
+    } else if find_struct(c, qn) >= 0 {
+        rk = "struct"
+        rn = qn
+    } else if variant_enum_at(c, name, e.line) >= 0 {
+        ei = variant_enum_at(c, name, e.line)
+        rk = "variant"
+        rn = c.enums[ei].name
+        vis = rn
+        ri = variant_index(c, ei, vname)
+    } else if count_uname(c, qn) > 0 {
+        rk = "fn"
+        rn = qn
+        if count_uname(c, qn) > 1 {
+            if len(args) == 0 { fail(e.line, e.col, "#{name} 是重载的函数，至少需要一个参数") }
+            if ofirst < 0 { ofirst = check_expr(&c, args[0].value, -1) }
+            oi = overload_for(c, qn, ofirst)
+            if oi < 0 { oi = template_for(&c, qn, ofirst, e.line, e.col) }
+            if oi < 0 { fail(e.line, e.col, "没有第一个参数为 #{show_ty(c, ofirst)} 的 #{name}") }
+            rn = c.fns[oi].name
+        }
+    } else if is_builtin(name) {
+        rk = "builtin"
+        // len(x)：x 是自己的类型时调用它的 fn iter_len(x: T) -> int（容器的元素个数，和借用遍历用的是同一个）
+        if name == "len" && len(args) == 1 {
+            if ofirst < 0 { ofirst = check_expr(&c, args[0].value, -1) }
+            li = if is_user_ty(c, ofirst) { sub_fn(&c, "iter_len", ofirst, e.line, e.col) } else { -1 }
+            if li >= 0 {
+                if len(c.fns[li].ptys) != 1 || c.fns[li].pmodes[0] != "read" || c.fns[li].ret != 0 {
+                    fail(e.line, e.col, "len 要调用 fn iter_len(x: #{show_ty(c, ofirst)}) -> int（参数只读）")
+                }
+                rk = "fn"
+                rn = c.fns[li].name
+            }
+        }
+    } else if has_dot(name) && is_protocol_fn(c, vname) && count_uname(c, vname) > 0 {
+        // hash、show、eq 这类接口方法不属于哪个模块（任何模块里给自己的类型写的都要被泛型代码找到），所以不能加模块名
+        fail(e.line, e.col, "#{vname} 是接口方法，不属于模块 #{mod_part(name)}，不用加模块名：直接写 #{vname}(…)")
+    } else {
+        fail(e.line, e.col, "未定义的函数 #{name}" + did_you_mean(name, call_cands(c)))
+    }
+    if rk == "struct" || rk == "variant" {
+        check_vis(c, vis, e.line, e.col)
+        if rk == "struct" { ctor_vis(c, rn, e.line, e.col) }
+    } else if rk == "fn" {
+        check_fn_vis(c, find_fn(c, rn), e.line, e.col)
+    }
+    // 泛型函数：推断出类型实参（见 infer_targs）后实例化，调用改为指向实例
+    if rk == "fn" && is_template(c, find_fn(c, rn)) {
+        gi = find_fn(c, rn)
+        pre = fill(len(args), -1)
+        // 方法调用和重载时第一个参数已经检查过（ofirst），不再检查一遍：里面的闭包只能登记一次
+        if ofirst >= 0 && len(args) > 0 && !is_closure(args[0].value) { pre[0] = ofirst }
+        bound = infer_targs(&c, gi, &pre, args, expect, e.line, e.col)
+        check_bounds(&c, gi, bound, e.line, e.col)
+        rn = instantiate(&c, gi, bound)
+    }
+    if rk == "fn" && has(c.dtor_fn, find_fn(c, rn)) {
+        fail(e.line, e.col, "析构函数 drop 会在值被销毁时自动调用，不能直接调用")
+    }
+    c.rkind[e.id] = rk
+    c.rname[e.id] = rn
+    note_mod(&c, rn, e.line)
+    c.ridx[e.id] = ri
+    is_ctor = rk == "struct" || rk == "variant"
+    if is_ctor && method { fail(e.line, e.col, "#{name} 不能用方法语法调用") }
+    for a in args {
+        if !is_ctor && a.label != "" { fail(e.line, e.col, "函数参数不能带名字") }
+        if is_ctor && a.amp { fail(e.line, e.col, "构造时不能写 &") }
+    }
+    // 先检查第一个参数：泛型内置函数和方法调用靠它确定签名
+    first = ofirst
+    if first < 0 && (method || is_generic(rk, rn)) && len(args) > 0 && len(pre) == 0 {
+        first = check_expr(&c, args[0].value, -1)
+    }
+    if rk == "builtin" && (rn == "send" || rn == "recv") && first >= 0 {
+        if !is_chan(c, first) { fail(e.line, e.col, "#{rn} 需要 Chan[T]，而不是 #{show_ty(c, first)}") }
+        _ot = intern(&c.tt, "opt", "", telem(c, first))
+    }
+    if rk == "builtin" && rn == "try_pop" && first >= 0 && tkind(c, first) == "list" {
+        if unit_like(telem(c, first)) { fail(e.line, e.col, "() 的列表不能 try_pop（() 不能是可选类型）") }
+        _ot = intern(&c.tt, "opt", "", telem(c, first))
+    }
+    if rk == "builtin" && rn == "mutex" && first >= 0 {
+        if unit_like(first) || is_fn_ty(c, first) { fail(e.line, e.col, "#{show_ty(c, first)} 不能放进 Mutex") }
+        _mt0 = intern(&c.tt, "mutex", "", first)
+    }
+    if rk == "builtin" && rn == "share" && first >= 0 {
+        if unit_like(first) || is_fn_ty(c, first) { fail(e.line, e.col, "#{show_ty(c, first)} 不能 share") }
+        seen: [int] = []
+        cell = cell_in(c, first, &seen)
+        if cell >= 0 {
+            fail(e.line, e.col, "shared 的内容是只读的，不能包含 #{show_ty(c, cell)}（lock、send 会经由 shared 修改它）：要在任务间共用 Mutex 或 Chan，直接传它的 .copy()")
+        }
+        _st0 = intern(&c.tt, "shared", "", first)
+    }
+    if rk == "builtin" && rn == "assert_eq" && first >= 0 {
+        if !is_eq(c, first) { fail(e.line, e.col, "assert_eq 的两边要能用 == 比较，#{show_ty(c, first)} 不行") }
+        check_show(&c, first, e.line, e.col)
+    }
+    sg = sig_of(c, rk, rn, ri, first, e.line, e.col)
+    if len(args) != len(sg.tys) {
+        fail(e.line, e.col, "#{name} 需要 #{len(sg.tys)} 个参数，给了 #{len(args)} 个")
+    }
+    order: [int] = []
+    if is_ctor {
+        order = ctor_order(c, rk, rn, ri, args)
+        fnames = ctor_fnames(c, rk, rn, ri)
+        for k in 0..len(order) {
+            if order[k] < 0 { fail(e.line, e.col, "缺少字段 #{fnames[k]}") }
+            for j in 0..k {
+                if order[j] == order[k] { fail(e.line, e.col, "字段 #{fnames[k]} 重复") }
+            }
+        }
+    } else {
+        for i in 0..len(args) { order.push(i) }
+    }
+    for k in 0..len(order) {
+        i = order[k]
+        pt = sg.tys[k]
+        m = sg.modes[k]
+        t = 0
+        if len(pre) > 0 {
+            t = pre[i]
+        } else if i == 0 && first >= 0 {
+            t = first
+        } else {
+            t = check_expr(&c, args[i].value, pt)
+        }
+        // Fn 值可以直接借给 fn 参数（两者在 C 里布局相同）
+        if !ofn_fits(c, pt, t) { expect_ty(c, pt, t, args[i].value.line, args[i].value.col) }
+        if !is_ctor {
+            amp = args[i].amp
+            if method && i == 0 {
+                amp = m == "inout"
+                c.ampx[args[i].value.id] = amp
+            }
+            if m == "inout" && !amp { fail(args[i].value.line, args[i].value.col, "inout 参数需要写成 &x") }
+            if m != "inout" && amp { fail(args[i].value.line, args[i].value.col, "只有 inout 参数可以写 &") }
+            if m == "inout" && !is_place(args[i].value) {
+                fail(args[i].value.line, args[i].value.col, "& 只能用于变量、字段或下标")
+            }
+            if m == "inout" && is_const_ref(c, args[i].value) {
+                fail(args[i].value.line, args[i].value.col, "常量不能作为 inout 参数")
+            }
+            if m == "inout" && via_index_op(c, args[i].value) {
+                fail(args[i].value.line, args[i].value.col, "x[i] 是 index 返回的新值，不能作为 inout 参数修改；请取出、修改后再用 x[i] = v 放回")
+            }
+        }
+    }
+    sg.ret
+}
+
+// ---------- 泛型函数 ----------
+// 模板本身不做检查。每次调用按实参类型推断出类型实参，同一组类型实参只实例化一次；
+// 实例从模板的 token 重新解析（节点 id 全新），放进 c.insts，在普通函数之后依次检查。
+
+// 把参数类型原文 pat 和实参类型 t 对齐，记下类型参数对应的类型
+fn unify(c: Ctx, tvars: [str], inout bound: [int], pat: str, t: int, line: int, col: int) {
+    if t < 0 || t == 4 || t == 5 { return }
+    for k in 0..len(tvars) {
+        if pat == tvars[k] {
+            if is_fn_ty(c, t) { fail(line, col, "类型参数 #{pat} 不能是函数类型") }
+            if bound[k] < 0 {
+                bound[k] = t
+            } else if bound[k] != t {
+                old = bound[k]
+                fail(line, col, "类型参数 #{pat} 既是 #{show_ty(c, old)} 又是 #{show_ty(c, t)}")
+            }
+            return
+        }
+    }
+    n = len(pat)
+    if n > 3 && (slice(pat, 0, 3) == "fn(" || slice(pat, 0, 3) == "Fn(") {
+        // fn(A) -> B 对上闭包或 Fn 值的函数类型：逐个对齐参数和返回类型
+        if is_callable(c, t) {
+            parts = split_fn(pat)
+            fps = fn_params(c, t)
+            if len(parts) - 1 == len(fps) {
+                for q in 1..len(parts) {
+                    pq = fps[q - 1]
+                    unify(c, tvars, &bound, parts[q], pq, line, col)
+                }
+                unify(c, tvars, &bound, parts[0], telem(c, t), line, col)
+            }
+        }
+        return
+    }
+    if n > 2 && byte_at(pat, n - 1) == '>' && tkind(c, t) == "res" {
+        // T!<E> 对上结果类型：分别对齐值和错误
+        j = n - 1
+        depth = 0
+        for j >= 0 {
+            b = byte_at(pat, j)
+            if b == '>' { depth += 1 }
+            if b == '<' {
+                depth -= 1
+                if depth == 0 { break }
+            }
+            j -= 1
+        }
+        unify(c, tvars, &bound, slice(pat, 0, j - 1), telem(c, t), line, col)
+        unify(c, tvars, &bound, slice(pat, j + 1, n - 1), res_err(c, t), line, col)
+        return
+    }
+    if n > 1 && byte_at(pat, n - 1) == '?' && tkind(c, t) == "opt" {
+        unify(c, tvars, &bound, slice(pat, 0, n - 1), telem(c, t), line, col)
+    } else if n > 1 && byte_at(pat, n - 1) == '!' && tkind(c, t) == "res" {
+        unify(c, tvars, &bound, slice(pat, 0, n - 1), telem(c, t), line, col)
+    } else if n > 1 && byte_at(pat, 0) == '@' && is_shared(c, t) {
+        unify(c, tvars, &bound, slice(pat, 1, n), telem(c, t), line, col)
+    } else if n > 2 && byte_at(pat, 0) == '(' && is_tuple(c, t) {
+        // (A, B) 对上元组：逐个对齐元素
+        tps = split_tuple(pat)
+        tes = tuple_elems(c, t)
+        if len(tps) == len(tes) {
+            for q in 0..len(tps) { unify(c, tvars, &bound, tps[q], tes[q], line, col) }
+        }
+    } else if n > 2 && byte_at(pat, 0) == '[' && tkind(c, t) == "list" {
+        unify(c, tvars, &bound, slice(pat, 1, n - 1), telem(c, t), line, col)
+    } else if n > 2 && byte_at(pat, 0) != '[' && byte_at(pat, n - 1) == ']' && inst_of(c, t) >= 0 {
+        // Pair[A,B] 对上 Pair[int, str] 的实例：逐个对齐类型实参
+        parts = split_generic(pat)
+        ki = inst_of(c, t)
+        // 模板里的类型名可能没带模块前缀，按最后一段比较
+        if last_part(c.tinsts[ki].origin) == last_part(parts[0]) && len(parts) - 1 == len(c.tinsts[ki].targs) {
+            for a in 1..len(parts) {
+                ta = c.tinsts[ki].targs[a - 1]
+                unify(c, tvars, &bound, parts[a], ta, line, col)
+            }
+        }
+    }
+}
+
+// 先检查非闭包的实参并对齐；再检查闭包：闭包的参数类型必须已经确定，返回类型可以由闭包体推断。
+// 直接写的函数名（sort.sort_by(&xs, less)）和闭包一样放到后面检查；它不是重载、不是泛型时，先用它的签名帮着推断类型参数。
+// 检查结果按实参下标写进 pre，之后 check_call 不再重复检查。
+fn infer_targs(inout c: Ctx, gi: int, inout pre: [int], args: [Arg], expect: int, line: int, col: int) -> [int] {
+    np = len(c.fns[gi].ptexts)
+    gname = c.fns[gi].name
+    if len(args) != np {
+        fail(line, col, "#{gname} 需要 #{np} 个参数，给了 #{len(args)} 个")
+    }
+    tv = c.fns[gi].tvars.copy()
+    texts = c.fns[gi].ptexts.copy()
+    bound = fill(len(tv), -1)
+    late: [bool] = []
+    for i in 0..len(args) {
+        fv = pre[i] < 0 && fn_arg(c, args[i].value, texts[i])
+        late.push(is_closure(args[i].value) || fv)
+        if fv {
+            ft = fn_name_ty(&c, args[i].value)
+            if ft >= 0 && slice(texts[i], 0, 3) == "fn(" { unify(c, tv, &bound, texts[i], ft, args[i].value.line, args[i].value.col) }
+        } else if !late[i] {
+            t = if pre[i] >= 0 { pre[i] } else { check_expr(&c, args[i].value, -1) }
+            pre[i] = t
+            unify(c, tv, &bound, texts[i], t, args[i].value.line, args[i].value.col)
+        }
+    }
+    // [I: Iter[T]]：I 确定后 T 就是它的元素类型，闭包参数的类型才推得出来
+    iter_bind(&c, gi, tv, &bound, line, col)
+    for i in 0..len(args) {
+        if late[i] {
+            al = args[i].value.line
+            ac = args[i].value.col
+            tl = if c.fns[gi].tok >= 0 { c.toks[c.fns[gi].tok].line } else { al }
+            want = closure_expect(&c, tv, bound, texts[i], al, ac, tl)
+            t = check_expr(&c, args[i].value, want)
+            pre[i] = t
+            unify(c, tv, &bound, texts[i], t, al, ac)
+        }
+    }
+    // 参数推断不出的类型参数（如 map.new[K, V]() -> Map[K, V]），用期望的返回类型补上：
+    // m: map.Map[str, int] = map.new()
+    if expect >= 0 && has(bound, -1) {
+        rt = c.fns[gi].rtext
+        unify(c, tv, &bound, rt, expect, line, col)
+        if has(bound, -1) && is_box(c, expect) { unify(c, tv, &bound, rt, telem(c, expect), line, col) }
+    }
+    for k in 0..len(bound) {
+        if bound[k] < 0 {
+            fail(line, col, "无法从参数推断 #{gname} 的类型参数 #{tv[k]}")
+        }
+    }
+    bound
+}
+
+// 实参是直接写的函数名、形参是函数类型：名字不是局部变量和常量，而是函数
+fn fn_arg(c: Ctx, e: Expr, text: str) -> bool {
+    if !(len(text) > 3 && (slice(text, 0, 3) == "fn(" || slice(text, 0, 3) == "Fn(")) { return false }
+    match e.kind {
+        EVar(name) => lookup(c, name) < 0 && find_const(c, name, e.line) < 0 && count_uname(c, resolve_name(c, name, e.line)) > 0
+        _ => false
+    }
+}
+
+// 直接写的函数名只有一个、不是泛型时，它的函数类型（用来推断类型参数）；否则 -1，等形参的类型确定后再按它挑
+fn fn_name_ty(inout c: Ctx, e: Expr) -> int {
+    match e.kind {
+        EVar(name) => {
+            qn = resolve_name(c, name, e.line)
+            if count_uname(c, qn) != 1 { return -1 }
+            fi = index_where(c.fns, |f| f.uname == qn)
+            if fi < 0 || is_template(c, fi) { return -1 }
+            ps = c.fns[fi].ptys.copy()
+            fn_ty_of(&c, ps, c.fns[fi].ret)
+        }
+        _ => -1
+    }
+}
+
+// 泛型参数是 fn(T) -> U 或 Fn(T) -> U 时，按已经确定的类型参数算出闭包的期望类型；返回类型还不确定时记为 unknown（5）
+// tl 是模板所在的行：模板里的类型名按模板所在的模块解析
+fn closure_expect(inout c: Ctx, tv: [str], bound: [int], text: str, line: int, col: int, tl: int) -> int {
+    stored = len(text) > 3 && slice(text, 0, 3) == "Fn("
+    if !stored && !(len(text) > 3 && slice(text, 0, 3) == "fn(") { fail(line, col, "这个参数的类型是 #{text}，不能传闭包") }
+    parts = split_fn(text)
+    ps: [int] = []
+    for k in 1..len(parts) {
+        if unbound_in(parts[k], tv, bound) { fail(line, col, "无法推断闭包参数的类型（#{parts[k]}），请先通过其它参数确定") }
+        pt = resolve_with(&c, parts[k], tv, bound, tl, col)
+        ps.push(pt)
+    }
+    r = 5
+    if !unbound_in(parts[0], tv, bound) { r = resolve_with(&c, parts[0], tv, bound, tl, col) }
+    ft = fn_ty_of(&c, ps, r)
+    if stored { intern(&c.tt, "ofn", tname(c, ft), telem(c, ft)) } else { ft }
+}
+
+// 闭包只能出现在期望函数类型的位置（即直接作为参数传入）。外层变量按只读方式捕获。
+fn check_closure(inout c: Ctx, e: Expr, params: [Param], body: Expr, expect: int) -> int {
+    if !is_callable(c, expect) {
+        fail(e.line, e.col, "闭包只能用在需要函数类型的地方：直接传给 fn(…) 参数，例如 xs.map(|x| x * 2)，或者存成 Fn(…) 类型的值")
+    }
+    ps = fn_params(c, expect)
+    if len(ps) != len(params) {
+        fail(e.line, e.col, "这里需要 #{len(ps)} 个参数的闭包，写了 #{len(params)} 个")
+    }
+    ret = telem(c, expect)
+    ci = len(c.clos)
+    c.clos.push(Clo(id: e.id, base: len(c.locals), caps: [], owned: is_ofn(c, expect)))
+    c.clo_stack.push(ci)
+    old_loop = c.loop_depth
+    old_labels = replace(&c.labels, [])
+    old_ret = c.cur_ret
+    c.loop_depth = 0
+    c.cur_ret = 3
+    push_scope(&c)
+    for k in 0..len(params) {
+        v = declare(&c, params[k].name, ps[k], "read", params[k].line, params[k].col)
+        c.locals[v].used = true     // 参数属于签名，用不用都不警告
+        c.vid[params[k].id] = v
+    }
+    want = if ret == 5 || ret == 3 { -1 } else { ret }
+    bt = check_expr(&c, body, want)
+    if want >= 0 { expect_ty(c, ret, bt, body.line, body.col) }
+    pop_scope(&c)
+    c.loop_depth = old_loop
+    c.labels = old_labels
+    c.cur_ret = old_ret
+    c.clo_stack.pop()
+    if c.clos[ci].owned {
+        // 捕获的变量会被复制进环境，闭包可能比它们活得更久
+        for v in c.clos[ci].caps {
+            vt = c.locals[v].ty
+            nm = c.locals[v].name
+            if is_fn_ty(c, vt) { fail(e.line, e.col, "Fn 闭包不能捕获函数类型的参数 #{nm}（它是借来的，可能活得没有闭包久）") }
+            if has_dtor(c, vt) { fail(e.line, e.col, "#{nm} 的类型有自定义析构，不能复制进 Fn 闭包") }
+        }
+    }
+    if ret == 5 {
+        if bt == 4 { fail(body.line, body.col, "无法推断闭包的返回类型") }
+        no_fn(c, bt, "闭包的返回类型", body.line, body.col)
+        ft = fn_ty_of(&c, ps, bt)
+        if c.clos[ci].owned { return intern(&c.tt, "ofn", tname(c, ft), telem(c, ft)) }
+        return ft
+    }
+    expect
+}
+
+// 函数名当值用：在需要函数类型的地方写 f，等于写 |a, b| f(a, b)。
+// 要求 f 不是泛型、参数都是只读的，参数和返回类型与需要的一样（重载时按第一个参数的类型选）。
+// name 不是函数时返回 -1；否则返回值的类型（不对时报错）
+fn check_fn_value(inout c: Ctx, e: Expr, name: str, expect: int) -> int {
+    qn = resolve_name(c, name, e.line)
+    n = count_uname(c, qn)
+    if n == 0 { return -1 }
+    if !is_callable(c, expect) {
+        fail(e.line, e.col, "#{name} 是函数：只能在需要函数类型的地方直接写函数名（比如传给 fn(…) 参数），否则请调用它 #{name}(…)")
+    }
+    ps = fn_params(c, expect)
+    fi = -1
+    if n == 1 {
+        for i in 0..len(c.fns) {
+            if c.fns[i].uname == qn { fi = i }
+        }
+    } else if len(ps) > 0 {
+        fi = overload_for(c, qn, ps[0])
+    }
+    if fi < 0 { fail(e.line, e.col, "#{name} 是重载的函数，没有和 #{show_ty(c, expect)} 对得上的那一个") }
+    if is_template(c, fi) { fail(e.line, e.col, "#{name} 是泛型函数，不能直接当值用，请写成闭包 |…| #{name}(…)") }
+    check_fn_vis(c, fi, e.line, e.col)
+    want_ret = telem(c, expect)
+    fret = c.fns[fi].ret
+    same = len(c.fns[fi].ptys) == len(ps) && (want_ret == 5 || want_ret == fret)
+    if same {
+        for k in 0..len(ps) {
+            if c.fns[fi].ptys[k] != ps[k] { same = false }
+        }
+    }
+    if !same {
+        fps = c.fns[fi].ptys.copy()
+        got = fn_ty_of(&c, fps, fret)
+        fail(e.line, e.col, "#{name} 的类型是 #{show_ty(c, got)}，这里需要 #{show_ty(c, expect)}")
+    }
+    for m in c.fns[fi].pmodes {
+        if m != "read" { fail(e.line, e.col, "#{name} 有 take 或 inout 参数，不能直接当值用，请写成闭包 |…| #{name}(…)") }
+    }
+    c.rkind[e.id] = "fnval"
+    c.rname[e.id] = c.fns[fi].name
+    if want_ret != 5 { return expect }
+    ft = fn_ty_of(&c, ps, fret)
+    if is_ofn(c, expect) { return intern(&c.tt, "ofn", tname(c, ft), telem(c, ft)) }
+    ft
+}
+
+// 返回实例的函数名，例如 last__0
+fn instantiate(inout c: Ctx, gi: int, targs: [int]) -> str {
+    ids: [str] = []
+    for t in targs { ids.push(int_str(t)) }
+    key = c.fns[gi].name + "__" + join(ids, "_")
+    if find_fn(c, key) >= 0 { return key }
+    start = c.fns[gi].tok
+    ts = replace(&c.toks, [])
+    p = P(toks: ts, k: start, next_id: c.nodes, mods: c.mods.copy(), nest: 0, elifs: 0)
+    f = parse_fn(&p)
+    c.toks = replace(&p.toks, [])
+    n = p.next_id
+    grow(&c, n)
+    f.name = key
+    // 在类型参数代换下解析签名；可能正在检查别的实例，先保存它的代换
+    tv = c.fns[gi].tvars.copy()
+    ta = targs.copy()
+    old_v = replace(&c.tvars, tv)
+    old_a = replace(&c.targs, ta)
+    modes: [str] = []
+    tys: [int] = []
+    for prm in f.params {
+        modes.push(prm.mode)
+        t = resolve_ty(&c, prm.ty, prm.line, prm.col)
+        if is_fn_ty(c, t) && prm.mode != "read" { fail(prm.line, prm.col, "函数类型的参数只能是只读的") }
+        tys.push(t)
+    }
+    r = resolve_ty(&c, f.ret, f.line, f.col)
+    no_fn(c, r, "返回类型", f.line, f.col)
+    c.tvars = old_v
+    c.targs = old_a
+    tv2 = c.fns[gi].tvars.copy()
+    ta2 = targs.copy()
+    c.fns.push(FInfo(name: key, uname: key, pmodes: modes, ptys: tys, ret: r, tvars: tv2, targs: ta2, ptexts: [], rtext: "", tok: -1, tbounds: []))
+    c.insts.push(f)
+    key
+}
+
+// 期望类型是该泛型类型的实例时，直接用它的类型实参（None、Nil 这类无字段的值靠它确定类型）
+fn targs_from_expect(c: Ctx, gti: int, expect: int) -> [int] {
+    t = expect
+    if is_box(c, t) { t = telem(c, t) }
+    k = inst_of(c, t)
+    if k >= 0 && c.tinsts[k].origin == c.tdecls[gti].name { return c.tinsts[k].targs.copy() }
+    []
+}
+
+// 按字段顺序检查实参：字段类型里的类型参数都已确定时带着期望类型检查，否则不带期望类型检查再对齐。
+// 检查结果写进 pre（按实参下标），之后 check_call 不再重复检查。
+fn infer_ctor(inout c: Ctx, gti: int, gvi: int, inout pre: [int], args: [Arg], line: int, col: int) -> [int] {
+    tv = c.tdecls[gti].tvars.copy()
+    names = c.tdecls[gti].variants[gvi].fnames.copy()
+    texts = c.tdecls[gti].variants[gvi].ftexts.copy()
+    gname = c.tdecls[gti].variants[gvi].name
+    if len(args) != len(texts) {
+        fail(line, col, "#{gname} 需要 #{len(texts)} 个参数，给了 #{len(args)} 个")
+    }
+    order = order_by_names(names, args)
+    bound = fill(len(tv), -1)
+    for k in 0..len(order) {
+        i = order[k]
+        if i < 0 { fail(line, col, "缺少字段 #{names[k]}") }
+        want = -1
+        if !unbound_in(texts[k], tv, bound) { want = resolve_with(&c, texts[k], tv, bound, c.tdecls[gti].line, col) }
+        t = check_expr(&c, args[i].value, want)
+        pre[i] = t
+        unify(c, tv, &bound, texts[k], t, args[i].value.line, args[i].value.col)
+    }
+    for k in 0..len(bound) {
+        if bound[k] < 0 { fail(line, col, "无法推断 #{gname} 的类型参数 #{tv[k]}，请给变量标注类型") }
+    }
+    bound
+}
+
+fn empty_fn() -> FnDecl {
+    FnDecl(name: "", tparams: [], tbounds: [], tok: -1, params: [], ret: "()", body: Block(stmts: [], tail: None), line: 0, col: 0, ext: false)
+}
+
+fn bind_pattern(inout c: Ctx, owning: bool, t: int, pat: Pat, line: int, col: int) {
+    kind = if owning { "owned" } else { "read" }
+    match pat {
+        PWild => {}
+        PBind(name, id) => {
+            v = declare(&c, name, t, kind, line, col)
+            c.locals[v].in_match = !owning
+            c.vid[id] = v
+        }
+        PInt(_) => {
+            if t != 0 && t != 11 { fail(line, col, "整数模式不能匹配 #{show_ty(c, t)}") }
+        }
+        PBool(_) => {
+            if t != 1 { fail(line, col, "布尔模式不能匹配 #{show_ty(c, t)}") }
+        }
+        PStr(_) => {
+            if t != 2 { fail(line, col, "字符串模式不能匹配 #{show_ty(c, t)}") }
+        }
+        PType(name, id, tx) => {
+            if !is_dyn(c, t) { fail(line, col, "类型模式 #{name}: #{tx} 只能用于 dyn 值，而不是 #{show_ty(c, t)}") }
+            tt = resolve_ty(&c, tx, line, col)
+            // 顺便检查这个类型实现了接口（没实现的类型不可能装在里面）
+            dyn_impl(&c, t, tt, line, col)
+            c.ety[id] = tt
+            if name != "_" {
+                v = declare(&c, name, tt, kind, line, col)
+                c.locals[v].in_match = !owning
+                c.vid[id] = v
+            }
+        }
+        POr(alts) => {
+            for a in alts {
+                if has_bind(a) { fail(line, col, "“或”模式（A | B）里不能绑定名字；要取值请分开写分支") }
+                bind_pattern(&c, owning, t, a, line, col)
+            }
+        }
+        PTuple(items) => {
+            if !is_tuple(c, t) { fail(line, col, "元组模式不能匹配 #{show_ty(c, t)}") }
+            es = tuple_elems(c, t)
+            if len(es) != len(items) { fail(line, col, "元组有 #{len(es)} 个元素，模式写了 #{len(items)} 个") }
+            for k in 0..len(items) { bind_pattern(&c, owning, es[k], items[k], line, col) }
+        }
+        PVariant(vn, fields) => {
+            // match take 只拆一层：字段只能是名字或 _
+            if owning {
+                for f in fields {
+                    if !is_simple_pat(f) { fail(line, col, "match take 的模式只能拆一层（字段写名字或 _）；嵌套模式请去掉 take") }
+                }
+            }
+            if is_box(c, t) {
+                bind_opt_pattern(&c, owning, t, vn, fields, line, col)
+                return
+            }
+            if tkind(c, t) != "enum" { fail(line, col, "变体模式不能匹配 #{show_ty(c, t)}") }
+            ei = find_enum(c, tname(c, t))
+            if variant_index(c, ei, vn) < 0 {
+                vns: [str] = []
+                for v in c.enums[ei].variants { vns.push(v.name.copy()) }
+                fail(line, col, "#{vn} 不是 #{show_ty(c, t)} 的变体" + did_you_mean(vn, vns))
+            }
+            vi = variant_index(c, ei, vn)
+            nf = len(c.enums[ei].variants[vi].ftys)
+            if len(fields) != nf {
+                fail(line, col, "变体 #{vn} 有 #{nf} 个字段，模式写了 #{len(fields)} 个")
+            }
+            for j in 0..nf {
+                ft = c.enums[ei].variants[vi].ftys[j]
+                bind_pattern(&c, owning, ft, fields[j], line, col)
+            }
+        }
+    }
+}
+
+fn bind_opt_pattern(inout c: Ctx, owning: bool, t: int, vn: str, fields: [Pat], line: int, col: int) {
+    is_res = tkind(c, t) == "res"
+    if (vn == "None" && !is_res) || (vn == "Ok" && is_res && telem(c, t) == 3) {
+        // ()! 的 Ok 不带值，写 Ok 或 Ok(_) 都行
+        unit_ok = vn == "Ok" && len(fields) == 1 && is_wild(fields[0])
+        if len(fields) != 0 && !unit_ok {
+            hint = if vn == "Ok" { "（()! 的 Ok 不带值，写 Ok 或 Ok(_)）" } else { "" }
+            fail(line, col, "#{vn} 没有字段" + hint)
+        }
+    } else if (vn == "Some" && !is_res) || (vn == "Ok" && is_res) || (vn == "Err" && is_res) {
+        if len(fields) != 1 { fail(line, col, "#{vn} 只有 1 个字段") }
+        et = if vn == "Err" { res_err(c, t) } else { telem(c, t) }
+        bind_pattern(&c, owning, et, fields[0], line, col)
+    } else if is_res {
+        fail(line, col, "结果只能匹配 Ok(x) 或 Err(e)，而不是 #{vn}")
+    } else {
+        fail(line, col, "可选值只能匹配 Some(x) 或 None，而不是 #{vn}")
+    }
+}
+
+// 名字或 _
+fn is_simple_pat(p: Pat) -> bool {
+    match p {
+        PWild => true
+        PBind(_, _) => true
+        _ => false
+    }
+}
+
+// 能匹配任何值的模式：名字、_，以及全由这类模式组成的元组
+fn irrefutable(p: Pat) -> bool {
+    match p {
+        PWild => true
+        PBind(_, _) => true
+        PTuple(items) => {
+            all = true
+            for x in items {
+                if !irrefutable(x) { all = false }
+            }
+            all
+        }
+        POr(alts) => {
+            any = false
+            for x in alts {
+                if irrefutable(x) { any = true }
+            }
+            any
+        }
+        _ => false
+    }
+}
+
+fn is_res_unit(c: Ctx, t: int) -> bool {
+    t >= 0 && tkind(c, t) == "res" && telem(c, t) == 3
+}
+
+// e?：T! 出错时把错误返回给调用者，T? 为 None 时返回 None。当前函数的返回类型必须同类。
+fn check_try(inout c: Ctx, e: Expr, a: Expr) -> int {
+    if c.defer_depth > 0 && len(c.clo_stack) == 0 { fail(e.line, e.col, "defer 里不能用 ?：出错时请用 match 或 _ = … 处理") }
+    ta = check_expr(&c, a, -1)
+    ret = c.cur_ret
+    if !is_box(c, ta) { fail(e.line, e.col, "? 只能用于可选或结果类型，而不是 #{show_ty(c, ta)}") }
+    if !is_box(c, ret) || tkind(c, ret) != tkind(c, ta) {
+        need = if tkind(c, ta) == "res" { "T!" } else { "T?" }
+        fail(e.line, e.col, "? 要求当前函数返回 #{need}，而它返回 #{show_ty(c, ret)}")
+    }
+    // 错误类型不同时用 fn from(take e: E1) -> E2 转换（按第一个参数重载，每种错误类型最多一个）
+    if tkind(c, ta) == "res" && res_err(c, ta) != res_err(c, ret) {
+        ea = res_err(c, ta)
+        eb = res_err(c, ret)
+        fi = overload_for(c, "from", ea)
+        if fi < 0 || c.fns[fi].ret != eb {
+            fail(e.line, e.col, "? 两边的错误类型不同：这里是 #{show_ty(c, ea)}，当前函数返回的是 #{show_ty(c, eb)}；" +
+                "可以写一个 fn from(take e: #{show_ty(c, ea)}) -> #{show_ty(c, eb)} 来转换")
+        }
+        if len(c.fns[fi].ptys) != 1 || c.fns[fi].pmodes[0] != "take" {
+            fail(e.line, e.col, "用于 ? 的转换函数要写成 fn from(take e: #{show_ty(c, ea)}) -> #{show_ty(c, eb)}")
+        }
+        c.rname[e.id] = c.fns[fi].name
+    }
+    telem(c, ta)
+}
+
+fn is_catch_all(a: Arm) -> bool { irrefutable(a.pat) }
+
+// 没有 else 的 if：分支末尾的值本身是 T! 时报错。看的是值自己的类型（ety），不是自动包成 Ok 之后的：
+// ()! 函数末尾的 if { print(…) } 里，print 的 () 会被当成 Ok(())，那不算丢掉了结果
+fn dropped_result(c: Ctx, b: Block) {
+    match b.tail {
+        Some(tx) => {
+            t = c.ety[tx.id]
+            if t >= 0 && tkind(c, t) == "res" {
+                fail(tx.line, tx.col, "没有 else 的 if 没有值，这里的 #{show_ty(c, t)} 会被丢掉：要把错误交给调用者请写 return Err(…) 或者在调用后面加 ?；确实不需要就写 _ = …")
+            }
+        }
+        None => {}
+    }
+}
+
+fn is_wild(p: Pat) -> bool {
+    match p {
+        PWild => true
+        _ => false
+    }
+}
+
+// 模式能不能覆盖整个变体 nm：字段都是能匹配任何值的模式时才算（Some(Leaf(v)) 不算覆盖了 Some）；
+// “或”模式里有一个选项能覆盖就算
+fn covers(p: Pat, nm: str) -> bool {
+    match p {
+        PVariant(n, fs) => {
+            all = n == nm
+            for f in fs {
+                if !irrefutable(f) { all = false }
+            }
+            all
+        }
+        POr(alts) => {
+            any = false
+            for x in alts {
+                if covers(x, nm) { any = true }
+            }
+            any
+        }
+        _ => false
+    }
+}
+
+// 模式能不能覆盖布尔值 b
+fn covers_bool(p: Pat, b: bool) -> bool {
+    match p {
+        PBool(v) => v == b
+        POr(alts) => {
+            any = false
+            for x in alts {
+                if covers_bool(x, b) { any = true }
+            }
+            any
+        }
+        _ => false
+    }
+}
+
+// match 的值类型不对时的提示：最常见的是以为 pop 返回 T?
+fn match_hint(c: Ctx, scrut: Expr) -> str {
+    if c.rkind[scrut.id] == "builtin" && c.rname[scrut.id] == "pop" {
+        "。xs.pop() 返回的是元素本身（空列表时 panic），要 T? 请用 xs.try_pop()"
+    } else {
+        ""
+    }
+}
+
+fn check_match(inout c: Ctx, e: Expr, owning: bool, scrut: Expr, arms: [Arm], expect: int) -> int {
+    ts0 = check_expr(&c, scrut, -1)
+    if owning && is_shared(c, ts0) { fail(e.line, e.col, "shared 的内容是只读的，不能 match take") }
+    ts = if is_shared(c, ts0) { telem(c, ts0) } else { ts0 }
+    k = tkind(c, ts)
+    if owning && k != "enum" && !is_box(c, ts) { fail(e.line, e.col, "match take 只能用于枚举、可选值或结果") }
+    if owning && dtor_of(c, ts) >= 0 { fail(e.line, e.col, "#{show_ty(c, ts)} 有析构函数，不能用 match take 拆开") }
+    if k != "enum" && !is_box(c, ts) && ts != 0 && ts != 11 && ts != 1 && ts != 2 && !is_tuple(c, ts) && !is_dyn(c, ts) {
+        fail(e.line, e.col, "match 不支持 #{show_ty(c, ts)}：能 match 的是枚举、T?、T!、元组、int、u8、bool、str 和 dyn 接口#{match_hint(c, scrut)}")
+    }
+    if len(arms) == 0 { fail(e.line, e.col, "match 至少需要一个分支") }
+    result = 4
+    for a in arms {
+        push_scope(&c)
+        bind_pattern(&c, owning, ts, a.pat, a.line, a.col)
+        t = check_expr(&c, a.body, expect)
+        result = join_ty(c, result, t, a.body.line, a.body.col)
+        pop_scope(&c)
+    }
+    catch_all = false
+    for a in arms {
+        if is_catch_all(a) { catch_all = true }
+    }
+    // 嵌套模式（如 Some(Leaf(v)) 和 Some(Node(_, _)) 合起来覆盖了 Some）按模式矩阵逐列检查
+    if !catch_all && exhaustive_arms(c, ts, arms) { catch_all = true }
+    if !catch_all {
+        if tkind(c, ts) == "res" {
+            has_ok = false
+            has_err = false
+            for a in arms {
+                if covers(a.pat, "Ok") { has_ok = true }
+                if covers(a.pat, "Err") { has_err = true }
+            }
+            if !(has_ok && has_err) { fail(e.line, e.col, "match 需要同时覆盖 Ok 和 Err") }
+        } else if k == "opt" {
+            has_some = false
+            has_none = false
+            for a in arms {
+                if covers(a.pat, "Some") { has_some = true }
+                if covers(a.pat, "None") { has_none = true }
+            }
+            if !(has_some && has_none) { fail(e.line, e.col, "match 需要同时覆盖 Some 和 None") }
+        } else if k == "enum" {
+            ei = find_enum(c, tname(c, ts))
+            for v in c.enums[ei].variants {
+                covered = false
+                for a in arms {
+                    if covers(a.pat, v.name) { covered = true }
+                }
+                if !covered { fail(e.line, e.col, "match 没有覆盖变体 #{v.name}") }
+            }
+        } else if ts == 1 {
+            has_t = false
+            has_f = false
+            for a in arms {
+                if covers_bool(a.pat, true) { has_t = true }
+                if covers_bool(a.pat, false) { has_f = true }
+            }
+            if !(has_t && has_f) { fail(e.line, e.col, "match 没有覆盖所有布尔值") }
+        } else {
+            fail(e.line, e.col, "这个 match 需要一个能匹配任何值的分支（_ 或名字）")
+        }
+    }
+    result
+}
+
+fn check_block(inout c: Ctx, b: Block, expect: int) -> int {
+    push_scope(&c)
+    skips = skip_lines()
+    dead = false
+    cut = false
+    skipped = false
+    for s in b.stmts {
+        // 报错后重新编译（见 main.lark 的 fail）：报过错的语句不再检查。它声明了新变量时块里后面的语句也不检查，
+        // 免得用到这个变量的地方都报“没有定义”；块的值当作 never，不会再报类型不匹配
+        if len(skips) > 0 && has_line(skips, s.line) {
+            if declares(c, s) && !declare_skipped(&c, s) {
+                cut = true
+                break
+            }
+            skipped = true
+            continue
+        }
+        if dead {
+            warn(&c, s.line, s.col, "这里永远不会执行：前面的语句已经 return / break / continue / panic / exit")
+            dead = false
+        }
+        check_stmt(&c, s)
+        if diverges(c, s) { dead = true }
+    }
+    t = if cut { 4 } else {
+        match b.tail {
+            Some(tx) => {
+                if len(skips) > 0 && has_line(skips, tx.line) {
+                    4
+                } else {
+                    if dead { warn(&c, tx.line, tx.col, "这里永远不会执行：前面的语句已经 return / break / continue / panic / exit") }
+                    check_expr(&c, tx, expect)
+                }
+            }
+            // 跳过的语句里可能有 return（块没有值时本来靠它返回）：当作 never
+            None => if skipped { 4 } else { 3 }
+        }
+    }
+    pop_scope(&c)
+    t
+}
+
+// 跳过的语句是带类型标注的声明（x: T = …）：照标注的类型声明 x，块里后面的语句照常检查
+fn declare_skipped(inout c: Ctx, s: Stmt) -> bool {
+    match s.kind {
+        SAssign(target, annot, _) => {
+            n = var_name(target)
+            if annot == "" || n == "" || is_tuple_expr(target) { return false }
+            t = resolve_ty(&c, annot, s.line, s.col)
+            v = declare(&c, n, t, "owned", s.line, s.col)
+            c.locals[v].used = true
+            true
+        }
+        _ => false
+    }
+}
+
+// 语句声明了新变量（x = … 里的 x 还没有定义，或者拆开元组）
+fn declares(c: Ctx, s: Stmt) -> bool {
+    match s.kind {
+        SAssign(target, _, _) => {
+            n = var_name(target)
+            is_tuple_expr(target) || (n != "" && n != "_" && lookup(c, n) < 0)
+        }
+        _ => false
+    }
+}
+
+// 表达式语句的类型是 never（return、break、continue、panic、exit，或者各分支都是这些的 if / match）
+fn diverges(c: Ctx, s: Stmt) -> bool {
+    match s.kind {
+        SExpr(e) => c.ety[e.id] == 4
+        _ => false
+    }
+}
+
+fn var_name(e: Expr) -> str {
+    match e.kind {
+        EVar(n) => n
+        _ => ""
+    }
+}
+
+fn check_stmt(inout c: Ctx, s: Stmt) {
+    match s.kind {
+        SExpr(e) => {
+            _t = check_expr(&c, e, -1)
+        }
+        SAssign(target, annot, rhs) => {
+            if is_tuple_expr(target) {
+                check_destructure(&c, s, target, annot, rhs)
+                return
+            }
+            name = var_name(target)
+            if name != "" && lookup(c, name) < 0 && find_const(c, name, s.line) >= 0 {
+                fail(s.line, s.col, "#{name} 是常量，不能赋值")
+            }
+            if name != "" && (lookup(c, name) < 0 || name == "_") {
+                t = 5
+                if annot != "" {
+                    t = resolve_ty(&c, annot, s.line, s.col)
+                    no_fn(c, t, "变量的类型", s.line, s.col)
+                    tr = check_expr(&c, rhs, t)
+                    expect_ty(c, t, tr, rhs.line, rhs.col)
+                } else {
+                    t = check_expr(&c, rhs, -1)
+                    if t == 3 || t == 4 { fail(s.line, s.col, "不能把 #{show_ty(c, t)} 赋给变量") }
+                    no_fn(c, t, "变量的类型（闭包只能直接作为参数传入）", s.line, s.col)
+                }
+                c.decl[s.id] = true
+                v = declare(&c, name, t, "owned", s.line, s.col)
+                c.vid[target.id] = v
+                c.ety[target.id] = t
+            } else {
+                if annot != "" { fail(s.line, s.col, "变量已经声明过，不能再标注类型") }
+                if !is_place(target) { fail(s.line, s.col, "只能给变量、字段或下标赋值") }
+                if index_base_user(&c, target) {
+                    check_set_index(&c, s, target, rhs)
+                } else {
+                    tt = check_expr(&c, target, -1)
+                    if via_index_op(c, target) {
+                        fail(s.line, s.col, "x[i] 是 index 返回的新值，不能给它的字段或元素赋值；请取出、修改后再用 x[i] = v 放回")
+                    }
+                    tr = check_expr(&c, rhs, tt)
+                    expect_ty(c, tt, tr, rhs.line, rhs.col)
+                }
+            }
+        }
+        SForCond(cond, body) => {
+            // 条件每轮都算，属于这个循环（和 own、生成的 C 一样）：条件里的 break / continue 不带标签时对的是它自己，
+            // 带标签的从它数起
+            lbl = replace(&c.pend_label, "")
+            c.loop_depth += 1
+            c.labels.push(lbl)
+            match cond {
+                Some(cx) => {
+                    tc = check_expr(&c, cx, 1)
+                    expect_ty(c, 1, tc, cx.line, cx.col)
+                }
+                None => {}
+            }
+            _tb = check_block(&c, body, -1)
+            _l = c.labels.pop()
+            c.loop_depth -= 1
+        }
+        SForRange(name, id, lo, hi, body) => {
+            lbl = replace(&c.pend_label, "")
+            tl = check_expr(&c, lo, 0)
+            expect_ty(c, 0, tl, lo.line, lo.col)
+            th = check_expr(&c, hi, 0)
+            expect_ty(c, 0, th, hi.line, hi.col)
+            c.loop_depth += 1
+            c.labels.push(lbl)
+            push_scope(&c)
+            v = declare(&c, name, 0, "owned", s.line, s.col)
+            c.vid[id] = v
+            _tb = check_block(&c, body, -1)
+            pop_scope(&c)
+            _l = c.labels.pop()
+            c.loop_depth -= 1
+        }
+        SForEach(name, id, it, body, iname, iid) => {
+            lbl = replace(&c.pend_label, "")
+            ti = check_expr(&c, it, -1)
+            et = 0
+            vk = "read"
+            if tkind(c, ti) == "list" {
+                et = telem(c, ti)
+            } else {
+                et = check_iter(&c, s, ti, it)
+                vk = "owned"
+            }
+            c.loop_depth += 1
+            c.labels.push(lbl)
+            push_scope(&c)
+            if iname != "" {
+                if iname == name && name != "_" { fail(s.line, s.col, "下标和元素不能同名：#{name}") }
+                iv = declare(&c, iname, 0, "owned", s.line, s.col)
+                c.vid[iid] = iv
+            }
+            v = declare(&c, name, et, vk, s.line, s.col)
+            c.vid[id] = v
+            _tb = check_block(&c, body, -1)
+            pop_scope(&c)
+            _l = c.labels.pop()
+            c.loop_depth -= 1
+        }
+        SLabel(name, body) => {
+            if c.defer_depth > 0 { fail(s.line, s.col, "defer 里的循环不能带标签") }
+            for l in c.labels {
+                if l == name { fail(s.line, s.col, "标签 #{name} 和外层的循环重名") }
+            }
+            c.pend_label = name.copy()
+            _tb = check_block(&c, body, -1)
+        }
+        SDefer(body) => {
+            // 体里不能 return、?，break / continue 只能对体里的循环（loop_depth 从 0 算）。
+            // ridx 记下这时有几个局部变量：编号更小的是体外的变量，所有权检查要钉住它们（见 own.lark 的 SDefer）
+            if len(c.clo_stack) > 0 { fail(s.line, s.col, "闭包里不能写 defer") }
+            c.ridx[s.id] = len(c.locals)
+            old_loop = c.loop_depth
+            old_labels = replace(&c.labels, [])
+            c.loop_depth = 0
+            c.defer_depth += 1
+            _tb = check_block(&c, body, -1)
+            c.defer_depth -= 1
+            c.loop_depth = old_loop
+            c.labels = old_labels
+        }
+    }
+}
+
+// scope { … }：结构化并发。块里 spawn 的任务都在块结束前等完，所以任务不会比创建它的代码活得更久。
+// 块里可以 return、?，也可以 break / continue 到块外：跳出去之前先等块里的任务结束（见代码生成的 drop_jump）。
+fn check_scope(inout c: Ctx, e: Expr, b: Block, expect: int) -> int {
+    if len(c.clo_stack) > 0 { fail(e.line, e.col, "闭包里不能写 scope") }
+    sd = c.scope_depth
+    c.scope_depth += 1
+    t = check_block(&c, b, expect)
+    c.scope_depth = sd
+    t
+}
+
+// lock m as x { … }：锁上 Mutex[T]，块里 x 是里面的值（inout：能改、能 &x 传下去，不能移走），块尾解锁。
+// 块里 return、?、break / continue 到块外时，跳出去之前先解锁。
+// m 要是一个位置（变量、字段）：锁着的时候它一直活着（所有权检查不许在块里移走或重新赋值它）
+fn check_lock(inout c: Ctx, e: Expr, m: Expr, name: str, id: int, b: Block, expect: int) -> int {
+    if len(c.clo_stack) > 0 { fail(e.line, e.col, "闭包里不能写 lock") }
+    if !is_place(m) { fail(m.line, m.col, "lock 后面要写一个变量或字段（例如 lock cache as c { … }），不能是调用的结果") }
+    tm = check_expr(&c, m, -1)
+    if !is_mutex(c, tm) { fail(m.line, m.col, "lock 需要 Mutex[T]，而不是 #{show_ty(c, tm)}") }
+    if via_index_op(c, m) { fail(m.line, m.col, "lock 不能用重载的下标取出的值（那是一个临时的副本），请先存到变量里") }
+    ld = c.lock_depth
+    c.lock_depth += 1
+    push_scope(&c)
+    v = declare(&c, name, telem(c, tm), "inout", e.line, e.col)
+    c.vid[id] = v
+    t = check_block(&c, b, expect)
+    pop_scope(&c)
+    c.lock_depth = ld
+    t
+}
+
+// spawn(f, x)：在新线程里运行 f(x)。f 是恰好有一个 take 参数、没有返回值的普通函数，x 被移进新线程，
+// 结果通过 Chan 送回来。只能写在 scope 里（不能在闭包里）。
+fn check_spawn(inout c: Ctx, e: Expr, args: [Arg]) -> int {
+    if c.scope_depth == 0 || len(c.clo_stack) > 0 {
+        fail(e.line, e.col, "spawn 只能直接写在 scope { … } 里：scope 结束前会等所有 spawn 的任务完成")
+    }
+    if len(args) != 2 || args[0].amp || args[1].amp || args[0].label != "" || args[1].label != "" {
+        fail(e.line, e.col, "spawn 的写法是 spawn(函数名, 参数)")
+    }
+    fnm0 = match args[0].value.kind {
+        EVar(n) => n
+        _ => ""
+    }
+    fnm = if fnm0 == "" { "" } else { resolve_name(c, fnm0, e.line) }
+    if fnm == "" || count_uname(c, fnm) != 1 || lookup(c, fnm0) >= 0 {
+        fail(e.line, e.col, "spawn 的第一个参数要是一个不重载的函数名")
+    }
+    fi = find_fn(c, fnm)
+    if is_template(c, fi) { fail(e.line, e.col, "不能直接 spawn 泛型函数 #{fnm}") }
+    check_fn_vis(c, fi, e.line, e.col)
+    if len(c.fns[fi].ptys) != 1 || c.fns[fi].pmodes[0] != "take" {
+        fail(e.line, e.col, "spawn 的函数要恰好有一个 take 参数，例如 fn worker(take job: Job)")
+    }
+    if c.fns[fi].ret != 3 { fail(e.line, e.col, "spawn 的函数不能有返回值，用 Chan 把结果送回来") }
+    pt = c.fns[fi].ptys[0]
+    t = check_expr(&c, args[1].value, pt)
+    expect_ty(c, pt, t, args[1].value.line, args[1].value.col)
+    c.rkind[e.id] = "builtin"
+    c.rname[e.id] = "spawn"
+    c.rname[args[0].value.id] = c.fns[fi].name
+    3
+}
+
+// extern "c" 函数的参数：类型要能对应到 C（见 ext_c），只读；[u8] 可以 inout（C 往缓冲区里写）
+fn check_ext_param(c: Ctx, p: Param) {
+    if ext_c(p.ty) == "" || p.ty == "()" {
+        fail(p.line, p.col, "extern \"c\" 函数的参数不支持类型 #{p.ty}；可以用 " + ext_names() + "、Fn() -> ()")
+    }
+    if p.mode == "take" { fail(p.line, p.col, "extern \"c\" 函数的参数不能是 take") }
+    if p.mode == "inout" && p.ty != "[u8]" { fail(p.line, p.col, "extern \"c\" 函数只有 [u8] 参数可以写 inout（让 C 往缓冲区里写）") }
+}
+
+// 报错后重新编译找下一处错误时（见 main.lark 的 fail 和 next_error）：报过错的语句在 check_block 里跳过；
+// 同一行跳过语句以后还报错时，整个函数体不再检查（skip 里记成负数）
+fn skipped_body(c: Ctx, f: FnDecl) -> bool {
+    skips = skip_lines()
+    if len(skips) == 0 { return false }
+    end = body_end(c.toks, f.line)
+    for s in skips {
+        if s < 0 && 0 - s >= f.line && 0 - s <= end { return true }
+    }
+    false
+}
+
+// 函数体里有报过错的地方：所有权检查整个跳过（跳过的语句没有类型，和 rustc 一样，有类型错误的函数不做借用检查）
+fn skipped_any(c: Ctx, f: FnDecl) -> bool {
+    skips = skip_lines()
+    if len(skips) == 0 { return false }
+    end = body_end(c.toks, f.line)
+    for s0 in skips {
+        s = if s0 < 0 { 0 - s0 } else { s0 }
+        if s >= f.line && s <= end { return true }
+    }
+    false
+}
+
+// 从第 line 行开始的函数（或 test 块），函数体最后的 } 所在的行
+fn body_end(ts: [Tok], line: int) -> int {
+    k = 0
+    for k < len(ts) && ts[k].line != line { k += 1 }
+    for k < len(ts) && ts[k].kind != "{" { k += 1 }
+    depth = 0
+    for k < len(ts) {
+        if ts[k].kind == "{" { depth += 1 }
+        if ts[k].kind == "}" {
+            depth -= 1
+            if depth == 0 { return ts[k].line }
+        }
+        k += 1
+    }
+    line
+}
+
+// break / continue 要跳出几层循环：1 是最里层（没写标签时）；写了标签时数到那个循环
+fn jump_depth(c: Ctx, e: Expr, label: str) -> int {
+    if label == "" { return 1 }
+    k = len(c.labels) - 1
+    for k >= 0 {
+        if c.labels[k] == label { return len(c.labels) - k }
+        k -= 1
+    }
+    fail(e.line, e.col, "外层没有叫 #{label} 的循环（标签写在 for 前面：#{label}: for …）")
+    1
+}
+
+fn check_fn(inout c: Ctx, f: FnDecl, fi: int) {
+    ret = c.fns[fi].ret
+    c.cur_ret = ret
+    c.loop_depth = 0
+    c.labels = []
+    c.pend_label = ""
+    c.scope_depth = 0
+    c.lock_depth = 0
+    push_scope(&c)
+    for k in 0..len(f.params) {
+        mode = f.params[k].mode
+        kind = if mode == "take" { "owned" } else { mode }
+        pt = c.fns[fi].ptys[k]
+        v = declare(&c, f.params[k].name, pt, kind, f.params[k].line, f.params[k].col)
+        c.locals[v].used = true
+        c.vid[f.params[k].id] = v
+    }
+    t = check_block(&c, f.body, ret)
+    if ret != 3 && !(is_res_unit(c, ret) && t == 3) { expect_ty(c, ret, t, f.line, f.col) }
+    pop_scope(&c)
+    mark_tail_block(&c, fi, f.body)
+}
+
+// 标出处在尾部位置的自调用（ridx 记为 1，代码生成时变成跳转）：函数体的值、if / match 各分支的值、块的值。
+// 不进入 scope、lock（跳出去会跳过块尾的等待、解锁）和闭包；中途的 return f(…) 由代码生成直接识别。
+fn mark_tail_block(inout c: Ctx, fi: int, b: Block) {
+    match b.tail {
+        Some(t) => mark_tail(&c, fi, t)
+        None => {}
+    }
+}
+
+fn mark_tail(inout c: Ctx, fi: int, e: Expr) {
+    match e.kind {
+        ECall(_, _, _) => {
+            if is_self_tail(c, fi, e) { c.ridx[e.id] = 1 }
+        }
+        EIf(_, thn, els) => {
+            mark_tail_block(&c, fi, thn)
+            match els {
+                Some(eb) => mark_tail_block(&c, fi, eb)
+                None => {}
+            }
+        }
+        EMatch(_, _, arms) => {
+            for a in arms { mark_tail(&c, fi, a.body) }
+        }
+        EBlock(b) => mark_tail_block(&c, fi, b)
+        _ => {}
+    }
+}
+
+fn claim(inout taken: [str], name: str, line: int, col: int) {
+    for t in taken {
+        if t == name { fail(line, col, "名字 #{name} 重复定义") }
+    }
+    if is_builtin(name) { fail(line, col, "#{name} 是内置函数，不能重新定义") }
+    taken.push(name)
+}
+
+fn field_texts(fs: [FieldDecl]) -> [str] {
+    out: [str] = []
+    for f in fs { out.push(f.ty) }
+    out
+}
+
+fn check_tparams(tps: [str], line: int, col: int) {
+    for i in 0..len(tps) {
+        if !is_upper(tps[i]) { fail(line, col, "类型参数 #{tps[i]} 必须大写开头") }
+        for j in 0..i {
+            if tps[j] == tps[i] { fail(line, col, "类型参数 #{tps[i]} 重复") }
+        }
+    }
+}
+
+fn field_names(fs: [FieldDecl], line: int, col: int) -> [str] {
+    names: [str] = []
+    for f in fs {
+        for n in names {
+            if n == f.name { fail(line, col, "字段 #{f.name} 重复") }
+        }
+        names.push(f.name)
+    }
+    names
+}
+
+fn check_program(prog: Program, take toks: [Tok]) -> Ctx {
+    c = new_ctx(prog.nodes, toks)
+    c.nmain = prog.nmain
+    c.pubs = prog.pubs.copy()
+    c.fmods = prog.fmods.copy()
+    c.mods = prog.mods.copy()
+    taken: [str] = []
+    // 第一遍：登记名字（类型可以先使用后声明）。模块里的名字在内部带模块前缀（见 decl_name）
+    for s in prog.structs {
+        sn = decl_name(c, s.name, s.line)
+        if mod_of(c, s.line) != "" {
+            for fd in s.fields {
+                if !fd.is_pub { c.fpriv.push(sn + "." + fd.name) }
+            }
+        }
+        claim(&taken, sn, s.line, s.col)
+        c.vnames.push(sn)
+        c.vlines.push(s.line)
+        if len(s.tparams) > 0 {
+            check_tparams(s.tparams, s.line, s.col)
+            gv = GVariant(name: sn, fnames: field_names(s.fields, s.line, s.col), ftexts: field_texts(s.fields))
+            tps = s.tparams.copy()
+            c.tdecls.push(GDecl(kind: "struct", name: sn, tvars: tps, variants: [gv], line: s.line, col: s.col))
+            continue
+        }
+        c.structs.push(SInfo(name: sn, fnames: field_names(s.fields, s.line, s.col), ftys: []))
+        _t = intern(&c.tt, "struct", sn, -1)
+    }
+    for en in prog.enums {
+        enn = decl_name(c, en.name, en.line)
+        claim(&taken, enn, en.line, en.col)
+        c.vnames.push(enn)
+        c.vlines.push(en.line)
+        if len(en.tparams) > 0 {
+            check_tparams(en.tparams, en.line, en.col)
+            gvs: [GVariant] = []
+            for v in en.variants {
+                claim(&taken, decl_name(c, v.name, en.line), en.line, en.col)
+                gvs.push(GVariant(name: v.name, fnames: field_names(v.fields, en.line, en.col), ftexts: field_texts(v.fields)))
+            }
+            etps = en.tparams.copy()
+            c.tdecls.push(GDecl(kind: "enum", name: enn, tvars: etps, variants: gvs, line: en.line, col: en.col))
+            continue
+        }
+        vs: [VInfo] = []
+        for v in en.variants {
+            claim(&taken, decl_name(c, v.name, en.line), en.line, en.col)
+            vs.push(VInfo(name: v.name, fnames: field_names(v.fields, en.line, en.col), ftys: []))
+        }
+        c.enums.push(EInfo(name: enn, variants: vs))
+        _t = intern(&c.tt, "enum", enn, -1)
+    }
+    for d in prog.ifaces {
+        claim(&taken, d.name, d.line, d.col)
+        if d.name == "Eq" || d.name == "Ord" { fail(d.line, d.col, "#{d.name} 是内置接口，不能重新定义") }
+        c.inames.push(d.name)
+        for m in d.methods {
+            if len(m.params) == 0 { fail(d.line, d.col, "接口方法 #{m.name} 至少要有一个参数") }
+            ms: [str] = []
+            ts: [str] = []
+            for p in m.params {
+                ms.push(p.mode)
+                ts.push(p.ty)
+            }
+            c.imeths.push(IMeth(iface: d.name, name: m.name, pmodes: ms, ptexts: ts, ret: m.ret, line: d.line, col: d.col))
+        }
+    }
+    // 同名函数只占一次名字：允许按第一个参数的类型重载（检查见下面）
+    seen: [str] = []
+    for f in prog.fns {
+        dup = false
+        for s in seen {
+            if s == fn_decl_name(c, f) { dup = true }
+        }
+        if !dup {
+            claim(&taken, fn_decl_name(c, f), f.line, f.col)
+            seen.push(fn_decl_name(c, f))
+        }
+    }
+    // 第二遍：解析字段和签名里的类型
+    // 泛型模板的字段在实例化时才解析；结构体、枚举的下标按名字找（模板不在 structs / enums 里）
+    for sd in prog.structs {
+        if len(sd.tparams) > 0 { continue }
+        si = find_struct(c, decl_name(c, sd.name, sd.line))
+        for f in sd.fields {
+            t = resolve_ty(&c, f.ty, sd.line, sd.col)
+            no_fn(c, t, "字段类型", sd.line, sd.col)
+            c.structs[si].ftys.push(t)
+        }
+    }
+    for ed in prog.enums {
+        if len(ed.tparams) > 0 { continue }
+        ei = find_enum(c, decl_name(c, ed.name, ed.line))
+        for j in 0..len(ed.variants) {
+            for f in ed.variants[j].fields {
+                t = resolve_ty(&c, f.ty, ed.line, ed.col)
+                no_fn(c, t, "字段类型", ed.line, ed.col)
+                c.enums[ei].variants[j].ftys.push(t)
+            }
+        }
+    }
+    for f in prog.fns {
+        if len(f.tparams) > 0 {
+            // 泛型模板：只记下参数类型原文，实例化时再解析
+            tmodes: [str] = []
+            texts: [str] = []
+            for p in f.params {
+                tmodes.push(p.mode)
+                texts.push(p.ty)
+            }
+            check_tparams(f.tparams, f.line, f.col)
+            fdn = fn_decl_name(c, f)
+            // 泛型函数也可以按第一个参数的类型重载（见 template_for）；第二个起换一个内部名字
+            gkey = if find_fn(c, fdn) >= 0 { fdn + "__g" + int_str(len(c.fns)) } else { fdn }
+            for b in f.tbounds { check_bound_names(c, b, f.line, f.col) }
+            tps = f.tparams.copy()
+            tbs = f.tbounds.copy()
+            c.fns.push(FInfo(name: gkey, uname: fdn, pmodes: tmodes, ptys: [], ret: 3, tvars: tps, targs: [], ptexts: texts, rtext: f.ret, tok: f.tok, tbounds: tbs))
+            continue
+        }
+        modes: [str] = []
+        tys: [int] = []
+        for p in f.params {
+            modes.push(p.mode)
+            if f.ext { check_ext_param(c, p) }
+            lt = if f.ext { ext_lark(p.ty) } else { p.ty.copy() }
+            t = resolve_ty(&c, lt, p.line, p.col)
+            if is_fn_ty(c, t) && p.mode != "read" { fail(p.line, p.col, "函数类型的参数只能是只读的") }
+            tys.push(t)
+        }
+        if f.ext && (ext_c(f.ret) == "" || f.ret == "[u8]" || f.ret == "Fn()->()") {
+            fail(f.line, f.col, "extern \"c\" 函数的返回类型不支持 #{f.ret}；可以用 ()、" + ext_names())
+        }
+        rtx = if f.ext { ext_lark(f.ret) } else { f.ret.copy() }
+        r = resolve_ty(&c, rtx, f.line, f.col)
+        no_fn(c, r, "返回类型", f.line, f.col)
+        // 重载的第二个起换一个内部名字
+        fqn = fn_decl_name(c, f)
+        key = fqn
+        prev = find_fn(c, fqn)
+        if prev >= 0 {
+            key = fqn + "__o" + int_str(len(c.fns))
+        }
+        c.fns.push(FInfo(name: key, uname: fqn, pmodes: modes, ptys: tys, ret: r, tvars: [], targs: [], ptexts: [], rtext: "", tok: f.tok, tbounds: []))
+    }
+    for i in 0..len(c.fns) {
+        for j in 0..i {
+            if c.fns[i].uname == c.fns[j].uname {
+                n = c.fns[i].uname
+                fl = prog.fns[i].line
+                fc = prog.fns[i].col
+                gi = is_template(c, i)
+                gj = is_template(c, j)
+                ni = if gi { len(c.fns[i].ptexts) } else { len(c.fns[i].ptys) }
+                nj = if gj { len(c.fns[j].ptexts) } else { len(c.fns[j].ptys) }
+                if ni == 0 || nj == 0 {
+                    fail(fl, fc, "重载的函数 #{n} 必须至少有一个参数")
+                }
+                if !gi && !gj && c.fns[i].ptys[0] == c.fns[j].ptys[0] {
+                    t0 = c.fns[i].ptys[0]
+                    fail(fl, fc, "函数 #{n} 重复定义（重载要求第一个参数类型不同，这里都是 #{show_ty(c, t0)}）")
+                }
+                if gi && gj && c.fns[i].ptexts[0] == c.fns[j].ptexts[0] {
+                    p0 = c.fns[i].ptexts[0]
+                    fail(fl, fc, "泛型函数 #{n} 重复定义（重载要求第一个参数的类型不同，这里都是 #{p0}）")
+                }
+            }
+        }
+    }
+    // 自定义析构：fn drop(inout x: T)，T 是结构体或枚举（靠重载，每个类型最多一个）
+    for i in 0..len(prog.fns) {
+        if c.fns[i].uname == "drop" {
+            fl = prog.fns[i].line
+            fc = prog.fns[i].col
+            if is_template(c, i) { fail(fl, fc, "析构函数不能是泛型函数") }
+            ok = len(c.fns[i].ptys) == 1 && c.fns[i].pmodes[0] == "inout" && c.fns[i].ret == 3
+            dk = if len(c.fns[i].ptys) == 1 { tkind(c, c.fns[i].ptys[0]) } else { "" }
+            if !ok || (dk != "struct" && dk != "enum") {
+                fail(fl, fc, "析构函数必须写成 fn drop(inout x: T)，T 是结构体或枚举，没有返回值")
+            }
+            dt = c.fns[i].ptys[0]
+            c.dtor_ty.push(dt)
+            c.dtor_fn.push(i)
+        }
+    }
+    // 自定义相等和比较：fn eq(a: T, b: T) -> bool、fn cmp(a: T, b: T) -> int，T 是结构体或枚举。
+    // eq 取代逐字段的比较（==、!=，以及列表、可选值、Map 的键里的比较都用它）；有 cmp 的类型满足 Ord
+    for i in 0..len(prog.fns) {
+        on = c.fns[i].uname
+        if (on == "eq" || on == "cmp") && !is_template(c, i) && len(c.fns[i].ptys) > 0 && is_user_ty(c, c.fns[i].ptys[0]) {
+            t0 = c.fns[i].ptys[0]
+            want = if on == "eq" { 1 } else { 0 }
+            ok = len(c.fns[i].ptys) == 2 && c.fns[i].ptys[1] == t0 && c.fns[i].ret == want &&
+                c.fns[i].pmodes[0] == "read" && c.fns[i].pmodes[1] == "read"
+            if !ok {
+                rs = if on == "eq" { "bool" } else { "int" }
+                ts = show_ty(c, t0)
+                fail(prog.fns[i].line, prog.fns[i].col, "#{on} 用来定义比较，必须写成 fn #{on}(a: #{ts}, b: #{ts}) -> #{rs}（参数只读）")
+            }
+        }
+    }
+    // 常量：先登记名字，再逐个求值（常量之间可以先使用后声明，见 const_ty）
+    for k in 0..len(prog.consts) {
+        kn = decl_name(c, prog.consts[k].name, prog.consts[k].line)
+        claim(&taken, kn, prog.consts[k].line, prog.consts[k].col)
+        if variant_enum(c, prog.consts[k].name) >= 0 {
+            fail(prog.consts[k].line, prog.consts[k].col, "常量 #{prog.consts[k].name} 和枚举的变体重名")
+        }
+        c.vnames.push(kn)
+        c.vlines.push(prog.consts[k].line)
+        c.knames.push(kn)
+        c.ktys.push(5)
+        c.kints.push(0)
+        c.kstrs.push("")
+        c.kstate.push(0)
+        c.kexprs.push(prog.consts[k].value.copy())
+    }
+    for k in 0..len(prog.consts) {
+        _kt = const_ty(&c, k, prog.consts[k].line, prog.consts[k].col)
+    }
+    mi = find_fn(c, "main")
+    // 测试模式（--test）下 main 由测试运行器代替，程序自己可以没有 main
+    if mi < 0 && !prog.testing { fail(1, 1, "缺少 fn main()") }
+    if mi >= 0 && (len(c.fns[mi].ptys) != 0 || c.fns[mi].ret != 3) { fail(1, 1, "main 不能有参数或返回值") }
+    // 第三遍：检查函数体
+    for i in 0..len(prog.fns) {
+        if !is_template(c, i) && !prog.fns[i].ext && !skipped_body(c, prog.fns[i]) { check_fn(&c, prog.fns[i], i) }
+    }
+    // 第四遍：检查泛型实例；检查过程中可能产生新的实例，一直做到队列清空
+    j = 0
+    for j < len(c.insts) {
+        fi = len(prog.fns) + j
+        f = replace(&c.insts[j], empty_fn())
+        tv = c.fns[fi].tvars.copy()
+        ta = c.fns[fi].targs.copy()
+        c.tvars = tv
+        c.targs = ta
+        if !skipped_body(c, f) { check_fn(&c, f, fi) }
+        c.tvars = []
+        c.targs = []
+        c.insts[j] = f
+        j += 1
+    }
+    check_imports(&c)
+    check_unused_items(&c, prog)
+    tb = boxed_types(c)
+    c.tboxed = tb
+    c
+}
+
+// ---------- 接口约束 ----------
+// 约束在实例化时检查，报错指向调用处。内置约束 Eq（可以 ==）、Ord（可以 <）；
+// 用户接口按结构匹配：把 Self 换成实参类型后，存在签名完全相同的函数即满足。
+
+fn split_plus(s: str) -> [str] {
+    out: [str] = []
+    start = 0
+    for i in 0..len(s) {
+        if byte_at(s, i) == '+' {
+            out.push(slice(s, start, i))
+            start = i + 1
+        }
+    }
+    out.push(slice(s, start, len(s)))
+    out
+}
+
+fn check_bound_names(c: Ctx, bs: str, line: int, col: int) {
+    if bs == "" { return }
+    parts = split_plus(bs)
+    for b in parts {
+        known = b == "Eq" || b == "Ord" || is_iter_bound(b)
+        for n in c.inames {
+            if n == b { known = true }
+        }
+        if !known { fail(line, col, "未知接口 #{b}") }
+    }
+}
+
+fn find_impl(c: Ctx, name: str, modes: [str], tys: [int], ret: int) -> bool {
+    for f in c.fns {
+        if f.uname == name && len(f.targs) == 0 && len(f.tvars) == 0 && f.ret == ret && len(f.ptys) == len(tys) {
+            same = true
+            for k in 0..len(tys) {
+                if f.ptys[k] != tys[k] || f.pmodes[k] != modes[k] { same = false }
+            }
+            if same { return true }
+        }
+    }
+    false
+}
+
+fn satisfy(inout c: Ctx, b: str, t: int, line: int, col: int) {
+    if is_iter_bound(b) {
+        if bound_elem(&c, b, t) < 0 { fail(line, col, iter_miss(c, b, t)) }
+        return
+    }
+    if b == "Eq" {
+        if !is_eq(c, t) { fail(line, col, "#{show_ty(c, t)} 不满足 Eq：函数类型不能比较") }
+        return
+    }
+    if b == "Ord" {
+        if t != 0 && t != 2 && t != 9 && !is_fixed(t) && find_op(c, "cmp", t) < 0 {
+            fail(line, col, "#{show_ty(c, t)} 不满足 Ord：只有 int / float / str 和定义了 fn cmp(a, b) -> int 的类型能用 < 比较")
+        }
+        return
+    }
+    for i in 0..len(c.imeths) {
+        if c.imeths[i].iface == b {
+            nm = c.imeths[i].name
+            texts = c.imeths[i].ptexts.copy()
+            modes = c.imeths[i].pmodes.copy()
+            rtext = c.imeths[i].ret
+            ml = c.imeths[i].line
+            mc = c.imeths[i].col
+            tys: [int] = []
+            for tx in texts {
+                ty = resolve_with(&c, tx, ["Self"], [t], ml, mc)
+                tys.push(ty)
+            }
+            r = resolve_with(&c, rtext, ["Self"], [t], ml, mc)
+            if !find_impl(c, nm, modes, tys, r) {
+                ps: [str] = []
+                for k in 0..len(tys) {
+                    pre = if modes[k] == "read" { "" } else { modes[k] + " " }
+                    ps.push(pre + show_ty(c, tys[k]))
+                }
+                rs = if r == 3 { "" } else { " -> " + show_ty(c, r) }
+                fail(line, col, "#{show_ty(c, t)} 不满足接口 #{b}：缺少 fn #{nm}(#{join(ps, ", ")})#{rs}")
+            }
+        }
+    }
+}
+
+fn check_bounds(inout c: Ctx, gi: int, bound: [int], line: int, col: int) {
+    for k in 0..len(bound) {
+        bs = c.fns[gi].tbounds[k].copy()
+        if bs != "" {
+            parts = split_plus(bs)
+            for b in parts {
+                satisfy(&c, b, bound[k], line, col)
+            }
+        }
+    }
+}
+
+// select：同时等几个 Chan，先到的那个执行对应分支。v <- ch 里 v 拿到收到的值（拥有它）；
+// after ms：等了 ms 毫秒还没有值；done：所有通道都结束了（除自己以外的持有者都放手、队列也空了）。
+// 没有 done 分支时，所有通道结束后 select 什么也不做，所以这时各分支不能有值。
+fn check_select(inout c: Ctx, e: Expr, arms: [SelArm], expect: int) -> int {
+    nrecv = 0
+    nafter = 0
+    ndone = 0
+    for a in arms {
+        if a.kind == "recv" { nrecv += 1 }
+        if a.kind == "after" { nafter += 1 }
+        if a.kind == "done" { ndone += 1 }
+    }
+    if nrecv == 0 { fail(e.line, e.col, "select 至少要有一个 v <- ch 分支") }
+    if nafter > 1 || ndone > 1 { fail(e.line, e.col, "select 里 after 和 done 各最多一个") }
+    // 先检查所有的通道和超时，再检查分支体
+    elems: [int] = []
+    for a in arms {
+        el = -1
+        match a.src {
+            Some(s) => {
+                if a.kind == "recv" {
+                    t = check_expr(&c, s, -1)
+                    if !is_chan(c, t) { fail(s.line, s.col, "<- 右边需要 Chan[T]，而不是 #{show_ty(c, t)}") }
+                    el = telem(c, t)
+                } else {
+                    t2 = check_expr(&c, s, 0)
+                    expect_ty(c, 0, t2, s.line, s.col)
+                }
+            }
+            None => {}
+        }
+        elems.push(el)
+    }
+    want = if ndone == 0 { 3 } else { expect }
+    acc = 4
+    for k in 0..len(arms) {
+        push_scope(&c)
+        if arms[k].kind == "recv" {
+            v = declare(&c, arms[k].name, elems[k], "owned", arms[k].line, arms[k].col)
+            c.vid[arms[k].id] = v
+        }
+        bt = check_expr(&c, arms[k].body, if want == 3 { -1 } else { want })
+        pop_scope(&c)
+        if ndone == 0 && bt != 3 && bt != 4 {
+            fail(arms[k].body.line, arms[k].body.col, "select 没有 done 分支时，各分支不能有值（所有通道结束后 select 什么也不做）")
+        }
+        acc = join_ty(c, acc, bt, arms[k].line, arms[k].col)
+    }
+    if ndone == 0 { 3 } else { acc }
+}
+
+fn is_tuple_expr(e: Expr) -> bool {
+    match e.kind {
+        ETuple(_) => true
+        _ => false
+    }
+}
+
+// (a, b)：元素按期望的元组类型检查（这样 None、[] 之类也能确定类型）
+fn check_tuple(inout c: Ctx, e: Expr, items: [Expr], expect: int) -> int {
+    ets: [int] = []
+    if is_tuple(c, expect) { ets = tuple_elems(c, expect) }
+    tys: [int] = []
+    for k in 0..len(items) {
+        want = if len(ets) == len(items) { ets[k] } else { -1 }
+        t = check_expr(&c, items[k], want)
+        if unit_like(t) { fail(items[k].line, items[k].col, "元组的元素不能是 #{show_ty(c, t)}") }
+        no_fn(c, t, "元组的元素", items[k].line, items[k].col)
+        tys.push(t)
+    }
+    tuple_of(&c, tys)
+}
+
+// a, b = 元组：声明新变量，各自拿走对应的元素；_ 表示丢弃
+fn check_destructure(inout c: Ctx, s: Stmt, target: Expr, annot: str, rhs: Expr) {
+    if annot != "" { fail(s.line, s.col, "解构赋值不能标注类型") }
+    t = check_expr(&c, rhs, -1)
+    if !is_tuple(c, t) { fail(rhs.line, rhs.col, "a, b = … 的右边需要元组，而不是 #{show_ty(c, t)}") }
+    es = tuple_elems(c, t)
+    match target.kind {
+        ETuple(ts) => {
+            if len(ts) != len(es) { fail(s.line, s.col, "元组有 #{len(es)} 个元素，左边写了 #{len(ts)} 个") }
+            for k in 0..len(ts) {
+                nm = var_name(ts[k])
+                if nm == "" { fail(ts[k].line, ts[k].col, "解构只能声明新变量") }
+                if nm != "_" {
+                    if lookup(c, nm) >= 0 { fail(ts[k].line, ts[k].col, "解构只能声明新变量，#{nm} 已经存在") }
+                    v = declare(&c, nm, es[k], "owned", ts[k].line, ts[k].col)
+                    c.vid[ts[k].id] = v
+                }
+                c.ety[ts[k].id] = es[k]
+            }
+        }
+        _ => {}
+    }
+    c.decl[s.id] = true
+    c.ety[target.id] = t
+}
+
+// ---------- 嵌套模式的穷尽检查 ----------
+// 每个分支是矩阵里的一行，一开始只有一列（被匹配的值）。对第一列的类型：
+// 有限个构造（枚举的变体、Some/None、Ok/Err、true/false、元组）时，按每个构造“特化”：
+// 匹配这个构造的行换成它的子模式，_ 和名字换成相应个数的 _；每个构造都要被覆盖。
+// 整数、字符串这类无限的类型只看第一列是 _ 或名字的行。
+
+fn exhaustive_arms(c: Ctx, t: int, arms: [Arm]) -> bool {
+    rows: [[Pat]] = []
+    for a in arms {
+        r: [Pat] = [a.pat.copy()]
+        rows.push(r)
+    }
+    exhaustive(c, rows, [t])
+}
+
+fn exhaustive(c: Ctx, rows0: [[Pat]], tys: [int]) -> bool {
+    rows = flat_or(rows0)
+    if len(rows) == 0 { return false }
+    if len(tys) == 0 { return true }
+    t = tys[0]
+    rest: [int] = []
+    for k in 1..len(tys) { rest.push(tys[k]) }
+    names = ctor_names(c, t)
+    // 第一列全是 _ 或名字时不用展开构造（否则递归的枚举会无限展开下去）
+    any_ctor = false
+    for r in rows {
+        if !is_simple_pat(r[0]) { any_ctor = true }
+    }
+    if len(names) == 0 || !any_ctor {
+        // 无限的类型：只能靠第一列是 _ 或名字的行
+        dm: [[Pat]] = []
+        for r in rows {
+            if is_simple_pat(r[0]) { dm.push(tail_of(r)) }
+        }
+        return exhaustive(c, dm, rest)
+    }
+    for nm in names {
+        fts = ctor_fields(c, t, nm)
+        sm: [[Pat]] = []
+        for r in rows {
+            subs = spec_row(r, nm, len(fts))
+            if len(subs) > 0 { sm.push(subs[0].copy()) }
+        }
+        all_tys = fts.copy()
+        for x in rest { all_tys.push(x) }
+        if !exhaustive(c, sm, all_tys) { return false }
+    }
+    true
+}
+
+// 第一列是“或”模式的行展开成每个选项一行（没有列的行原样保留）
+fn flat_or(rows: [[Pat]]) -> [[Pat]] {
+    out: [[Pat]] = []
+    for r in rows {
+        alts: [Pat] = []
+        if len(r) > 0 {
+            alts = match r[0] {
+                POr(xs) => xs.copy()
+                _ => []
+            }
+        }
+        if len(alts) == 0 {
+            out.push(r.copy())
+        } else {
+            for a in alts {
+                nr: [Pat] = [a.copy()]
+                for k in 1..len(r) { nr.push(r[k].copy()) }
+                out.push(nr)
+            }
+        }
+    }
+    out
+}
+
+// 模式里有没有绑定名字
+fn has_bind(p: Pat) -> bool {
+    match p {
+        PBind(_, _) => true
+        PVariant(_, fs) => any_bind(fs)
+        PTuple(items) => any_bind(items)
+        POr(alts) => any_bind(alts)
+        PType(n, _, _) => n != "_"
+        _ => false
+    }
+}
+
+fn any_bind(ps: [Pat]) -> bool {
+    for x in ps {
+        if has_bind(x) { return true }
+    }
+    false
+}
+
+// 第一列的类型有哪些构造；无限的类型返回 []
+fn ctor_names(c: Ctx, t: int) -> [str] {
+    k = tkind(c, t)
+    if t == 1 { return ["true", "false"] }
+    if k == "opt" { return ["Some", "None"] }
+    if k == "res" { return ["Ok", "Err"] }
+    if is_tuple(c, t) { return ["()"] }
+    if k == "enum" {
+        out: [str] = []
+        ei = find_enum(c, tname(c, t))
+        for v in c.enums[ei].variants { out.push(v.name.copy()) }
+        return out
+    }
+    []
+}
+
+fn ctor_fields(c: Ctx, t: int, nm: str) -> [int] {
+    k = tkind(c, t)
+    if nm == "Some" { return [telem(c, t)] }
+    if nm == "Ok" && telem(c, t) != 3 { return [telem(c, t)] }
+    if nm == "Err" { return [res_err(c, t)] }
+    if nm == "()" { return tuple_elems(c, t) }
+    if k == "enum" {
+        ei = find_enum(c, tname(c, t))
+        return c.enums[ei].variants[variant_index(c, ei, nm)].ftys.copy()
+    }
+    []
+}
+
+// 按构造 nm 特化一行：不匹配时返回 []，匹配时返回只含新行的列表
+fn spec_row(r: [Pat], nm: str, arity: int) -> [[Pat]] {
+    out: [[Pat]] = []
+    nr: [Pat] = []
+    ok = false
+    match r[0] {
+        PWild => {
+            ok = true
+            for _k in 0..arity { nr.push(PWild) }
+        }
+        PBind(_, _) => {
+            ok = true
+            for _k in 0..arity { nr.push(PWild) }
+        }
+        PVariant(vn, fs) => {
+            if vn == nm {
+                ok = true
+                // ()! 的 Ok(_) 比构造多一个字段，多出来的 _ 不算一列
+                for k in 0..len(fs) {
+                    if k < arity { nr.push(fs[k].copy()) }
+                }
+            }
+        }
+        PBool(b) => {
+            ok = (b && nm == "true") || (!b && nm == "false")
+        }
+        PTuple(items) => {
+            ok = nm == "()"
+            if ok {
+                for x in items { nr.push(x.copy()) }
+            }
+        }
+        _ => {}
+    }
+    if !ok { return out }
+    for k in 1..len(r) { nr.push(r[k].copy()) }
+    out.push(nr)
+    out
+}
+
+fn tail_of(r: [Pat]) -> [Pat] {
+    out: [Pat] = []
+    for k in 1..len(r) { out.push(r[k].copy()) }
+    out
+}
+
+// import 了却没用到的模块记一条警告。用到指的是：这个文件里写过 m.x（类型、函数、常量、变体都算），
+// 或者这个文件里的方法调用、运算符、下标解析到了 m 里的函数（见 note_mod）
+fn check_imports(inout c: Ctx) {
+    n = len(c.toks)
+    for k in 0..n {
+        if c.toks[k].kind == "import" && k + 1 < n && c.toks[k + 1].kind == "str" {
+            path = c.toks[k + 1].text.copy()
+            ln = c.toks[k].line
+            cl = c.toks[k].col
+            if !mod_used(c, path_last(path), ln / 100000) { warn(&c, ln, cl, "import \"#{path}\" 没有用到") }
+        }
+    }
+}
+
+fn mod_used(c: Ctx, m: str, f: int) -> bool {
+    if has(c.umods, "#{m}@#{f}") { return true }
+    for k in 0..len(c.toks) - 1 {
+        if c.toks[k].kind == "ident" && c.toks[k].text == m && c.toks[k + 1].kind == "." && c.toks[k].line / 100000 == f {
+            return true
+        }
+    }
+    false
+}
+
+// "std/map" → "map"（模块名是文件名）
+fn path_last(p: str) -> str {
+    i = len(p) - 1
+    for i >= 0 && byte_at(p, i) != '/' { i -= 1 }
+    slice(p, i + 1, len(p))
+}
+
+// ---------- 字段的可见性 ----------
+// 模块里定义的结构体，没写 pub 的字段只能在这个模块里用（读也不行）；有这样的字段时，模块外也不能直接构造，
+// 要用模块提供的函数（如 map.new()）。根模块（命令行给出的文件）里的结构体不受限制。
+
+// 结构体（或泛型结构体的实例）声明时的名字：map.Map__3_0 → map.Map
+fn struct_decl_name(c: Ctx, sname: str) -> str {
+    for x in c.tinsts {
+        if x.key == sname { return x.origin.copy() }
+    }
+    sname.copy()
+}
+
+fn field_vis(c: Ctx, t: int, f: str, line: int, col: int) {
+    m = type_mod(c, t)
+    if m == "" || m == mod_of(c, line) { return }
+    dn = struct_decl_name(c, tname(c, t))
+    if has(c.fpriv, dn + "." + f) {
+        fail(line, col, "#{show_ty(c, t)} 的字段 #{f} 没有 pub，只能在模块 #{m} 里使用")
+    }
+}
+
+// 结构体的字段全都写了 pub：模块外能直接构造，也能修改字段（它只是一组数据，没有要保护的内部状态）
+fn all_pub(c: Ctx, sname: str) -> bool {
+    p = struct_decl_name(c, sname) + "."
+    for k in c.fpriv {
+        if len(k) > len(p) && slice(k, 0, len(p)) == p { return false }
+    }
+    true
+}
+
+fn ctor_vis(c: Ctx, sname: str, line: int, col: int) {
+    m = mod_part(sname)
+    if m == "" || m == mod_of(c, line) { return }
+    dn = struct_decl_name(c, sname)
+    p = dn + "."
+    for k in c.fpriv {
+        if len(k) > len(p) && slice(k, 0, len(p)) == p {
+            f = slice(k, len(p), len(k))
+            fail(line, col, "#{dn} 的字段 #{f} 没有 pub，所以在模块 #{m} 外面不能直接构造 #{last_part(dn)}（请用 #{m} 提供的函数）")
+        }
+    }
+}
+
+// ---------- 没用到的函数和类型 ----------
+// 不带 pub 的函数、结构体和枚举，名字在能看到它的文件里（根模块是命令行给出的所有文件，模块是它自己）
+// 除了声明之外一次都没出现过时警告。按名字算：重载里只要有一个被用到就都不警告；
+// 会被隐式调用的名字（运算符、show、eq、next、drop、接口方法等）、test 块和以 _ 开头的名字不算。
+
+type Cand {
+    name: str
+    kind: str       // "函数" / "类型"
+    file: int       // -1：根模块（所有命令行给出的文件）；否则是模块所在的文件
+    decls: int      // 同一个名字的声明个数（重载、枚举的变体名）
+    uses: int       // 出现的次数（含声明）
+    line: int
+    col: int
+    alts: [str]     // 枚举的变体名：用到任何一个也算用到
+}
+
+fn implicit_fn(c: Ctx, n: str) -> bool {
+    is_protocol_fn(c, n) || n == "add" || n == "sub" || n == "mul" || n == "div" || n == "rem" || n == "neg" ||
+        n == "index" || n == "set_index" || n == "show" || n == "hash" || n == "iter_len" || n == "iter_at" ||
+        (len(n) > 6 && slice(n, 0, 6) == "test__")
+}
+
+fn name_hash(s: str) -> int {
+    h = 5381
+    for i in 0..len(s) { h = (h * 33 + byte_at(s, i)) % 1048573 }
+    h % 4096
+}
+
+fn cand_file(c: Ctx, line: int) -> int {
+    fi = line / 100000
+    if fi < c.nmain { -1 } else { fi }
+}
+
+fn add_cand(inout cs: [Cand], name: str, kind: str, file: int, line: int, col: int, alts: [str]) {
+    for k in 0..len(cs) {
+        if cs[k].name == name && cs[k].file == file && cs[k].kind == kind {
+            cs[k].decls += 1
+            return
+        }
+    }
+    cs.push(Cand(name: name, kind: kind, file: file, decls: 1, uses: 0, line: line, col: col, alts: alts.copy()))
+}
+
+fn check_unused_items(inout c: Ctx, prog: Program) {
+    cs: [Cand] = []
+    none: [str] = []
+    for f in prog.fns {
+        nm = f.name
+        if !has(c.pubs, f.line) && !implicit_fn(c, nm) && byte_at(nm, 0) != '_' {
+            add_cand(&cs, nm, "函数", cand_file(c, f.line), f.line, f.col, none)
+        }
+    }
+    for s in prog.structs {
+        if !has(c.pubs, s.line) && byte_at(s.name, 0) != '_' {
+            add_cand(&cs, s.name, "类型", cand_file(c, s.line), s.line, s.col, none)
+        }
+    }
+    for en in prog.enums {
+        if !has(c.pubs, en.line) && byte_at(en.name, 0) != '_' {
+            vs: [str] = []
+            for v in en.variants { vs.push(v.name.copy()) }
+            add_cand(&cs, en.name, "类型", cand_file(c, en.line), en.line, en.col, vs)
+        }
+    }
+    if len(cs) == 0 { return }
+    // 名字 → 候选（链表），变体名也挂上去，指向它的枚举
+    head = fill(4096, -1)
+    nxt: [int] = []
+    owner: [int] = []
+    keys: [str] = []
+    for k in 0..len(cs) {
+        names: [str] = [cs[k].name.copy()]
+        for a in cs[k].alts { names.push(a.copy()) }
+        for nm in names {
+            h = name_hash(nm)
+            nxt.push(head[h])
+            owner.push(k)
+            keys.push(nm.copy())
+            head[h] = len(keys) - 1
+        }
+    }
+    vuses = fill(len(keys), 0)
+    for t in c.toks {
+        if t.kind == "ident" {
+            tf = t.line / 100000
+            j = head[name_hash(t.text)]
+            for j >= 0 {
+                if keys[j] == t.text {
+                    cf = cs[owner[j]].file
+                    if (cf == -1 && tf < c.nmain) || cf == tf { vuses[j] += 1 }
+                }
+                j = nxt[j]
+            }
+        }
+    }
+    for j in 0..len(keys) {
+        k = owner[j]
+        if keys[j] == cs[k].name {
+            cs[k].uses += vuses[j]
+        } else if vuses[j] > 1 {
+            // 变体名除了声明还出现过
+            cs[k].uses += vuses[j]
+        }
+    }
+    for cd in cs {
+        if cd.uses <= cd.decls {
+            what = if cd.kind == "函数" { "函数 #{cd.name}" } else { "类型 #{cd.name}" }
+            warn(&c, cd.line, cd.col, "#{what} 没有用到（不需要的话可以删掉，或者改成以 _ 开头的名字）")
+        }
+    }
+}
+
+// ---------- 单元测试（lark1 --test，见 make unit-compiler） ----------
+
+// 解析并检查一段源码（必须能通过检查，否则编译器的 fail 会让这个测试失败）
+fn check_src(src: str) -> Ctx {
+    prog = parse_files([src], 1, [""])
+    toks = replace(&prog.toks, [])
+    check_program(prog, toks)
+}
+
+test "检查：小工具" {
+    assert_eq(split_plus("Eq+Ord"), ["Eq", "Ord"])
+    assert_eq(split_plus(""), [""])
+    assert(is_iter_bound("Iter[T]"))
+    assert(is_iter_bound("Next[T]"))
+    assert(is_next_bound("Next[T]"))
+    assert(!is_next_bound("Iter[T]"))
+    assert(!is_iter_bound("Iter[]"))
+    assert(!is_iter_bound("Eq"))
+    assert_eq(op_fn_name("+"), "add")
+    assert_eq(op_fn_name(">="), "cmp")
+    assert_eq(op_fn_name("=="), "")
+    assert_eq(path_last("std/map"), "map")
+    assert_eq(path_last("os"), "os")
+    assert_eq(split_fn("fn(int,[str])->bool"), ["bool", "int", "[str]"])
+    assert_eq(split_fn("fn()->int"), ["int"])
+    assert_eq(split_fn("Fn((int,str),[int])->str"), ["str", "(int,str)", "[int]"])
+}
+
+test "检查：函数签名" {
+    c = check_src("fn f(x: int, s: str) -> int { x }\n\nfn main() {}\n")
+    fi = find_fn(c, "f")
+    assert(fi >= 0)
+    assert_eq(c.fns[fi].ptys, [0, 2])
+    assert_eq(c.fns[fi].ret, 0)
+    // 参数没用到不警告；f 本身没被调用，所以有一条“函数 f 没有用到”
+    assert_eq(len(c.wmsgs), 1)
+    assert_eq(c.wmsgs[0], "函数 f 没有用到（不需要的话可以删掉，或者改成以 _ 开头的名字）")
+}
+
+test "检查：警告" {
+    c = check_src("fn main() {\n    y = 1\n    _z = 2\n    return\n    print(\"x\")\n}\n")
+    // 按发现的顺序：不会执行的语句在检查到时记下，没用到的变量在离开作用域时记下（打印前才按位置排序）
+    assert_eq(c.wlines, [5, 2])
+    assert_eq(c.wcols, [5, 5])
+    assert_eq(c.wmsgs[0], "这里永远不会执行：前面的语句已经 return / break / continue / panic / exit")
+    assert_eq(c.wmsgs[1], "变量 y 没有用到（不需要的话写成 _，或者改成以 _ 开头的名字）")
+}
+
+test "检查：没用到的函数和类型" {
+    c = check_src("type A {\n    n: int\n}\n\ntype B {\n    n: int\n}\n\nfn g(a: A) -> int { a.n }\n\nfn main() {\n    print(\"\#{g(A(n: 1))}\")\n}\n")
+    assert_eq(c.wlines, [5])
+    assert_eq(c.wmsgs, ["类型 B 没有用到（不需要的话可以删掉，或者改成以 _ 开头的名字）"])
+    assert_eq(name_hash("abc"), name_hash("abc"))
+    assert(name_hash("abc") >= 0 && name_hash("abc") < 4096)
+}
+
+test "检查：只有导入了模块的文件里，模块名才不能用作变量名" {
+    // 两个根模块文件：第一个导入了 m，第二个没有，所以第二个里 m 是普通的变量名
+    a = "import \"m\"\n\nfn main() {\n    if m.one() == 1 { g() }\n}\n"
+    b = "fn g() {\n    m = 2\n    _k = m + 1\n}\n"
+    md = "pub fn one() -> int { 1 }\n"
+    prog = parse_files([a, b, md], 2, ["", "", "m"])
+    assert_eq(prog.mods, ["m@0"])
+    toks = replace(&prog.toks, [])
+    c = check_program(prog, toks)
+    assert(find_fn(c, "g") >= 0)
+}
+
+test "检查：函数名当值、()! 的 if、Ok(_)" {
+    src = "fn dbl(x: int) -> int { x * 2 }\n\nfn ap(f: fn(int) -> int) -> int { f(1) }\n\n" +
+        "fn r(inout n: int) -> ()! {\n    if n > 0 {\n        n += 1\n    } else {\n        Err(\"负\")\n    }\n}\n\n" +
+        "fn main() {\n    k = 1\n    _v = ap(dbl)\n    match r(&k) {\n        Ok(_) => {}\n        Err(_) => {}\n    }\n}\n"
+    c = check_src(src)
+    hit = 0
+    for k in 0..len(c.rkind) {
+        if c.rkind[k] == "fnval" { hit += 1 }
+    }
+    assert_eq(hit, 1)
+}

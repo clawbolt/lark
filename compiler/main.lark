@@ -1,0 +1,500 @@
+// Lark 编译器 stage1 · 命令行入口
+// 用法：lark1 a.lark b.lark … [-o out.c] [-w] [--test] [--release] [-p 名字=目录]…
+// （-w：不显示警告；--test：生成运行文件里全部 test 块的程序；--release：生成的 C 不记调用栈，panic 时只打印信息）
+// -p json5=/缓存/json5：import "json5" 载入 目录/json5.lark，import "json5/sub" 载入 目录/sub.lark（lark build 用它找依赖和 std）
+// 多个文件共享同一个顶层命名空间（还没有模块系统），声明顺序和文件顺序无关。
+
+fn strip_ext(path: str) -> str {
+    i = len(path) - 1
+    for i >= 0 {
+        b = byte_at(path, i)
+        if b == '.' { return slice(path, 0, i) }
+        if b == '/' { break }
+        i -= 1
+    }
+    path
+}
+
+fn usage() {
+    eprint("用法：lark1 <输入.lark>… [-o <输出.c>] [-w] [--test] [--release] [-p 名字=目录]…")
+    exit(2)
+}
+
+// 命令行里除了 -o 及其参数以外的都是输入文件，顺序就是文件序号
+fn input_files() -> [str] {
+    av = args()
+    fs: [str] = []
+    i = 1
+    for i < len(av) {
+        if av[i] == "-w" || av[i] == "--test" || av[i] == "--release" {
+            i += 1
+        } else if av[i] == "-o" || av[i] == "-p" || av[i] == "--skip" {
+            i += 2
+        } else {
+            fs.push(av[i])
+            i += 1
+        }
+    }
+    fs
+}
+
+// 输入文件加上它们（递归地）import 的模块，顺序就是文件序号。
+// import 只认行首的 `import "路径"`；fail 也靠这里找回文件名，所以这里不做会报错的词法分析。
+fn all_files() -> [str] {
+    fs = input_files()
+    k = 0
+    for k < len(fs) {
+        src = try_read_file(fs[k]) ?? ""
+        imps = import_paths(src)
+        for path in imps {
+            f = resolve_import(fs[k], path)
+            if !has(fs, f) { fs.push(f) }
+        }
+        k += 1
+    }
+    fs
+}
+
+fn import_paths(src: str) -> [str] {
+    ps: [str] = []
+    start = 0
+    for i in 0..len(src) + 1 {
+        if i == len(src) || byte_at(src, i) == '\n' {
+            ln = slice(src, start, i)
+            if len(ln) > 8 && slice(ln, 0, 8) == "import \"" {
+                j = 8
+                for j < len(ln) && byte_at(ln, j) != '"' { j += 1 }
+                ps.push(slice(ln, 8, j))
+            }
+            start = i + 1
+        }
+    }
+    ps
+}
+
+// 命令行的 -p 名字=目录，每项是 [名字, 目录]
+fn pkg_maps() -> [[str]] {
+    av = args()
+    out: [[str]] = []
+    i = 1
+    for i + 1 < len(av) {
+        if av[i] == "-p" {
+            m = av[i + 1]
+            for k in 0..len(m) {
+                if byte_at(m, k) == '=' {
+                    pair = [slice(m, 0, k), slice(m, k + 1, len(m))]
+                    out.push(pair)
+                    break
+                }
+            }
+            i += 2
+        } else {
+            i += 1
+        }
+    }
+    out
+}
+
+// path 的第一段是 -p 给的名字时，换成那个目录里的文件；不是时为 ""
+fn mapped_import(maps: [[str]], path: str) -> str {
+    cut = len(path)
+    for k in 0..len(path) {
+        if byte_at(path, k) == '/' {
+            cut = k
+            break
+        }
+    }
+    head = slice(path, 0, cut)
+    for m in maps {
+        if m[0] == head {
+            rest = if cut == len(path) { head } else { slice(path, cut + 1, len(path)) }
+            return normalize(m[1] + "/" + rest + ".lark")
+        }
+    }
+    ""
+}
+
+// 路径不带 .lark：第一段是 -p 给的名字时到那个目录里找；否则先相对于写 import 的文件所在的目录找，
+// 找不到再相对于那个文件所在的包的根目录找（依赖包里的文件是 -p 给的目录，项目自己的文件是当前目录）。
+// 这样依赖包里写 import "http/request" 找的是它自己的 http/，和被谁依赖、在哪里编译无关。
+// 两处都没有时返回前者，由 main 报“找不到”
+fn resolve_import(from: str, path: str) -> str {
+    maps = pkg_maps()
+    mp = mapped_import(maps, path)
+    if mp != "" { return mp }
+    near = normalize(dir_of(from) + path + ".lark")
+    if exists(near) { return near }
+    here = normalize(pkg_root(maps, from) + path + ".lark")
+    if exists(here) { here } else { near }
+}
+
+// 文件所在的包的根目录（带结尾的 /）：在哪个 -p 给的目录里就是那个目录，都不在时是当前目录（""）
+fn pkg_root(maps: [[str]], file: str) -> str {
+    f = normalize(file)
+    for m in maps {
+        d = normalize(m[1])
+        if d != "" && str_starts(f, d + "/") { return d + "/" }
+    }
+    ""
+}
+
+fn str_starts(s: str, p: str) -> bool { len(s) >= len(p) && slice(s, 0, len(p)) == p }
+
+fn exists(path: str) -> bool {
+    r = try_read_file(path)
+    match r {
+        Ok(_) => true
+        Err(_) => false
+    }
+}
+
+fn dir_of(path: str) -> str {
+    i = len(path) - 1
+    for i >= 0 {
+        if byte_at(path, i) == '/' { return slice(path, 0, i + 1) }
+        i -= 1
+    }
+    ""
+}
+
+// 去掉 "." 和 "x/.."，让同一个文件只载入一次
+fn normalize(path: str) -> str {
+    parts: [str] = []
+    start = 0
+    for i in 0..len(path) + 1 {
+        if i == len(path) || byte_at(path, i) == '/' {
+            seg = slice(path, start, i)
+            if seg == ".." && len(parts) > 0 && parts[len(parts) - 1] != ".." {
+                _dropped = parts.pop()
+            } else if seg != "." && seg != "" {
+                parts.push(seg)
+            }
+            start = i + 1
+        }
+    }
+    s = join(parts, "/")
+    if len(path) > 0 && byte_at(path, 0) == '/' { "/" + s } else { s }
+}
+
+// 行号里编码了文件序号（见 lex.lark 的 file_base），这里拆开并找回文件名。
+// 报完一处错误后，带上 --skip 重新编译一遍找下一处（见 next_error）：重新编译时跳过报过错的那条语句（check.lark 的 check_block），
+// 函数体里别的语句照常检查，所以一个函数里的几处错误能一起报出来
+fn fail(line: int, col: int, msg: str) {
+    skips = skip_lines()
+    if has_line(skips, line) {
+        // 跳过那条语句以后同一行又报错：错误不在语句开头的那一行（比如跨行的表达式中间），或者根本不在函数体里。
+        // 这次不再报，改成跳过整个函数体再找一遍；整个函数体都跳过了还在这里出错（语法错误、类型声明里的错误等），就停下
+        if !has_line(skips, 0 - line) { next_error(skips, 0 - line) }
+        exit(1)
+    }
+    report("错误", line, col, msg)
+    next_error(skips, line)
+    exit(1)
+}
+
+// 一次最多报这么多处错误
+fn max_errors() -> int { 10 }
+
+// 隐藏的参数 --skip 行,行,…（行号带文件序号）：这些行开头的语句不检查；写成 w行 时整个函数体都不检查（负数表示）
+fn skip_lines() -> [int] {
+    av = args()
+    out: [int] = []
+    for i in 0..len(av) - 1 {
+        if av[i] == "--skip" {
+            for s in split_on(av[i + 1], ',') {
+                whole = len(s) > 0 && byte_at(s, 0) == 'w'
+                n = try_parse_int(if whole { slice(s, 1, len(s)) } else { s.copy() }) ?? -1
+                if n >= 0 { out.push(if whole { 0 - n } else { n }) }
+            }
+        }
+    }
+    out
+}
+
+// 报过的错误有几处（不算整个函数体跳过的标记）
+fn reported(skips: [int]) -> int {
+    n = 0
+    for s in skips {
+        if s > 0 { n += 1 }
+    }
+    n
+}
+
+fn has_line(xs: [int], x: int) -> bool {
+    for v in xs {
+        if v == x { return true }
+    }
+    false
+}
+
+fn split_on(s: str, sep: int) -> [str] {
+    out: [str] = []
+    start = 0
+    for i in 0..len(s) + 1 {
+        if i == len(s) || byte_at(s, i) == sep {
+            out.push(slice(s, start, i))
+            start = i + 1
+        }
+    }
+    out
+}
+
+// 跳过报过错的语句（line 是负数时跳过整个函数体，不算一处错误），用同样的参数再编译一遍（只检查、不生成 C），找下一处错误；子进程的错误直接打到 stderr。
+// 编译器的单元测试（没有输入文件）不这样做
+fn next_error(skips: [int], line: int) {
+    if len(input_files()) == 0 { return }
+    if line > 0 && reported(skips) + 1 >= max_errors() {
+        eprint("（已经报了 #{max_errors()} 处错误，后面的没有再检查）")
+        return
+    }
+    av = args()
+    parts: [str] = [sh_quote(av[0])]
+    k = 1
+    for k < len(av) {
+        if av[k] == "--skip" {
+            k += 2
+        } else {
+            parts.push(sh_quote(av[k]))
+            k += 1
+        }
+    }
+    ls: [str] = []
+    for s in skips { ls.push(skip_arg(s)) }
+    ls.push(skip_arg(line))
+    parts.push("--skip")
+    parts.push(join(ls, ","))
+    _code = run_cmd(join(parts, " "))
+}
+
+fn skip_arg(s: int) -> str { if s < 0 { "w#{0 - s}" } else { "#{s}" } }
+
+fn sh_quote(s: str) -> str {
+    out = "'"
+    for i in 0..len(s) {
+        if byte_at(s, i) == '\'' { out += "'\\''" } else { out += slice(s, i, i + 1) }
+    }
+    out + "'"
+}
+
+// 打印 “文件:行:列: 类别：信息”，再把那一行和指向列的 ^ 打出来
+fn report(kind: str, line: int, col: int, msg: str) {
+    f = line / 100000
+    n = line % 100000
+    fs = all_files()
+    name = if f < len(fs) { fs[f] } else { "?" }
+    eprint("#{name}:#{n}:#{col}: #{kind}：#{msg}")
+    if f < len(fs) {
+        src = try_read_file(fs[f]) ?? ""
+        text = line_text(src, n)
+        if text != "" {
+            num = int_str(n)
+            eprint(" #{num} | #{text}")
+            eprint(" #{blank(len(num))} | #{caret_pad(text, col - 1)}^")
+        }
+    }
+}
+
+// 编译成功后按位置输出警告。标准库（std/ 下的文件）里的警告不输出：那不是用户能改的代码
+fn print_warnings(c: Ctx) {
+    fs = all_files()
+    order: [int] = []
+    for i in 0..len(c.wmsgs) {
+        // 插入排序：先按行（含文件序号），再按列
+        k = len(order)
+        order.push(i)
+        for k > 0 && later(c, order[k - 1], i) {
+            order[k] = order[k - 1]
+            k -= 1
+        }
+        order[k] = i
+    }
+    shown = 0
+    for i in order {
+        f = c.wlines[i] / 100000
+        lib = f < len(fs) && (starts_with_std(fs[f]) || has_sub_std(fs[f]))
+        if !lib {
+            report("警告", c.wlines[i], c.wcols[i], c.wmsgs[i])
+            shown += 1
+        }
+    }
+    if shown > 0 { eprint("#{shown} 条警告（加 -w 可以不显示）") }
+}
+
+fn later(c: Ctx, a: int, b: int) -> bool {
+    c.wlines[a] > c.wlines[b] || (c.wlines[a] == c.wlines[b] && c.wcols[a] > c.wcols[b])
+}
+
+fn starts_with_std(p: str) -> bool { len(p) >= 4 && slice(p, 0, 4) == "std/" }
+
+fn has_sub_std(p: str) -> bool {
+    for i in 0..len(p) {
+        if i + 5 <= len(p) && slice(p, i, i + 5) == "/std/" { return true }
+    }
+    false
+}
+
+// 第 n 行（从 1 数）的内容，不含换行；行号超出时为 ""
+fn line_text(src: str, n: int) -> str {
+    ln = 1
+    start = 0
+    for i in 0..len(src) {
+        if byte_at(src, i) == '\n' {
+            if ln == n { return slice(src, start, i) }
+            ln += 1
+            start = i + 1
+        }
+    }
+    if ln == n { slice(src, start, len(src)) } else { "" }
+}
+
+fn blank(n: int) -> str {
+    parts: [str] = []
+    for _i in 0..n { parts.push(" ") }
+    join(parts, "")
+}
+
+// 让 ^ 对准第 k 个字节下面：列号按字节数，终端里 ASCII 占 1 格、中文等三字节字符占 2 格，tab 原样保留
+fn caret_pad(text: str, k: int) -> str {
+    parts: [str] = []
+    i = 0
+    for i < k && i < len(text) {
+        b = byte_at(text, i)
+        if b == '\t' {
+            parts.push("\t")
+        } else if b < 128 {
+            parts.push(" ")
+        } else if b >= 224 {
+            parts.push("  ")
+        } else if b >= 192 {
+            parts.push(" ")
+        }
+        i += 1
+    }
+    join(parts, "")
+}
+
+fn main() {
+    av = args()
+    output = ""
+    quiet = false
+    testing = false
+    release = false
+    i = 1
+    for i < len(av) {
+        if av[i] == "-w" {
+            quiet = true
+            i += 1
+        } else if av[i] == "--release" {
+            release = true
+            i += 1
+        } else if av[i] == "--test" {
+            testing = true
+            i += 1
+        } else if av[i] == "-o" {
+            if i + 1 >= len(av) { usage() }
+            output = av[i + 1]
+            i += 2
+        } else {
+            i += 1
+        }
+    }
+    inputs = input_files()
+    if len(inputs) == 0 { usage() }
+    if output == "" { output = strip_ext(inputs[0]) + ".c" }
+    files = all_files()
+    srcs: [str] = []
+    for f in files {
+        r = try_read_file(f)
+        match take r {
+            Ok(s) => srcs.push(s)
+            Err(_) => {
+                eprint("错误：找不到文件 #{f}（import 的路径相对于写 import 的文件所在目录，或当前目录）")
+                exit(1)
+            }
+        }
+    }
+    // 命令行给出的文件属于根模块（""），import 载入的文件各是一个模块，模块名是文件名
+    fmods: [str] = []
+    for k in 0..len(files) {
+        if k < len(inputs) {
+            fmods.push("")
+        } else {
+            mn = module_name(files[k])
+            if has(fmods, mn) { eprint("错误：两个模块都叫 #{mn}（#{files[k]}）"); exit(1) }
+            fmods.push(mn)
+        }
+    }
+    prog = parse_files(srcs, len(inputs), fmods)
+    prog.paths = files.copy()
+    prog.testing = testing
+    toks = replace(&prog.toks, [])
+    c = check_program(prog, toks)
+    own_program(c, prog)
+    // 重新编译找下一处错误时（见 next_error）只做检查：走到这里说明后面没有别的错误了
+    if len(skip_lines()) > 0 { exit(1) }
+    out0 = gen_program(c, prog)
+    // --release：等于编译 C 时加 -DLK_NOTRACE（见运行时的 LK_FRAME），整数溢出检查照常保留
+    out = if release { "#define LK_NOTRACE\n" + out0 } else { out0 }
+    write_file(output, out)
+    if !quiet { print_warnings(c) }
+}
+
+// "std/map.lark" → "map"
+fn module_name(path: str) -> str {
+    base = strip_ext(path)
+    i = len(base) - 1
+    for i >= 0 {
+        if byte_at(base, i) == '/' { return slice(base, i + 1, len(base)) }
+        i -= 1
+    }
+    base
+}
+
+// ---------- 单元测试（lark1 --test，见 make unit-compiler） ----------
+
+test "命令行：路径" {
+    assert_eq(strip_ext("a/b.lark"), "a/b")
+    assert_eq(strip_ext("a.d/b"), "a.d/b")
+    assert_eq(module_name("std/map.lark"), "map")
+    assert_eq(module_name("x"), "x")
+    assert_eq(dir_of("a/b.lark"), "a/")
+    assert_eq(dir_of("b.lark"), "")
+    assert_eq(normalize("a/./b/../c"), "a/c")
+    assert_eq(normalize("../x"), "../x")
+    assert_eq(normalize("/a//b"), "/a/b")
+    assert(starts_with_std("std/os.lark"))
+    assert(has_sub_std("lib/std/os.lark"))
+    assert(!has_sub_std("stdx/os.lark"))
+}
+
+test "命令行：-p 映射的 import" {
+    maps = [["json5", "/c/json5"], ["std", "/home/lark/std/"]]
+    assert_eq(mapped_import(maps, "json5"), "/c/json5/json5.lark")
+    assert_eq(mapped_import(maps, "json5/sub"), "/c/json5/sub.lark")
+    assert_eq(mapped_import(maps, "std/map"), "/home/lark/std/map.lark")
+    assert_eq(mapped_import(maps, "geo"), "")
+    assert_eq(mapped_import(maps, "json"), "")
+    // 依赖包里的文件：包的根目录是 -p 给的目录；项目自己的文件是当前目录
+    assert_eq(pkg_root(maps, "/c/json5/sub/x.lark"), "/c/json5/")
+    assert_eq(pkg_root(maps, "/home/lark/std/os.lark"), "/home/lark/std/")
+    assert_eq(pkg_root(maps, "/c/json5x/a.lark"), "")
+    assert_eq(pkg_root(maps, "main.lark"), "")
+    assert_eq(pkg_root([["lhttp", "./../lhttp"]], "../lhttp/http/files.lark"), "../lhttp/")
+}
+
+test "命令行：找出 import" {
+    src = "import \"std/os\"\nfn main() {}\n// import \"no\"\nimport \"geo\""
+    assert_eq(import_paths(src), ["std/os", "geo"])
+    none: [str] = []
+    assert_eq(import_paths(""), none)
+}
+
+test "命令行：报错时的源码行和 ^ 的位置" {
+    assert_eq(line_text("a\nb\nc", 2), "b")
+    assert_eq(line_text("a\nb\nc", 3), "c")
+    assert_eq(line_text("a\nb", 5), "")
+    // 中文占 2 格，tab 原样保留
+    assert_eq(caret_pad("a中b", 4), "   ")
+    assert_eq(caret_pad("\tx", 2), "\t ")
+    assert_eq(blank(3), "   ")
+}

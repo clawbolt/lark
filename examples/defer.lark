@@ -1,0 +1,70 @@
+// defer { … }：离开所在的块时执行——走到块尾、return、?、break、continue 都算。几个 defer 按逆序执行，
+// 和析构交错：defer 之后声明的值先释放，再执行 defer，然后才释放 defer 之前声明的值（所以 defer 里还能用它们）。
+// os.at_exit(f)：进程退出时执行（main 正常结束、exit、panic），按登记的逆序；exit 和 panic 不执行 defer。
+import "std/os"
+
+type Res {
+    name: str
+}
+
+fn drop(inout r: Res) { print("  释放 #{r.name}") }
+
+fn order() {
+    a = Res(name: "a")
+    defer { print("  defer 1：a 还在（#{a.name}）") }
+    b = Res(name: "b")
+    defer { print("  defer 2") }
+    print("  块里的最后一句（#{b.name}）")
+}
+
+// 每一轮结束都执行，continue、break 也算
+fn rounds() {
+    for i in 0..4 {
+        defer { print("  第 #{i} 轮结束") }
+        if i == 1 { continue }
+        if i == 3 { break }
+        print("  第 #{i} 轮")
+    }
+}
+
+// ? 提前返回时也执行
+fn add(a: str, b: str) -> int! {
+    defer { print("  add(#{a}, #{b}) 离开") }
+    x = try_parse_int(a)?
+    y = try_parse_int(b)?
+    Ok(x + y)
+}
+
+// defer 看到的是变量离开时的值；返回值在 defer 之前就算好了
+fn latest() -> str {
+    s = "旧"
+    defer { print("  defer 看到的是#{s}的") }
+    s = "新"
+    "返回值（#{s}）"
+}
+
+// 调用自己的 return 有 defer 时不变成跳转，defer 照常从里到外执行
+fn down(n: int) {
+    defer { print("  down(#{n}) 离开") }
+    if n == 0 { return }
+    down(n - 1)
+}
+
+fn main() {
+    os.at_exit(|| print("at_exit：先登记的后执行"))
+    os.at_exit(|| print("at_exit：后登记的先执行"))
+    print("顺序：")
+    order()
+    print("循环：")
+    rounds()
+    print("?：")
+    print("  = #{add("1", "2") ?? -1}")
+    print("  = #{add("1", "x") ?? -1}")
+    print("值：")
+    print("  #{latest()}")
+    print("递归：")
+    down(2)
+    defer { print("main 的 defer：exit 时不执行") }
+    print("exit(3)")
+    exit(3)
+}

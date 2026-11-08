@@ -1,0 +1,118 @@
+// std/proc 的测试：用 sh、cat、pwd 这些系统里一定有的程序
+import "std/proc"
+import "std/str"
+import "std/time"
+
+fn ok(r: proc.Output!) -> proc.Output {
+    match r {
+        Ok(o) => o.copy()
+        Err(e) => panic(e)
+    }
+}
+
+fn err_of(r: str!) -> str {
+    match r {
+        Ok(s) => "<成功：#{s}>"
+        Err(e) => e.copy()
+    }
+}
+
+test "退出码、标准输出和标准错误" {
+    o = ok(proc.run(["sh", "-c", "echo out; echo err >&2; exit 3"]))
+    assert_eq(o.code, 3)
+    assert_eq(o.out, "out\n")
+    assert_eq(o.err, "err\n")
+    // 参数不经过 sh：空格、引号、$ 都原样传过去
+    o2 = ok(proc.run(["printf", "%s|", "a b", "'q'", "$HOME"]))
+    assert_eq(o2.out, "a b|'q'|$HOME|")
+    o3 = ok(proc.run(["sh", "-c", "kill -9 $$"]))
+    assert_eq(o3.code, 137)
+}
+
+test "标准输入和目录" {
+    o = ok(proc.run_with(["cat"], "云雀\n", ""))
+    assert_eq(o.out, "云雀\n")
+    root = ok(proc.run_with(["pwd"], "", "/"))
+    assert_eq(root.out, "/\n")
+    // 没给输入时标准输入是空的
+    empty = ok(proc.run(["cat"]))
+    assert_eq(empty.out, "")
+    // 输入、输出都比管道的缓冲大很多：一边写一边读，不会互相等死
+    big = "abcdefgh"
+    for _i in 0..15 { big += big }
+    o2 = ok(proc.run_with(["sh", "-c", "cat; cat >&2 < /dev/null; echo done >&2"], big, ""))
+    assert_eq(len(o2.out), 262144)
+    assert(o2.out == big)
+    assert_eq(o2.err, "done\n")
+    // 子进程不读输入就退出：不会因为 SIGPIPE 退出
+    early = ok(proc.run_with(["true"], big, ""))
+    assert_eq(early.code, 0)
+}
+
+test "output、status 和错误" {
+    assert_eq(proc.output(["echo", "hi"]) ?? "-", "hi\n")
+    assert_eq(err_of(proc.output(["sh", "-c", "echo bad >&2; exit 2"])), "命令失败：sh -c 'echo bad >&2; exit 2'（退出码 2）：bad")
+    assert_eq(proc.status(["true"]) ?? -1, 0)
+    assert_eq(proc.status(["sh", "-c", "exit 7"]) ?? -1, 7)
+    assert_eq(err_of(proc.output(["lark-no-such-program"])), "找不到程序 lark-no-such-program")
+    none: [str] = []
+    assert_eq(err_of(proc.output(none)), "没有要运行的命令")
+    assert_eq(err_of(proc.output(["echo", "a\0b"])), "命令行参数里不能有 0 字节：'a\0b'")
+}
+
+test "给 sh 的引号" {
+    assert_eq(proc.quote("abc-1.txt"), "abc-1.txt")
+    assert_eq(proc.quote(""), "''")
+    assert_eq(proc.quote("a b"), "'a b'")
+    assert_eq(proc.quote("it's"), "'it'\\''s'")
+    assert_eq(proc.quote("$x"), "'$x'")
+    assert_eq(proc.join_cmd(["grep", "-n", "a|b", "f.txt"]), "grep -n 'a|b' f.txt")
+}
+
+fn run_err(r: proc.Output!) -> str {
+    match r {
+        Ok(o) => "<成功：#{o}>"
+        Err(e) => e.copy()
+    }
+}
+
+test "环境变量" {
+    o = proc.opts()
+    o.env = ["LK_A=1", "LK_B=有 空格"]
+    assert_eq(ok(proc.run_opts(["sh", "-c", "echo \"$LK_A|$LK_B|${LK_C-无}\""], o)).out, "1|有 空格|无\n")
+    // 覆盖已有的，同一个名字写两次时后一个算
+    o.env = ["HOME=/nowhere", "LK_A=1", "LK_A=2"]
+    assert_eq(ok(proc.run_opts(["sh", "-c", "echo \"$HOME $LK_A\""], o)).out, "/nowhere 2\n")
+    // 只写名字：去掉；其余的照样继承（PATH 还在，cat 才找得到）
+    o.env = ["HOME"]
+    assert_eq(ok(proc.run_opts(["sh", "-c", "echo \"${HOME-无}\"; command -v cat > /dev/null && echo 有 PATH"], o)).out, "无\n有 PATH\n")
+    // 写法不对
+    o.env = ["=x"]
+    assert_eq(run_err(proc.run_opts(["true"], o)), "环境变量的写法不对：\"=x\"（要写 名字=值，或者只写 名字 表示去掉）")
+    o.env = [""]
+    assert_eq(run_err(proc.run_opts(["true"], o)), "环境变量的写法不对：\"\"（要写 名字=值，或者只写 名字 表示去掉）")
+    // 不给 env 时和 run 一样
+    p = proc.opts()
+    p.input = "云雀\n"
+    p.dir = "/"
+    assert_eq(ok(proc.run_opts(["sh", "-c", "cat; pwd"], p)).out, "云雀\n/\n")
+    assert_eq("#{p}", "Opts(input: \"云雀\n\", dir: \"/\", env: [], timeout_ms: 0)")
+}
+
+test "超时" {
+    o = proc.opts()
+    o.timeout_ms = 200
+    t0 = time.now()
+    assert_eq(run_err(proc.run_opts(["sleep", "5"], o)), "命令超时：sleep 5（200 毫秒内没有结束，已经结束它）")
+    // 它启动的进程拿着管道也不会一直等；关掉了输出、只是不结束的也一样
+    assert(str.starts_with(run_err(proc.run_opts(["sh", "-c", "sleep 5 & sleep 5"], o)), "命令超时："))
+    assert(str.starts_with(run_err(proc.run_opts(["sh", "-c", "exec > /dev/null 2>&1; sleep 5"], o)), "命令超时："))
+    assert(time.elapsed_ms(t0) < 4000)
+    // 时间够用时照常返回
+    o.timeout_ms = 5000
+    r = ok(proc.run_opts(["sh", "-c", "echo hi; exit 3"], o))
+    assert_eq(r.out, "hi\n")
+    assert_eq(r.code, 3)
+    o.timeout_ms = -1
+    assert_eq(run_err(proc.run_opts(["true"], o)), "超时不能是负数：-1")
+}

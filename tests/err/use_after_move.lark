@@ -1,0 +1,10 @@
+// 期望错误：u 的值已经被移走，不能再使用
+type User { name: str }
+
+fn consume(take u: User) {}
+
+fn main() {
+    u = User(name: "a")
+    consume(u)
+    print(u.name)
+}

@@ -1,0 +1,8 @@
+// 期望错误：fn eq 必须返回 bool
+type Point {
+    x: int
+}
+
+fn eq(a: Point, b: Point) -> int { a.x - b.x }
+
+fn main() {}

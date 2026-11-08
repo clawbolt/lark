@@ -1,0 +1,12 @@
+// 期望错误：T! 的结果没有处理（写 ?、match 或 _ = …）；各函数里的都报出来
+import "std/os"
+
+fn save(p: str) {
+    os.write(p, "x")
+}
+
+fn main() {
+    save("/tmp/a")
+    for n in ["a", "b"] { os.remove(n) }
+    _ = os.remove("c")
+}

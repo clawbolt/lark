@@ -1,0 +1,9 @@
+// 期望错误：结构体没有 fn show，不能直接插值
+type Point {
+    x: int
+}
+
+fn main() {
+    p = Point(x: 1)
+    print("#{p}")
+}

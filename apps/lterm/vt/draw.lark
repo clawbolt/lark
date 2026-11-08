@@ -1,0 +1,142 @@
+// 把仿真出来的屏幕画到真的终端上，只画变了的地方。
+// 先证明再写：对应 formal/Lark/VtDraw.lean，函数和定义一一对应：
+//   pre ↔ pre、row_cmd ↔ rowCmd、apply_row ↔ applyRow、diff ↔ diff、apply ↔ applyF。
+// 证明了：旧画面执行 diff 出来的命令，正好得到新画面（applyRow_ok、draw_ok）；从相同前缀里更早的地方开始画也对（applyRow_le）；
+// 画面没变时什么都不画（diff_same）；一行画出去的格子不比这一行多（cost_le）。
+// 格子是字符（vt/screen 的编码）加样式（vt/style 的 pack）：两样都一样才算一样。
+// 和模型不一样的一处：开始画的那一格是宽字符的右半时，退回到左半（applyRow_le 说这样也对）。
+// render 把命令写成转义序列：CUP 移到那一格、样式变了写 CSI … m、写字；最后放好光标、显示或隐藏光标。
+// 行数或列数变了（改大小）、或者还没画过时整个重画。
+import "std/utf8"
+import "vt/screen"
+import "vt/style"
+
+// 一帧：每一行的格子和样式
+pub type F {
+    pub cells: [[int]]
+    pub sty: [[int]]
+    pub rows: int
+    pub cols: int
+}
+
+// 一行要画的：第 row 行从第 col 列开始写 cells（样式 sty）
+pub type Cmd {
+    pub row: int
+    pub col: int
+    pub cells: [int]
+    pub sty: [int]
+}
+
+pub fn frame(s: screen.S) -> F {
+    cs: [[int]] = []
+    ss: [[int]] = []
+    for i in 0..s.rows {
+        cs.push(screen.row(s, i))
+        ss.push(screen.srow(s, i))
+    }
+    F(cells: cs, sty: ss, rows: s.rows, cols: s.cols)
+}
+
+// 两行一样的前缀有多长（pre）
+pub fn pre(oc: [int], os: [int], nc: [int], ns: [int]) -> int {
+    i = 0
+    for i < len(oc) && i < len(nc) && oc[i] == nc[i] && os[i] == ns[i] { i += 1 }
+    i
+}
+
+fn same(oc: [int], os: [int], nc: [int], ns: [int]) -> bool {
+    len(oc) == len(nc) && pre(oc, os, nc, ns) == len(nc)
+}
+
+fn rest(l: [int], a: int) -> [int] {
+    out: [int] = []
+    for i in a..len(l) { out.push(l[i]) }
+    out
+}
+
+fn first(l: [int], a: int) -> [int] {
+    out: [int] = []
+    for i in 0..len(l) {
+        if i < a { out.push(l[i]) }
+    }
+    out
+}
+
+// rowCmd：一样就不画；不一样就从第一个不一样的格子开始画剩下的（右半退回左半）
+pub fn row_cmd(i: int, oc: [int], os: [int], nc: [int], ns: [int]) -> Cmd? {
+    if same(oc, os, nc, ns) { return None }
+    a = pre(oc, os, nc, ns)
+    if a > 0 && a < len(nc) && nc[a] == screen.SPACER { a -= 1 }
+    Some(Cmd(row: i, col: a, cells: rest(nc, a), sty: rest(ns, a)))
+}
+
+// diff：每一行一条（没有要画的就不放）
+pub fn diff(o: F, n: F) -> [Cmd] {
+    out: [Cmd] = []
+    for i in 0..n.rows {
+        if i < o.rows {
+            match row_cmd(i, o.cells[i], o.sty[i], n.cells[i], n.sty[i]) {
+                Some(c) => out.push(c.copy())
+                None => {}
+            }
+        }
+    }
+    out
+}
+
+// 整个画：每一行都从第 0 列开始
+pub fn full(n: F) -> [Cmd] {
+    out: [Cmd] = []
+    for i in 0..n.rows { out.push(Cmd(row: i, col: 0, cells: n.cells[i].copy(), sty: n.sty[i].copy())) }
+    out
+}
+
+// applyRow / applyF：真的终端执行这些命令以后的画面（测试里用来检查 diff）
+pub fn apply(o: F, cmds: [Cmd]) -> F {
+    out = o.copy()
+    for c in cmds {
+        if c.row >= 0 && c.row < out.rows {
+            nc = first(out.cells[c.row], c.col)
+            ns = first(out.sty[c.row], c.col)
+            for v in c.cells { nc.push(v) }
+            for v in c.sty { ns.push(v) }
+            out.cells[c.row] = nc
+            out.sty[c.row] = ns
+        }
+    }
+    out
+}
+
+// 命令写成转义序列；cx、cy 是画完以后光标的位置，show 是显示光标
+pub fn render(cmds: [Cmd], clear: bool, cx: int, cy: int, show: bool) -> str {
+    out = "\x1b[?25l"
+    if clear { out += "\x1b[0m\x1b[H\x1b[2J" }
+    prev = -1
+    for c in cmds {
+        out += "\x1b[#{c.row + 1};#{c.col + 1}H"
+        for j in 0..len(c.cells) {
+            v = c.cells[j]
+            if v != screen.SPACER {
+                if c.sty[j] != prev {
+                    out += style.sgr(style.unpack(c.sty[j]))
+                    prev = c.sty[j]
+                }
+                out += utf8.from_code_point(screen.cell_ch(v))
+            }
+        }
+    }
+    out += "\x1b[0m\x1b[#{cy + 1};#{cx + 1}H"
+    if show { out += "\x1b[?25h" }
+    out
+}
+
+// 从上一帧（没有时整个画）到这一帧要写出去的字节
+pub fn update(prev: F?, n: F, cx: int, cy: int, show: bool) -> str {
+    match prev {
+        Some(o) => {
+            if o.rows == n.rows && o.cols == n.cols { return render(diff(o, n), false, cx, cy, show) }
+            render(full(n), true, cx, cy, show)
+        }
+        None => render(full(n), true, cx, cy, show)
+    }
+}

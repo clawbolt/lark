@@ -1,0 +1,8 @@
+// 期望错误：defer 里用到的变量，到块结束前不能移走（defer 执行时还要用它）
+fn consume(take xs: [int]) { print("#{len(xs)}") }
+
+fn main() {
+    xs = [1, 2]
+    defer { print("#{len(xs)}") }
+    consume(xs)
+}

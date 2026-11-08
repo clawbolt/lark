@@ -1,0 +1,109 @@
+// lcache 的单元测试：lark test（在 apps/lcache 里运行）。直接调用存取和处理请求的函数，时间是固定的，不用网络
+import "std/str"
+import "std/http"
+
+// buf 里从 pos 开始第一次出现 pat 的位置，没有是 -1
+fn find_from(buf: str, pos: int, pat: str) -> int { str.find_from(buf, pat, pos) ?? -1 }
+import "kv/store"
+import "kv/api"
+
+const NOW = 784111777000
+
+fn req(s: str) -> http.Request {
+    r, _at, code = http.parse_request(s, 0)
+    match take r {
+        Some(x) => x
+        None => panic("没有解析出请求，状态码 #{code}")
+    }
+}
+
+fn status_line(resp: str) -> str { slice(resp, 0, find_from(resp, 0, "\r\n")) }
+
+fn body_of(resp: str) -> str { slice(resp, find_from(resp, 0, "\r\n\r\n") + 4, len(resp)) }
+
+// handler 的回复照 http.serve 的样子写成文字（不写 Connection）
+fn run(s: store.Store, r: http.Request, now: int) -> str {
+    resp = api.handle(s, r, now)
+    http.format_response(resp.status, resp.headers, resp.body, r.method == "HEAD", "", now)
+}
+
+test "存取：放、取、覆盖、删" {
+    s = store.new()
+    assert(store.get(s, "a", NOW) == None)
+    store.set(s, "a", "1", 0, NOW)
+    store.set(s, "b", "2", 0, NOW)
+    assert_eq(store.get(s, "a", NOW) ?? "", "1")
+    store.set(s, "a", "one", 0, NOW)
+    assert_eq(store.get(s, "a", NOW) ?? "", "one")
+    assert(store.del(s, "a", NOW))
+    assert(!store.del(s, "a", NOW))
+    assert(store.get(s, "a", NOW) == None)
+    assert_eq(store.get(s, "b", NOW) ?? "", "2")
+    st = store.stats(s)
+    assert_eq(st.keys, 1)
+    assert_eq(st.hits, 3)
+    assert_eq(st.misses, 2)
+}
+
+test "存取：过期" {
+    s = store.new()
+    store.set(s, "t", "x", 1000, NOW)
+    store.set(s, "forever", "y", 0, NOW)
+    assert_eq(store.get(s, "t", NOW + 999) ?? "", "x")
+    assert(store.get(s, "t", NOW + 1000) == None)
+    // 重新放进去、不带 ttl：不再过期
+    store.set(s, "t", "x2", 0, NOW)
+    assert_eq(store.get(s, "t", NOW + 5000) ?? "", "x2")
+    // 已过期的删不掉（算不在）
+    store.set(s, "u", "z", 10, NOW)
+    assert(!store.del(s, "u", NOW + 10))
+}
+
+test "存取：清理过期的键" {
+    s = store.new()
+    for i in 0..100 {
+        ttl = if i % 2 == 0 { 1000 } else { 0 }
+        store.set(s, "k#{i}", "v#{i}", ttl, NOW)
+    }
+    assert_eq(store.sweep(s, NOW + 999), 0)
+    assert_eq(store.sweep(s, NOW + 1000), 50)
+    assert_eq(store.stats(s).keys, 50)
+    assert_eq(store.get(s, "k1", NOW + 2000) ?? "", "v1")
+    assert(store.get(s, "k2", NOW + 2000) == None)
+    // 复制 Store 拿到的是同一份数据
+    s2 = s.copy()
+    store.set(s2, "shared", "yes", 0, NOW)
+    assert_eq(store.get(s, "shared", NOW) ?? "", "yes")
+}
+
+test "接口：GET、PUT、DELETE" {
+    s = store.new()
+    assert_eq(status_line(run(s, req("GET /k/a HTTP/1.1\r\n\r\n"), NOW)), "HTTP/1.1 404 Not Found")
+    put = run(s, req("PUT /k/a%2Fb?ttl=2 HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"), NOW)
+    assert_eq(status_line(put), "HTTP/1.1 204 No Content")
+    // 名字是解码以后的路径
+    g = run(s, req("GET /k/a/b HTTP/1.1\r\n\r\n"), NOW + 1999)
+    assert_eq(status_line(g), "HTTP/1.1 200 OK")
+    assert_eq(body_of(g), "hello")
+    assert_eq(status_line(run(s, req("GET /k/a/b HTTP/1.1\r\n\r\n"), NOW + 2000)), "HTTP/1.1 404 Not Found")
+    _p2 = run(s, req("PUT /k/c HTTP/1.1\r\nContent-Length: 1\r\n\r\nz"), NOW)
+    assert_eq(status_line(run(s, req("DELETE /k/c HTTP/1.1\r\n\r\n"), NOW)), "HTTP/1.1 204 No Content")
+    assert_eq(status_line(run(s, req("DELETE /k/c HTTP/1.1\r\n\r\n"), NOW)), "HTTP/1.1 404 Not Found")
+    st = run(s, req("GET /stats HTTP/1.1\r\n\r\n"), NOW)
+    assert_eq(body_of(st), "{\"keys\":0,\"hits\":1,\"misses\":2}\n")
+}
+
+test "接口：错误" {
+    s = store.new()
+    assert_eq(status_line(run(s, req("PUT /k/a?ttl=abc HTTP/1.1\r\n\r\n"), NOW)), "HTTP/1.1 400 Bad Request")
+    assert_eq(status_line(run(s, req("PUT /k/a?ttl=0 HTTP/1.1\r\n\r\n"), NOW)), "HTTP/1.1 400 Bad Request")
+    assert_eq(status_line(run(s, req("GET /k/ HTTP/1.1\r\n\r\n"), NOW)), "HTTP/1.1 404 Not Found")
+    assert_eq(status_line(run(s, req("GET /nope HTTP/1.1\r\n\r\n"), NOW)), "HTTP/1.1 404 Not Found")
+    p = run(s, req("POST /k/a HTTP/1.1\r\n\r\n"), NOW)
+    assert_eq(status_line(p), "HTTP/1.1 405 Method Not Allowed")
+    assert(str.contains(p, "Allow: GET, PUT, DELETE\r\n"))
+    assert_eq(api.ttl_ms("x=1&ttl=60"), 60000)
+    assert_eq(api.ttl_ms(""), 0)
+    assert_eq(api.ttl_ms("ttl=%36%30"), 60000)
+    assert_eq(api.ttl_ms("ttl=%zz"), -1)
+}

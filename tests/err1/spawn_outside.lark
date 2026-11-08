@@ -1,0 +1,6 @@
+// 期望错误：spawn 只能直接写在 scope { … } 里
+fn work(take n: int) { print("#{n}") }
+
+fn main() {
+    spawn(work, 1)
+}

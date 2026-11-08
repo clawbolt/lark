@@ -1,0 +1,472 @@
+// lvm 的单元测试：lark test（在 apps/lvm 里运行）。
+// 虚拟机和时间片对着 VmCore.lean 的例子；调度器用 run_sim 每走一步都检查每个线程正好在一个地方（VmSched 的 reach_inv）；
+// 最后用 run_par 真的并行跑几遍，结果要一样。
+import "std/deque"
+import "std/str"
+import "vm/core"
+import "vm/asm"
+import "vm/sched"
+
+fn lines(ls: [str]) -> str {
+    s = ""
+    for l in ls { s += l + "\n" }
+    s
+}
+
+fn prog(ls: [str]) -> asm.Prog {
+    match take asm.parse(lines(ls)) {
+        Ok(p) => p
+        Err(e) => panic(e)
+    }
+}
+
+fn parse_err(ls: [str]) -> str {
+    match asm.parse(lines(ls)) {
+        Ok(_) => "<成功>"
+        Err(e) => e
+    }
+}
+
+// VmCore 的 sum10：loc0 = i，loc1 = s
+fn sum10() -> [core.Ins] {
+    [core.Push(10), core.Store(0), core.Push(0), core.Store(1),
+        core.Load(0), core.Jz(15), core.Load(1), core.Load(0), core.Add, core.Store(1), core.Load(0), core.Push(1), core.Sub, core.Store(0), core.Jmp(4),
+        core.Load(1), core.Halt]
+}
+
+fn done_v(e: core.Ev) -> int {
+    match e {
+        Done(v, _h) => v
+        _ => -999
+    }
+}
+
+fn kind(e: core.Ev) -> str {
+    match e {
+        Next => "next"
+        Budget => "budget"
+        Done(_v, _h) => "done"
+        Fault => "fault"
+        Call(k, _a) => "call #{k}"
+    }
+}
+
+// 开 n 个线程，第 i 个算 1 + … + i，主线程 join 它们加起来（examples/many.s 的小版本）
+fn many(n: int) -> asm.Prog {
+    prog([".locals 4", "push #{n}", "store 0",
+        "sl: load 0", "jz js", "load 0", "spawn wk", "pop", "load 0", "push 1", "sub", "store 0", "jmp sl",
+        "js: push 1", "store 0", "push 0", "store 2",
+        "jl: load 0", "push #{n + 1}", "eq", "jz j1", "load 2", "halt",
+        "j1: load 0", "join", "load 2", "add", "store 2", "load 0", "push 1", "add", "store 0", "jmp jl",
+        "wk: store 0", "push 0", "store 1",
+        "wl: load 0", "jz wd", "load 1", "load 0", "add", "store 1", "load 0", "push 1", "sub", "store 0", "jmp wl",
+        "wd: load 1", "halt"])
+}
+
+fn many_res(n: int) -> int { n * (n + 1) * (n + 2) / 6 }
+
+fn sched_errs(wd: sched.Sh) -> int {
+    c = 0
+    for l in wd.out {
+        if str.starts_with(l, "调度器出错") { c += 1 }
+    }
+    c
+}
+
+test "虚拟机：1 加到 10、出错、sys 停下" {
+    c = sum10()
+    t = core.new_th(0, 2)
+    r = core.slice(c, 1000, &t)
+    assert_eq(kind(r.stop), "done")
+    assert_eq(done_v(r.stop), 55)
+    t = core.new_th(0, 2)
+    r = core.slice([core.Add], 10, &t)
+    assert_eq(kind(r.stop), "fault")
+    assert_eq(t.pc, 0)
+    t = core.new_th(0, 2)
+    r = core.slice([core.Push(1), core.Store(5)], 10, &t)
+    assert_eq(kind(r.stop), "fault")
+    t = core.new_th(0, 2)
+    r = core.slice([core.Push(3), core.Sys(core.SYS_SLEEP, 0), core.Halt], 10, &t)
+    assert_eq(kind(r.stop), "call 5")
+    assert_eq(r.used, 2)
+    assert_eq(t.pc, 2)
+    assert_eq(t.st, [3])
+    // pc 跑出程序
+    t = core.new_th(0, 2)
+    r = core.slice([core.Jmp(7)], 10, &t)
+    assert_eq(kind(r.stop), "fault")
+    assert_eq(r.used, 2)
+}
+
+test "时间片：最多 budget 条，在哪里被抢占结果都一样（slice_split）" {
+    c = sum10()
+    t = core.new_th(0, 2)
+    r = core.slice(c, 7, &t)
+    assert_eq(kind(r.stop), "budget")
+    assert_eq(r.used, 7)
+    for n in 1..80 {
+        for m in [1, 3, 50, 1000] {
+            a = core.new_th(0, 2)
+            ra = core.slice(c, n, &a)
+            if kind(ra.stop) != "budget" { continue }
+            assert_eq(ra.used, n)
+            rb = core.slice(c, m, &a)
+            b = core.new_th(0, 2)
+            rc = core.slice(c, n + m, &b)
+            assert_eq(rc.used, n + rb.used)
+            assert_eq(kind(rc.stop), kind(rb.stop))
+            assert_eq(a.pc, b.pc)
+            assert_eq(a.st, b.st)
+            assert_eq(a.loc, b.loc)
+            assert(rc.used <= n + m)
+        }
+    }
+}
+
+test "函数调用：call / ret、局部变量换回来、在函数里被抢占、太深出错" {
+    // VmCall 的 sq：调用者 loc0 = 5，调用 sq(7)（sq 自己也用 loc0），回来以后加上调用者的 loc0：49 + 5 = 54
+    c = [core.Push(5), core.Store(0), core.Push(7), core.CallF(7), core.Load(0), core.Add, core.Halt,
+        core.Store(0), core.Load(0), core.Load(0), core.Mul, core.RetF]
+    t = core.new_th(0, 2)
+    r = core.slice(c, 1000, &t)
+    assert_eq(done_v(r.stop), 54)
+    assert_eq(len(t.fr), 0)
+    t = core.new_th(0, 2)
+    r = core.slice(c, 4, &t)
+    assert_eq(kind(r.stop), "budget")
+    assert_eq(len(t.fr), 1)
+    assert_eq(t.fr[0].ret, 4)
+    assert_eq(t.fr[0].loc, [5, 0])
+    assert_eq(t.loc, [0, 0])
+    // 在哪里被抢占结果都一样（slice_split）
+    for n in 1..12 {
+        a = core.new_th(0, 2)
+        ra = core.slice(c, n, &a)
+        if kind(ra.stop) != "budget" { continue }
+        rb = core.slice(c, 1000, &a)
+        assert_eq(done_v(rb.stop), 54)
+        assert_eq(n + rb.used, 12)
+    }
+    // 无限递归：已经有 DEPTH 帧时再 call 出错
+    t = core.new_th(0, 2)
+    r = core.slice([core.CallF(0)], 100000, &t)
+    assert_eq(kind(r.stop), "fault")
+    assert_eq(r.used, core.DEPTH + 1)
+    assert_eq(len(t.fr), core.DEPTH)
+    // 没有帧时 ret 出错
+    t = core.new_th(0, 2)
+    r = core.slice([core.RetF], 10, &t)
+    assert_eq(kind(r.stop), "fault")
+    // 汇编和调度器：递归算 10 的阶乘，时间片很小，好几个 worker
+    fact = prog(["push 10", "call fact", "halt",
+        "fact: store 0", "load 0", "jz base", "load 0", "load 0", "push 1", "sub", "call fact", "mul", "ret",
+        "base: push 1", "ret"])
+    for b in [1, 3, 100] {
+        wd = sched.run_sim(fact, 3, b, true)
+        assert_eq(sched_errs(wd), 0)
+        assert_eq(wd.ts[0].res, 3628800)
+    }
+    assert_eq(parse_err(["call nowhere"]), "第 1 行：没有标签 nowhere")
+    assert_eq(parse_err(["ret 1"]), "第 1 行：ret 后面不要参数")
+}
+
+test "汇编：标签、.locals、错误" {
+    p = prog([".locals 2", "start: push 10", "store 0   ; 注释", "a: b: jmp a", "# 整行注释", "", "halt"])
+    assert_eq(p.nloc, 2)
+    assert_eq(len(p.code), 4)
+    t = core.new_th(2, 2)
+    _e = core.step(p.code, &t)
+    assert_eq(t.pc, 2)
+    p = prog(["spawn 3", "newch", "send", "recv", "sleep", "join", "self", "print", "yield", "halt"])
+    assert_eq(len(p.code), 10)
+    assert_eq(parse_err(["push x"]), "第 1 行：push 的参数要是数，不是 x")
+    assert_eq(parse_err(["push 1", "jmp nowhere"]), "第 2 行：没有标签 nowhere")
+    assert_eq(parse_err(["a: push 1", "a: halt"]), "第 2 行：标签 a 重复了")
+    assert_eq(parse_err([".locals 1", "load 1"]), "第 2 行：局部变量 1 不在 0 到 0 里")
+    assert_eq(parse_err(["frob"]), "第 1 行：不认识的指令 frob")
+    assert_eq(parse_err(["add 1"]), "第 1 行：add 后面不要参数")
+    assert_eq(parse_err(["; 只有注释"]), "程序是空的")
+}
+
+test "调度器：每一步每个线程正好在一个地方，结果对" {
+    for nw in [1, 2, 3, 5] {
+        for b in [1, 2, 7, 100] {
+            wd = sched.run_sim(many(12), nw, b, true)
+            assert_eq(sched_errs(wd), 0)
+            assert(!wd.dead)
+            assert_eq(wd.live, 0)
+            assert_eq(len(wd.ts), 13)
+            assert_eq(len(wd.done), 13)
+            assert_eq(len(wd.blocked), 0)
+            assert_eq(wd.ts[0].res, many_res(12))
+        }
+    }
+    // 只有一个 worker 时不会偷；好几个 worker 时会偷（线程都开在 worker 0 上）
+    wd = sched.run_sim(many(12), 1, 5, false)
+    assert_eq(wd.steals, 0)
+    wd = sched.run_sim(many(12), 3, 5, false)
+    assert(wd.steals > 0)
+}
+
+test "调度器的每一步（pick、preempt、偷一半、spawn）" {
+    s = sched.new_sched(many(1), 3, 10)
+    // worker 1 自己的队列是空的：先看 worker 2（空的），再偷 worker 0 的一半（1 个），拿来跑
+    x, th = sched.acquire(s, 1)
+    assert_eq(x, 0)
+    assert_eq(sched.running(s, 1), 0)
+    assert_eq(sched.queue(s, 0), [])
+    // 已经在跑了：不会再拿一个
+    y0, _t0 = sched.acquire(s, 1)
+    assert_eq(y0, -1)
+    lock s.sh as sh {
+        for _i in 0..4 { _y = sched.spawn_th(&sh, 0, 0, 0) }
+    }
+    assert_eq(sched.queue(s, 0), [1, 2, 3, 4])
+    // worker 2 偷 worker 0 前面的一半（2 个），拿头上的来跑
+    x2, th2 = sched.acquire(s, 2)
+    assert_eq(x2, 1)
+    assert_eq(sched.queue(s, 2), [2])
+    assert_eq(sched.queue(s, 0), [3, 4])
+    // 时间片用完：放回自己队列的尾巴
+    sched.preempt(s, 1, x, th)
+    assert_eq(sched.running(s, 1), -1)
+    assert_eq(sched.queue(s, 1), [0])
+    sched.preempt(s, 2, x2, th2)
+    assert_eq(sched.queue(s, 2), [2, 1])
+    lock s.sh as sh {
+        for t in 0..5 { assert_eq(sched.cnt(sh, t), 1) }
+    }
+    // 两个 worker 各自拿、各自放回，换个顺序结果一样（pick_comm、preempt_comm）
+    a = sched.new_sched(many(1), 2, 10)
+    b = sched.new_sched(many(1), 2, 10)
+    for m in [a.copy(), b.copy()] {
+        lock m.sh as sh { _y = sched.spawn_th(&sh, 1, 0, 0) }
+    }
+    p0, q0 = sched.acquire(a, 0)
+    p1, q1 = sched.acquire(a, 1)
+    r1, u1 = sched.acquire(b, 1)
+    r0, u0 = sched.acquire(b, 0)
+    assert_eq(p0, r0)
+    assert_eq(p1, r1)
+    sched.preempt(a, 0, p0, q0)
+    sched.preempt(a, 1, p1, q1)
+    sched.preempt(b, 1, r1, u1)
+    sched.preempt(b, 0, r0, u0)
+    assert_eq(sched.queue(a, 0), sched.queue(b, 0))
+    assert_eq(sched.queue(a, 1), sched.queue(b, 1))
+}
+
+// 两个生产者往两个通道里各放 3 个（1、2、3 和 100、200、300），主线程 select 收 6 次：
+// 结果是 值的和 × 1000 + 从第二个通道收到几次 = 606003
+fn sel_prog(nc: str) -> asm.Prog {
+    prog([".locals 6", nc, "store 0", nc, "store 1",
+        "load 0", "spawn pa", "pop", "load 1", "spawn pb", "pop",
+        "push 0", "store 2", "push 6", "store 3", "push 0", "store 4",
+        "lp: load 3", "jz end", "load 0", "load 1", "select 2",
+        "load 4", "add", "store 4", "load 2", "add", "store 2",
+        "load 3", "push 1", "sub", "store 3", "jmp lp",
+        "end: load 2", "push 1000", "mul", "load 4", "add", "halt",
+        "pa: store 0", "load 0", "push 1", "send", "load 0", "push 2", "send", "load 0", "push 3", "send", "push 0", "halt",
+        "pb: store 0", "load 0", "push 100", "send", "load 0", "push 200", "send", "load 0", "push 300", "send", "push 0", "halt"])
+}
+
+test "select：同时等两个通道，哪个先有收哪个，叫醒以后哪个通道里都没有它" {
+    for nc in ["newch", "newch 0", "newch 1"] {
+        for nw in [1, 2, 3] {
+            for b in [1, 2, 50] {
+                wd = sched.run_sim(sel_prog(nc), nw, b, true)
+                assert_eq(sched_errs(wd), 0)
+                assert(!wd.dead)
+                assert_eq(wd.ts[0].res, 606003)
+                assert(deque.is_empty(wd.chs[0].recvq))
+                assert(deque.is_empty(wd.chs[1].recvq))
+            }
+        }
+        for _k in 0..3 {
+            pw = sched.run_par(sel_prog(nc), 4, 2)
+            assert_eq(pw.ts[0].res, 606003)
+        }
+    }
+    // 已经有东西的时候不用等：栈上是值和第几个通道
+    wd = sched.run_sim(prog(["newch", "store 0", "newch", "store 1", "load 1", "push 7", "send",
+        "load 0", "load 1", "select 2", "push 10", "mul", "add", "halt"]), 1, 100, true)
+    assert_eq(wd.ts[0].res, 17)
+    // 两个通道都没人发：死锁
+    wd = sched.run_sim(prog(["newch", "newch", "select 2", "halt"]), 2, 10, true)
+    assert(wd.dead)
+    assert_eq(parse_err(["select 0"]), "第 1 行：select 至少等 1 个通道")
+    assert_eq(parse_err(["select"]), "第 1 行：select 后面要一个参数")
+}
+
+test "公平：别的线程一直在跑（死循环），主线程照样轮得到" {
+    src = ["push 0", "spawn spin", "pop", "push 0", "spawn spin", "pop", "push 0", "spawn spin", "pop",
+        "push 10", "store 0", "push 0", "store 1",
+        "l: load 0", "jz e", "load 1", "load 0", "add", "store 1", "load 0", "push 1", "sub", "store 0", "jmp l",
+        "e: load 1", "halt",
+        "spin: jmp spin"]
+    for nw in [1, 2] {
+        for b in [1, 2, 5] {
+            wd = sched.run_sim(prog(src), nw, b, true)
+            assert_eq(sched_errs(wd), 0)
+            assert_eq(wd.ts[0].res, 55)
+            // 一个 worker 时轮着来：主线程每跑一个时间片，别的 3 个最多各跑一个（fair）；主线程大约 127 条指令、3 次 spawn
+            if nw == 1 {
+                main_slices = (130 + b - 1) / b + 3
+                assert(wd.slices <= 4 * main_slices)
+            }
+        }
+    }
+    pw = sched.run_par(prog(src), 3, 4)
+    assert_eq(pw.ts[0].res, 55)
+}
+
+test "通道：先进先出、不丢不重复、收的时候等" {
+    // 生产者放 1..30，消费者每收一个就打印，0 结束
+    src = [".locals 4", "newch", "store 0", "load 0", "spawn cons", "store 1", "push 1", "store 2",
+        "pl: load 2", "push 31", "eq", "jz ps", "load 0", "push 0", "send", "load 1", "join", "halt",
+        "ps: load 0", "load 2", "send", "load 2", "push 1", "add", "store 2", "jmp pl",
+        "cons: store 0", "cl: load 0", "recv", "dup", "jz cd", "print", "jmp cl", "cd: push 7", "halt"]
+    for nw in [1, 2, 4] {
+        for b in [1, 3, 1000] {
+            wd = sched.run_sim(prog(src), nw, b, true)
+            assert_eq(sched_errs(wd), 0)
+            assert_eq(len(wd.out), 30)
+            for i in 0..30 { assert_eq(wd.out[i], "#{i + 1}") }
+            assert_eq(wd.ts[0].res, 7)
+        }
+    }
+}
+
+// 生产者放 1..30，消费者每收一个就打印，0 结束；nc 是建通道的那一行
+fn pipe(nc: str) -> asm.Prog {
+    prog([".locals 4", nc, "store 0", "load 0", "spawn cons", "store 1", "push 1", "store 2",
+        "pl: load 2", "push 31", "eq", "jz ps", "load 0", "push 0", "send", "load 1", "join", "halt",
+        "ps: load 0", "load 2", "send", "load 2", "push 1", "add", "store 2", "jmp pl",
+        "cons: store 0", "cl: load 0", "recv", "dup", "jz cd", "print", "jmp cl", "cd: push 7", "halt"])
+}
+
+fn in_order(wd: sched.Sh) {
+    assert_eq(len(wd.out), 30)
+    for i in 0..30 { assert_eq(wd.out[i], "#{i + 1}") }
+    assert_eq(wd.ts[0].res, 7)
+}
+
+test "有界通道：满了发的等着、收的时候补上、容量 0 直接交接" {
+    for nc in ["newch 0", "newch 1", "newch 3"] {
+        for nw in [1, 2, 4] {
+            for b in [1, 3, 1000] {
+                // check 里还检查了：缓冲不超过容量、有人等着发时缓冲正好是满的、有人等着收时缓冲是空的（BInv）
+                wd = sched.run_sim(pipe(nc), nw, b, true)
+                assert_eq(sched_errs(wd), 0)
+                in_order(wd)
+            }
+        }
+    }
+    // 容量 1：放进 5 以后再发 6 就要等，没人收：死锁，6 还在等着发
+    wd = sched.run_sim(prog(["newch 1", "store 0", "load 0", "push 5", "send", "load 0", "push 6", "send", "push 1", "halt"]), 2, 10, true)
+    assert(wd.dead)
+    assert_eq(deque.to_list(wd.chs[0].buf), [5])
+    assert_eq(deque.to_list(wd.chs[0].sendv), [6])
+    assert_eq(deque.to_list(wd.chs[0].sendq), [0])
+    // 不写容量是不限：两个都放进去，接着跑
+    wd = sched.run_sim(prog(["newch", "store 0", "load 0", "push 5", "send", "load 0", "push 6", "send", "push 1", "halt"]), 2, 10, true)
+    assert(!wd.dead)
+    assert_eq(wd.ts[0].res, 1)
+    assert_eq(deque.to_list(wd.chs[0].buf), [5, 6])
+    assert_eq(parse_err(["newch x"]), "第 1 行：newch 的容量要是不小于 0 的数")
+    assert_eq(parse_err(["newch 1 2"]), "第 1 行：newch 后面最多一个数（容量）")
+}
+
+test "定时器和带超时的 select：按到期时间叫醒、超时、旧的定时器叫不醒新的等待" {
+    // 三个线程分别睡 30、10、20 毫秒，醒了就打印自己睡了多久：按到期时间叫醒
+    wd = sched.run_sim(prog(["push 30", "spawn s", "pop", "push 10", "spawn s", "pop", "push 20", "spawn s", "pop",
+        "push 60", "sleep", "push 1", "halt",
+        "s: dup", "sleep", "print", "push 0", "halt"]), 2, 10, true)
+    assert_eq(sched_errs(wd), 0)
+    assert_eq(wd.out, ["10", "20", "30"])
+    assert_eq(wd.sleeping, 0)
+    // 没人发：超时，栈上是 0 和 -1
+    wd = sched.run_sim(prog(["newch", "push 5", "tselect 1", "push 10", "mul", "add", "halt"]), 2, 10, true)
+    assert_eq(sched_errs(wd), 0)
+    assert(!wd.dead)
+    assert_eq(wd.ts[0].res, -10)
+    assert(deque.is_empty(wd.chs[0].recvq))
+    // 超时是 0：马上返回
+    wd = sched.run_sim(prog(["newch", "push 0", "tselect 1", "push 10", "mul", "add", "halt"]), 1, 10, true)
+    assert_eq(wd.ts[0].res, -10)
+    // 已经有东西：不等
+    wd = sched.run_sim(prog(["newch", "dup", "push 7", "send", "push 1000", "tselect 1", "push 10", "mul", "add", "halt"]), 1, 10, true)
+    assert_eq(wd.ts[0].res, 7)
+    // 通道先来（另一个线程 2 毫秒后发 7），定时器那项留在堆里；接着又等一次（这次超时 5 毫秒，没人发），
+    // 第一次留下的定时器（1000 毫秒）到期之前就超时了，结果 7 × 100 + 第二次的 (0, -1) = 700 - 1
+    src = [".locals 4", "newch", "store 0", "load 0", "spawn snd", "pop",
+        "load 0", "push 1000", "tselect 1", "pop", "push 100", "mul", "store 1",
+        "load 0", "push 5", "tselect 1", "add", "load 1", "add", "halt",
+        "snd: store 0", "push 2", "sleep", "load 0", "push 7", "send", "push 0", "halt"]
+    for nw in [1, 3] {
+        wd = sched.run_sim(prog(src), nw, 4, true)
+        assert_eq(sched_errs(wd), 0)
+        assert_eq(wd.ts[0].res, 699)
+        assert_eq(wd.sleeping, 0)
+        assert_eq(wd.ts[0].wait, -1)
+        assert_eq(wd.ts[0].nid, 2)
+    }
+    pw = sched.run_par(prog(src), 4, 4)
+    assert_eq(pw.ts[0].res, 699)
+    // 有线程在睡就不算死锁；睡完了还在等通道才算
+    wd = sched.run_sim(prog(["push 5", "sleep", "newch", "recv", "halt"]), 2, 10, false)
+    assert(wd.dead)
+    assert_eq(parse_err(["tselect 0"]), "第 1 行：tselect 至少等 1 个通道")
+}
+
+test "join、self、sleep、yield、出错的线程、死锁" {
+    // join 一个已经结束的、self
+    wd = sched.run_sim(prog(["push 0", "spawn w", "dup", "store 0", "yield", "yield", "yield", "load 0", "join", "self", "add", "halt",
+        "w: push 9", "add", "halt"]), 2, 1, true)
+    assert_eq(sched_errs(wd), 0)
+    assert_eq(wd.ts[0].res, 9)
+    // 好几个线程 join 同一个
+    wd = sched.run_sim(prog(["push 0", "spawn slow", "store 0", "load 0", "spawn jn", "load 0", "spawn jn", "join", "load 0", "join", "add", "halt",
+        "slow: pop", "push 20", "sleep", "push 5", "halt",
+        "jn: join", "push 1", "add", "halt"]), 2, 3, true)
+    assert_eq(sched_errs(wd), 0)
+    assert_eq(wd.ts[0].res, 11)
+    // sleep 至少睡了那么久
+    wd = sched.run_sim(prog(["push 30", "sleep", "push 1", "halt"]), 2, 10, false)
+    assert_eq(wd.ts[0].res, 1)
+    // 出错的线程不影响别的
+    wd = sched.run_sim(prog(["push 0", "spawn bad", "join", "push 3", "add", "halt", "bad: pop", "add", "halt"]), 2, 10, true)
+    assert_eq(wd.faults, 1)
+    assert_eq(wd.ts[0].res, 3)
+    assert_eq(wd.out, ["线程 1 出错（pc 7）"])
+    wd = sched.run_sim(prog(["push 99", "join", "halt"]), 1, 10, false)
+    assert_eq(wd.faults, 1)
+    assert_eq(wd.out, ["线程 0 出错（pc 1）：join 的线程不对"])
+    // 死锁：在空的通道上等
+    wd = sched.run_sim(prog(["newch", "recv", "halt"]), 3, 10, false)
+    assert(wd.dead)
+    assert_eq(wd.live, 1)
+    // 两个线程互相 join
+    wd = sched.run_sim(prog(["push 0", "spawn w", "join", "halt", "w: pop", "push 0", "join", "halt"]), 2, 10, false)
+    assert(wd.dead)
+}
+
+test "真的并行：好几个 worker 一起跑，结果一样" {
+    for nw in [1, 2, 4, 8] {
+        for _k in 0..3 {
+            wd = sched.run_par(many(60), nw, 5)
+            assert(!wd.dead)
+            assert_eq(wd.live, 0)
+            assert_eq(len(wd.done), 61)
+            assert_eq(wd.ts[0].res, many_res(60))
+            for t in 0..61 { assert_eq(sched.cnt(wd, t), 1) }
+        }
+    }
+    // 有界通道也真的并行跑：只有一个消费者，打印的顺序还是 1..30
+    for nc in ["newch 0", "newch 2"] {
+        for _k in 0..3 { in_order(sched.run_par(pipe(nc), 4, 3)) }
+    }
+    wd = sched.run_par(prog(["newch", "recv", "halt"]), 4, 10)
+    assert(wd.dead)
+}

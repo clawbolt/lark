@@ -1,0 +1,297 @@
+// tar 格式（POSIX ustar），不碰文件系统：把 Entry 写成字节，把字节读回 Entry。
+//
+// 一个文件是 512 字节的头，后面是内容，补 0 到 512 的整数倍；整个包以两个全 0 的块结尾。
+// 头里的数都是八进制的文字（"0000644\0"）；校验和是把校验和那 8 个字节当成空格时，整个头的字节之和。
+// 名字超过 100 字节时拆成 prefix（最多 155）和 name 两段，在某个 / 处拆开。
+//
+// 读的时候还认得：pax 扩展头（'x'，里面的 path、linkpath、size 覆盖下一项；别的键忽略）、全局 pax 头（'g'，忽略）、
+// GNU 的长名字（'L'、'K'）。系统的 tar（macOS 的 bsdtar、Linux 的 GNU tar）打的包都能读。
+// 写的时候只写 ustar：名字或链接目标太长时报错，不写 pax 头。
+import "std/str"
+
+pub type Entry {
+    pub name: str   // 不带结尾的 /
+    pub kind: str   // "file" / "dir" / "symlink" / "hardlink" / "other"（设备、管道等）
+    pub mode: int   // 权限位，比如 0o755
+    pub size: int   // 内容的字节数（只有 file 有）
+    pub mtime: int  // 修改时间，秒
+    pub link: str   // symlink、hardlink 指向的地方
+    pub data: [u8]
+}
+
+const BLOCK = 512
+
+// 一个 file 项
+pub fn file(name: str, mode: int, mtime: int, data: [u8]) -> Entry {
+    Entry(name: name, kind: "file", mode: mode, size: len(data), mtime: mtime, link: "", data: data.copy())
+}
+
+pub fn dir(name: str, mode: int, mtime: int) -> Entry {
+    Entry(name: name, kind: "dir", mode: mode, size: 0, mtime: mtime, link: "", data: [])
+}
+
+pub fn symlink(name: str, target: str, mtime: int) -> Entry {
+    Entry(name: name, kind: "symlink", mode: 0o777, size: 0, mtime: mtime, link: target, data: [])
+}
+
+// ---------- 写 ----------
+
+// 在 out 末尾写一项：头、内容、补齐
+pub fn write_entry(inout out: [u8], e: Entry) -> ()! {
+    h = header(e)?
+    for b in h { out.push(b) }
+    if e.kind == "file" {
+        for b in e.data { out.push(b) }
+        pad(&out)
+    }
+    Ok()
+}
+
+// 包的结尾：两个全 0 的块
+pub fn finish(inout out: [u8]) {
+    for _ in 0..2 * BLOCK { out.push(0) }
+}
+
+fn pad(inout out: [u8]) {
+    for len(out) % BLOCK != 0 { out.push(0) }
+}
+
+fn header(e: Entry) -> [u8]! {
+    h: [u8] = []
+    for _ in 0..BLOCK { h.push(0) }
+    full = if e.kind == "dir" { e.name + "/" } else { e.name.copy() }
+    prefix, name = split_name(full)?
+    if len(e.link) > 100 { return Err("链接目标太长（ustar 最多 100 字节）：#{e.name} -> #{e.link}") }
+    put_str(&h, 0, name)
+    put_oct(&h, 100, 8, e.mode & 0o7777)?
+    put_oct(&h, 108, 8, 0)?
+    put_oct(&h, 116, 8, 0)?
+    size = if e.kind == "file" { len(e.data) } else { 0 }
+    put_oct(&h, 124, 12, size)?
+    put_oct(&h, 136, 12, if e.mtime < 0 { 0 } else { e.mtime })?
+    h[156] = type_flag(e.kind)
+    put_str(&h, 157, e.link)
+    put_str(&h, 257, "ustar")
+    put_str(&h, 263, "00")
+    put_str(&h, 345, prefix)
+    // 校验和：那 8 个字节先当空格算，再写成 6 位八进制、0、空格
+    for i in 148..156 { h[i] = ' ' }
+    sum = 0
+    for b in h { sum += b.to_int() }
+    put_oct(&h, 148, 7, sum)?
+    h[155] = ' '
+    Ok(h)
+}
+
+fn type_flag(kind: str) -> u8 {
+    if kind == "dir" { return '5' }
+    if kind == "symlink" { return '2' }
+    if kind == "hardlink" { return '1' }
+    '0'
+}
+
+// 名字放不进 100 字节时，在某个 / 处拆成 (prefix, name)：prefix 最多 155 字节、name 最多 100 字节
+pub fn split_name(full: str) -> (str, str)! {
+    if len(full) <= 100 { return Ok(("", full.copy())) }
+    // 从右往左找第一个能让两段都放得下的 /（目录的结尾 / 不算）
+    i = len(full) - 2
+    for i > 0 {
+        if byte_at(full, i) == '/' && i <= 155 && len(full) - i - 1 <= 100 {
+            return Ok((slice(full, 0, i), slice(full, i + 1, len(full))))
+        }
+        i -= 1
+    }
+    Err("路径太长（ustar 最多 255 字节，并且要能在某个 / 处拆成 155 + 100）：#{full}")
+}
+
+fn put_str(inout h: [u8], at: int, s: str) {
+    for i in 0..len(s) { h[at + i] = byte_at(s, i).to_u8() }
+}
+
+// width - 1 位八进制，前面补 0，最后一个字节是 0
+fn put_oct(inout h: [u8], at: int, width: int, v: int) -> ()! {
+    n = width - 1
+    x = v
+    for i in 0..n {
+        h[at + n - 1 - i] = ('0' + x % 8).to_u8()
+        x = x / 8
+    }
+    if x != 0 { return Err("数太大，放不进 ustar 的 #{width} 字节字段：#{v}") }
+    h[at + n] = 0
+    Ok()
+}
+
+// ---------- 读 ----------
+
+// 读整个包。出错时写明是第几个字节的头
+pub fn parse(d: [u8]) -> [Entry]! {
+    out: [Entry] = []
+    // 前面的 pax 头、GNU 长名字留给下一项用
+    long_name = ""
+    long_link = ""
+    pax_size = -1
+    off = 0
+    for true {
+        if off == len(d) { break }
+        if off + BLOCK > len(d) { return Err("tar 第 #{off} 个字节：头不完整（只剩 #{len(d) - off} 个字节）") }
+        if zero_block(d, off) { break }
+        stored = oct_at(d, off, 148, 8)?
+        if stored != checksum(d, off) { return Err("tar 第 #{off} 个字节：头的校验和不对，不是 tar 包，或者包坏了") }
+        typ = d[off + 156]
+        size = oct_at(d, off, 124, 12)?
+        if pax_size >= 0 && typ != 'x' && typ != 'g' && typ != 'L' && typ != 'K' {
+            size = pax_size
+        }
+        start = off + BLOCK
+        if start + size > len(d) { return Err("tar 第 #{off} 个字节：内容被截断了（要 #{size} 个字节，只剩 #{len(d) - start} 个）") }
+        next = start + (size + BLOCK - 1) / BLOCK * BLOCK
+        if typ == 'x' {
+            pax(d, start, start + size, &long_name, &long_link, &pax_size)
+        } else if typ == 'L' {
+            long_name = cstr(d, start, size)
+        } else if typ == 'K' {
+            long_link = cstr(d, start, size)
+        } else if typ != 'g' {
+            name = cstr(d, off, 100)
+            if is_ustar(d, off) {
+                prefix = cstr(d, off + 345, 155)
+                if prefix != "" { name = prefix + "/" + name }
+            }
+            if long_name != "" { name = replace(&long_name, "") }
+            link = cstr(d, off + 157, 100)
+            if long_link != "" { link = replace(&long_link, "") }
+            pax_size = -1
+            kind = kind_of(typ, name)
+            data: [u8] = []
+            if kind == "file" {
+                data.reserve(size)
+                for i in start..start + size { data.push(d[i]) }
+            }
+            for len(name) > 1 && str.ends_with(name, "/") { name = slice(name, 0, len(name) - 1) }
+            mode = oct_at(d, off, 100, 8)? & 0o7777
+            mtime = oct_at(d, off, 136, 12)?
+            out.push(Entry(name: name, kind: kind, mode: mode, size: if kind == "file" { size } else { 0 }, mtime: mtime, link: link, data: data))
+        }
+        off = next
+    }
+    Ok(out)
+}
+
+fn kind_of(typ: u8, name: str) -> str {
+    if typ == '0' || typ == 0 || typ == '7' {
+        // 很老的 tar 用结尾的 / 表示目录
+        return if str.ends_with(name, "/") { "dir" } else { "file" }
+    }
+    if typ == '5' { return "dir" }
+    if typ == '2' { return "symlink" }
+    if typ == '1' { return "hardlink" }
+    "other"
+}
+
+fn zero_block(d: [u8], off: int) -> bool {
+    for i in off..off + BLOCK {
+        if d[i] != 0 { return false }
+    }
+    true
+}
+
+fn is_ustar(d: [u8], off: int) -> bool { cstr(d, off + 257, 5) == "ustar" }
+
+fn checksum(d: [u8], off: int) -> int {
+    sum = 0
+    for i in 0..BLOCK {
+        sum += if i >= 148 && i < 156 { 32 } else { d[off + i].to_int() }
+    }
+    sum
+}
+
+// 从 d[at] 开始最多 n 个字节，到第一个 0 为止
+fn cstr(d: [u8], at: int, n: int) -> str {
+    b: [u8] = []
+    for i in at..at + n {
+        if d[i] == 0 { break }
+        b.push(d[i])
+    }
+    from_bytes(b)
+}
+
+// 头里的八进制字段：前面可以有空格，到 0 或空格为止
+fn oct_at(d: [u8], off: int, at: int, n: int) -> int! {
+    v = 0
+    i = off + at
+    end = i + n
+    if (d[i] & 0x80) != 0 { return Err("tar 第 #{off} 个字节：不支持 GNU 的二进制数字段（文件太大？）") }
+    for i < end && d[i] == ' ' { i += 1 }
+    for i < end && d[i] != 0 && d[i] != ' ' {
+        c = d[i].to_int()
+        if c < '0' || c > '7' { return Err("tar 第 #{off} 个字节：第 #{at} 个字节起的数不是八进制") }
+        v = v * 8 + (c - '0')
+        i += 1
+    }
+    Ok(v)
+}
+
+// pax 扩展头：一条条 "长度 键=值\n"，长度包括它自己
+fn pax(d: [u8], lo: int, hi: int, inout name: str, inout link: str, inout size: int) {
+    i = lo
+    for i < hi {
+        n = 0
+        j = i
+        for j < hi && d[j] >= '0' && d[j] <= '9' {
+            n = n * 10 + (d[j].to_int() - '0')
+            j += 1
+        }
+        if n <= 0 || i + n > hi { return }
+        rec = cstr_n(d, j + 1, i + n - 1)
+        k, v = str.cut(rec, "=") ?? ("", "")
+        if k == "path" { name = v } else if k == "linkpath" { link = v } else if k == "size" { size = try_parse_int(v) ?? -1 }
+        i += n
+    }
+}
+
+// d[a..b] 原样拼成 str（可以有 0）
+fn cstr_n(d: [u8], a: int, b: int) -> str {
+    out: [u8] = []
+    for i in a..b { out.push(d[i]) }
+    from_bytes(out)
+}
+
+// 解包时要拒绝的名字：绝对路径、有 .. 的、空的。返回原因，安全时返回 ""
+pub fn unsafe_reason(name: str) -> str {
+    if name == "" { return "名字是空的" }
+    if str.starts_with(name, "/") { return "是绝对路径" }
+    for part in str.split(name, "/") {
+        if part == ".." { return "里面有 .." }
+    }
+    ""
+}
+
+// ls -l 那样的权限：drwxr-xr-x
+pub fn mode_text(e: Entry) -> str {
+    t = if e.kind == "dir" { "d" } else if e.kind == "symlink" { "l" } else if e.kind == "file" { "-" } else if e.kind == "hardlink" { "h" } else { "?" }
+    letters = "rwxrwxrwx"
+    out = t
+    for i in 0..9 {
+        bit = 1 << (8 - i)
+        out += if (e.mode & bit) != 0 { slice(letters, i, i + 1) } else { "-" }
+    }
+    out
+}
+
+// "#{e}"：file a/b.txt（12 字节，0o644）
+pub fn show(e: Entry) -> str {
+    if e.kind == "symlink" || e.kind == "hardlink" { return "#{e.kind} #{e.name} -> #{e.link}" }
+    if e.kind == "file" { return "file #{e.name}（#{e.size} 字节，0o#{oct(e.mode)}）" }
+    "#{e.kind} #{e.name}（0o#{oct(e.mode)}）"
+}
+
+fn oct(v: int) -> str {
+    if v == 0 { return "0" }
+    s = ""
+    x = v
+    for x > 0 {
+        s = from_byte('0' + x % 8) + s
+        x = x / 8
+    }
+    s
+}

@@ -1,0 +1,626 @@
+// llua · 解析：递归下降，优先级同 Lua 5.4 的 lparser.c。解析的同时解析名字（见 ast.lark 开头）。
+import "lex"
+import "ast"
+
+// 正在解析的一个函数
+type Fs {
+    names: [str]       // 当前可见的局部变量（按声明顺序），槽位就是下标
+    blocks: [int]      // 每层块开始时 names 的长度
+    nslots: int
+    boxed: [bool]
+    slot_names: [str]
+    up_local: [bool]
+    up_idx: [int]
+    up_names: [str]
+    vararg: bool
+}
+
+pub type Prog {
+    pub protos: [ast.Proto]
+    pub main: int
+    pub chunk: str
+}
+
+type P {
+    ts: [lex.Tok]
+    pos: int
+    chunk: str
+    fss: [Fs]
+    protos: [ast.Proto]
+}
+
+fn new_fs(vararg: bool) -> Fs {
+    Fs(names: [], blocks: [], nslots: 0, boxed: [], slot_names: [], up_local: [], up_idx: [], up_names: [], vararg: vararg)
+}
+
+// ---------- 记号 ----------
+
+fn kind(p: P) -> int { p.ts[p.pos].kind }
+
+fn text(p: P) -> str { p.ts[p.pos].text }
+
+fn line(p: P) -> int { p.ts[p.pos].line }
+
+fn is_sym(p: P, s: str) -> bool { p.ts[p.pos].kind == lex.K_SYM && p.ts[p.pos].text == s }
+
+fn near(p: P) -> str {
+    t = p.ts[p.pos].text
+    if p.ts[p.pos].kind == lex.K_EOF { "<eof>" } else { t }
+}
+
+fn err(p: P, msg: str) -> str { "#{p.chunk}:#{line(p)}: #{msg} near '#{near(p)}'" }
+
+fn accept(inout p: P, s: str) -> bool {
+    if is_sym(p, s) {
+        p.pos += 1
+        return true
+    }
+    false
+}
+
+fn expect(inout p: P, s: str) -> ()! {
+    if !accept(&p, s) { return Err(err(p, "'#{s}' expected")) }
+}
+
+// what 在 at 行打开、到这里该用 s 结束（Lua 的 check_match）
+fn expect_match(inout p: P, s: str, what: str, at: int) -> ()! {
+    if accept(&p, s) { return Ok() }
+    if at == line(p) { return Err(err(p, "'#{s}' expected")) }
+    Err(err(p, "'#{s}' expected (to close '#{what}' at line #{at})"))
+}
+
+fn name(inout p: P) -> str! {
+    if kind(p) != lex.K_NAME { return Err(err(p, "<name> expected")) }
+    s = text(p)
+    p.pos += 1
+    Ok(s)
+}
+
+// ---------- 作用域 ----------
+
+fn top(p: P) -> int { len(p.fss) - 1 }
+
+fn open_block(inout p: P) {
+    t = top(p)
+    n = len(p.fss[t].names)
+    p.fss[t].blocks.push(n)
+}
+
+fn close_block(inout p: P) {
+    t = top(p)
+    n = p.fss[t].blocks.pop()
+    for len(p.fss[t].names) > n { _ = p.fss[t].names.pop() }
+}
+
+// 声明一个局部变量（马上可见），返回它的槽位
+fn declare(inout p: P, nm: str) -> int {
+    t = top(p)
+    slot = len(p.fss[t].names)
+    p.fss[t].names.push(nm)
+    if slot >= p.fss[t].nslots {
+        p.fss[t].nslots = slot + 1
+        p.fss[t].boxed.push(false)
+        p.fss[t].slot_names.push(nm)
+    } else {
+        p.fss[t].slot_names[slot] = nm
+    }
+    slot
+}
+
+fn find_local(f: Fs, nm: str) -> int {
+    i = len(f.names) - 1
+    for i >= 0 {
+        if f.names[i] == nm { return i }
+        i -= 1
+    }
+    -1
+}
+
+// 第 k 个函数里名字 nm 对应的上值编号；不是上值时 -1
+fn find_up(inout p: P, k: int, nm: str) -> int {
+    for i in 0..len(p.fss[k].up_names) {
+        if p.fss[k].up_names[i] == nm { return i }
+    }
+    if k == 0 { return -1 }
+    pk = k - 1
+    slot = find_local(p.fss[pk], nm)
+    is_local = slot >= 0
+    idx = slot
+    if is_local {
+        p.fss[pk].boxed[slot] = true
+    } else {
+        idx = find_up(&p, pk, nm)
+        if idx < 0 { return -1 }
+    }
+    p.fss[k].up_local.push(is_local)
+    p.fss[k].up_idx.push(idx)
+    p.fss[k].up_names.push(nm)
+    len(p.fss[k].up_names) - 1
+}
+
+fn resolve(inout p: P, nm: str) -> ast.Ex {
+    t = top(p)
+    slot = find_local(p.fss[t], nm)
+    if slot >= 0 { return ast.ELocal(slot, nm) }
+    u = find_up(&p, t, nm)
+    if u >= 0 { return ast.EUp(u, nm) }
+    ast.EGlobal(nm)
+}
+
+// ---------- 函数 ----------
+
+// 解析参数表和函数体（pos 指着 "("），返回函数原型的编号。is_method：a:b() 的形式，多一个参数 self
+fn func_body(inout p: P, fname: str, is_method: bool, at: int) -> int! {
+    p.fss.push(new_fs(false))
+    open_block(&p)
+    np = 0
+    if is_method {
+        _ = declare(&p, "self")
+        np += 1
+    }
+    expect(&p, "(")?
+    if !is_sym(p, ")") {
+        for true {
+            if accept(&p, "...") {
+                t = top(p)
+                p.fss[t].vararg = true
+                break
+            }
+            nm = name(&p)?
+            _ = declare(&p, nm)
+            np += 1
+            if !accept(&p, ",") { break }
+        }
+    }
+    expect(&p, ")")?
+    body = block(&p)?
+    expect_match(&p, "end", "function", at)?
+    f = p.fss.pop()
+    pr = ast.Proto(name: fname, line: at, nparams: np, vararg: f.vararg, nslots: f.nslots, boxed: replace(&f.boxed, []), names: replace(&f.slot_names, []),
+        up_local: replace(&f.up_local, []), up_idx: replace(&f.up_idx, []), up_names: replace(&f.up_names, []), body: body)
+    p.protos.push(pr)
+    Ok(len(p.protos) - 1)
+}
+
+// ---------- 表达式 ----------
+
+fn primary(inout p: P) -> ast.Ex! {
+    if kind(p) == lex.K_NAME {
+        nm = name(&p)?
+        return Ok(resolve(&p, nm))
+    }
+    if accept(&p, "(") {
+        at = line(p)
+        e = expr(&p)?
+        expect_match(&p, ")", "(", at)?
+        return Ok(ast.EParen(e))
+    }
+    Err(err(p, "unexpected symbol"))
+}
+
+fn call_args(inout p: P) -> [ast.Ex]! {
+    if kind(p) == lex.K_STR {
+        s = text(p)
+        p.pos += 1
+        return Ok([ast.EStr(s)])
+    }
+    if is_sym(p, "{") {
+        t = table(&p)?
+        return Ok([t])
+    }
+    at = line(p)
+    expect(&p, "(")?
+    args: [ast.Ex] = []
+    if !is_sym(p, ")") {
+        args = expr_list(&p)?
+    }
+    expect_match(&p, ")", "(", at)?
+    Ok(args)
+}
+
+fn suffixed(inout p: P) -> ast.Ex! {
+    e = primary(&p)?
+    for true {
+        ln = line(p)
+        if accept(&p, ".") {
+            nm = name(&p)?
+            e = ast.EIndex(e, ast.EStr(nm), ln)
+        } else if accept(&p, "[") {
+            k = expr(&p)?
+            expect(&p, "]")?
+            e = ast.EIndex(e, k, ln)
+        } else if accept(&p, ":") {
+            nm = name(&p)?
+            args = call_args(&p)?
+            e = ast.EMethod(e, nm, args, ln)
+        } else if is_sym(p, "(") || is_sym(p, "{") || kind(p) == lex.K_STR {
+            args = call_args(&p)?
+            e = ast.ECall(e, args, ln)
+        } else {
+            return Ok(e)
+        }
+    }
+    Ok(e)
+}
+
+fn table(inout p: P) -> ast.Ex! {
+    at = line(p)
+    expect(&p, "{")?
+    items: [ast.Ex] = []
+    keys: [ast.Ex] = []
+    vals: [ast.Ex] = []
+    for !is_sym(p, "}") {
+        if accept(&p, "[") {
+            k = expr(&p)?
+            expect(&p, "]")?
+            expect(&p, "=")?
+            v = expr(&p)?
+            keys.push(k)
+            vals.push(v)
+        } else if kind(p) == lex.K_NAME && p.ts[p.pos + 1].kind == lex.K_SYM && p.ts[p.pos + 1].text == "=" {
+            nm = name(&p)?
+            p.pos += 1
+            v = expr(&p)?
+            keys.push(ast.EStr(nm))
+            vals.push(v)
+        } else {
+            v = expr(&p)?
+            items.push(v)
+        }
+        if !accept(&p, ",") && !accept(&p, ";") { break }
+    }
+    expect_match(&p, "}", "{", at)?
+    Ok(ast.ETable(items, keys, vals, at))
+}
+
+fn simple(inout p: P) -> ast.Ex! {
+    k = kind(p)
+    if k == lex.K_INT {
+        n = p.ts[p.pos].n
+        p.pos += 1
+        return Ok(ast.EInt(n))
+    }
+    if k == lex.K_FLT {
+        f = p.ts[p.pos].f
+        p.pos += 1
+        return Ok(ast.ENum(f))
+    }
+    if k == lex.K_STR {
+        s = text(p)
+        p.pos += 1
+        return Ok(ast.EStr(s))
+    }
+    if accept(&p, "nil") { return Ok(ast.ENil) }
+    if accept(&p, "true") { return Ok(ast.ETrue) }
+    if accept(&p, "false") { return Ok(ast.EFalse) }
+    if is_sym(p, "...") {
+        if !p.fss[top(p)].vararg { return Err(err(p, "cannot use '...' outside a vararg function")) }
+        p.pos += 1
+        return Ok(ast.EVararg)
+    }
+    if is_sym(p, "{") { return table(&p) }
+    if is_sym(p, "function") {
+        at = line(p)
+        p.pos += 1
+        id = func_body(&p, "anonymous", false, at)?
+        return Ok(ast.EFunc(id))
+    }
+    suffixed(&p)
+}
+
+// 二元运算的编号和左右优先级；不是二元运算时编号为 0
+fn binop(p: P) -> (int, int, int) {
+    if kind(p) != lex.K_SYM { return (0, 0, 0) }
+    t = text(p)
+    match t {
+        "+" => (ast.OP_ADD, 10, 10)
+        "-" => (ast.OP_SUB, 10, 10)
+        "*" => (ast.OP_MUL, 11, 11)
+        "/" => (ast.OP_DIV, 11, 11)
+        "//" => (ast.OP_IDIV, 11, 11)
+        "%" => (ast.OP_MOD, 11, 11)
+        "^" => (ast.OP_POW, 14, 13)
+        ".." => (ast.OP_CONCAT, 9, 8)
+        "<<" => (ast.OP_SHL, 7, 7)
+        ">>" => (ast.OP_SHR, 7, 7)
+        "&" => (ast.OP_BAND, 6, 6)
+        "~" => (ast.OP_BXOR, 5, 5)
+        "|" => (ast.OP_BOR, 4, 4)
+        "==" => (ast.OP_EQ, 3, 3)
+        "~=" => (ast.OP_NE, 3, 3)
+        "<" => (ast.OP_LT, 3, 3)
+        "<=" => (ast.OP_LE, 3, 3)
+        ">" => (ast.OP_GT, 3, 3)
+        ">=" => (ast.OP_GE, 3, 3)
+        "and" => (-1, 2, 2)
+        "or" => (-2, 1, 1)
+        _ => (0, 0, 0)
+    }
+}
+
+fn unop(p: P) -> int {
+    if kind(p) != lex.K_SYM { return 0 }
+    t = text(p)
+    match t {
+        "-" => ast.OP_NEG
+        "not" => ast.OP_NOT
+        "#" => ast.OP_LEN
+        "~" => ast.OP_BNOT
+        _ => 0
+    }
+}
+
+const UNARY_PRI = 12
+
+// 常量折叠只做一种：负的数字字面量（让 -1、-0.5 直接是常量）
+fn negate(take e: ast.Ex, ln: int) -> ast.Ex {
+    match take e {
+        ast.EInt(n) => ast.EInt(0 -% n)
+        ast.ENum(f) => ast.ENum(f * (0.0 - 1.0))
+        other => ast.EUn(ast.OP_NEG, other, ln)
+    }
+}
+
+fn subexpr(inout p: P, limit: int) -> ast.Ex! {
+    u = unop(p)
+    e = ast.ENil
+    if u != 0 {
+        ln = line(p)
+        p.pos += 1
+        a = subexpr(&p, UNARY_PRI)?
+        e = if u == ast.OP_NEG { negate(a, ln) } else { ast.EUn(u, a, ln) }
+    } else {
+        e = simple(&p)?
+    }
+    for true {
+        op, lp, rp = binop(p)
+        if op == 0 || lp <= limit { break }
+        ln = line(p)
+        p.pos += 1
+        b = subexpr(&p, rp)?
+        if op == -1 {
+            e = ast.EAnd(e, b)
+        } else if op == -2 {
+            e = ast.EOr(e, b)
+        } else {
+            e = ast.EBin(op, e, b, ln)
+        }
+    }
+    Ok(e)
+}
+
+fn expr(inout p: P) -> ast.Ex! { subexpr(&p, 0) }
+
+fn expr_list(inout p: P) -> [ast.Ex]! {
+    xs: [ast.Ex] = []
+    for true {
+        e = expr(&p)?
+        xs.push(e)
+        if !accept(&p, ",") { break }
+    }
+    Ok(xs)
+}
+
+// ---------- 语句 ----------
+
+fn block_end(p: P) -> bool {
+    kind(p) == lex.K_EOF || is_sym(p, "end") || is_sym(p, "else") || is_sym(p, "elseif") || is_sym(p, "until")
+}
+
+// 一串语句，不开新的作用域
+fn stmts(inout p: P) -> [ast.St]! {
+    out: [ast.St] = []
+    for !block_end(p) {
+        if is_sym(p, "return") {
+            ln = line(p)
+            p.pos += 1
+            vals: [ast.Ex] = []
+            if !block_end(p) && !is_sym(p, ";") {
+                vals = expr_list(&p)?
+            }
+            _ = accept(&p, ";")
+            if !block_end(p) { return Err(err(p, "'<eof>' expected")) }
+            out.push(ast.SReturn(vals, ln))
+            break
+        }
+        s = stmt(&p)?
+        match take s {
+            Some(x) => out.push(x)
+            None => {}
+        }
+    }
+    Ok(out)
+}
+
+fn block(inout p: P) -> [ast.St]! {
+    open_block(&p)
+    b = stmts(&p)?
+    close_block(&p)
+    Ok(b)
+}
+
+fn local_attr(inout p: P) -> ()! {
+    if accept(&p, "<") {
+        a = name(&p)?
+        if a != "const" { return Err(err(p, "llua 只支持 <const>，不支持 <#{a}>")) }
+        expect(&p, ">")?
+    }
+}
+
+// 一条语句；空语句（;）得到 None
+fn stmt(inout p: P) -> ast.St?! {
+    ln = line(p)
+    if accept(&p, ";") { return Ok(None) }
+    if accept(&p, "if") {
+        conds: [ast.Ex] = []
+        blocks: [[ast.St]] = []
+        c = expr(&p)?
+        expect(&p, "then")?
+        b = block(&p)?
+        conds.push(c)
+        blocks.push(b)
+        els: [ast.St] = []
+        for true {
+            if accept(&p, "elseif") {
+                c2 = expr(&p)?
+                expect(&p, "then")?
+                b2 = block(&p)?
+                conds.push(c2)
+                blocks.push(b2)
+            } else if accept(&p, "else") {
+                els = block(&p)?
+                expect_match(&p, "end", "if", ln)?
+                break
+            } else {
+                expect_match(&p, "end", "if", ln)?
+                break
+            }
+        }
+        return Ok(Some(ast.SIf(conds, blocks, els)))
+    }
+    if accept(&p, "while") {
+        c = expr(&p)?
+        expect(&p, "do")?
+        b = block(&p)?
+        expect_match(&p, "end", "while", ln)?
+        return Ok(Some(ast.SWhile(c, b)))
+    }
+    if accept(&p, "do") {
+        b = block(&p)?
+        expect_match(&p, "end", "do", ln)?
+        return Ok(Some(ast.SDo(b)))
+    }
+    if accept(&p, "repeat") {
+        // until 的条件能看到循环体里的局部变量
+        open_block(&p)
+        b = stmts(&p)?
+        expect_match(&p, "until", "repeat", ln)?
+        c = expr(&p)?
+        close_block(&p)
+        return Ok(Some(ast.SRepeat(b, c)))
+    }
+    if accept(&p, "for") {
+        n1 = name(&p)?
+        if accept(&p, "=") {
+            a = expr(&p)?
+            expect(&p, ",")?
+            b = expr(&p)?
+            step = ast.EInt(1)
+            if accept(&p, ",") {
+                step = expr(&p)?
+            }
+            expect(&p, "do")?
+            open_block(&p)
+            slot = declare(&p, n1)
+            body = block(&p)?
+            close_block(&p)
+            expect_match(&p, "end", "for", ln)?
+            return Ok(Some(ast.SNumFor(slot, a, b, step, body, ln)))
+        }
+        names = [n1]
+        for accept(&p, ",") {
+            n = name(&p)?
+            names.push(n)
+        }
+        expect(&p, "in")?
+        exprs = expr_list(&p)?
+        expect(&p, "do")?
+        open_block(&p)
+        slots: [int] = []
+        for nm in names { slots.push(declare(&p, nm)) }
+        body = block(&p)?
+        close_block(&p)
+        expect_match(&p, "end", "for", ln)?
+        return Ok(Some(ast.SGenFor(slots, exprs, body, ln)))
+    }
+    if accept(&p, "function") {
+        n1 = name(&p)?
+        full = n1.copy()
+        target = resolve(&p, n1)
+        is_method = false
+        for is_sym(p, ".") || is_sym(p, ":") {
+            colon = is_sym(p, ":")
+            kl = line(p)
+            p.pos += 1
+            k = name(&p)?
+            full += if colon { ":" } else { "." }
+            full += k
+            target = ast.EIndex(target, ast.EStr(k), kl)
+            if colon {
+                is_method = true
+                break
+            }
+        }
+        id = func_body(&p, full, is_method, ln)?
+        return Ok(Some(ast.SAssign([target], [ast.EFunc(id)], ln)))
+    }
+    if accept(&p, "local") {
+        if accept(&p, "function") {
+            nm = name(&p)?
+            slot = declare(&p, nm)
+            id = func_body(&p, nm, false, ln)?
+            return Ok(Some(ast.SLocalFn(slot, id)))
+        }
+        names: [str] = []
+        for true {
+            n = name(&p)?
+            local_attr(&p)?
+            names.push(n)
+            if !accept(&p, ",") { break }
+        }
+        vals: [ast.Ex] = []
+        if accept(&p, "=") {
+            vals = expr_list(&p)?
+        }
+        // 先求右边的值，再声明（local x = x 里右边的 x 是外面的）
+        slots: [int] = []
+        for nm in names { slots.push(declare(&p, nm)) }
+        return Ok(Some(ast.SLocal(slots, vals, ln)))
+    }
+    if accept(&p, "break") { return Ok(Some(ast.SBreak)) }
+    if is_sym(p, "goto") || is_sym(p, "::") { return Err(err(p, "llua 还不支持 goto")) }
+    // 赋值或者函数调用
+    e = suffixed(&p)?
+    if is_sym(p, "=") || is_sym(p, ",") {
+        targets = [e]
+        for accept(&p, ",") {
+            t = suffixed(&p)?
+            targets.push(t)
+        }
+        expect(&p, "=")?
+        for t in targets {
+            if !assignable(t) { return Err(err(p, "syntax error")) }
+        }
+        vals = expr_list(&p)?
+        return Ok(Some(ast.SAssign(targets, vals, ln)))
+    }
+    if !is_call(e) { return Err(err(p, "syntax error")) }
+    Ok(Some(ast.SCall(e, ln)))
+}
+
+fn assignable(e: ast.Ex) -> bool {
+    match e {
+        ast.ELocal(_, _) | ast.EUp(_, _) | ast.EGlobal(_) | ast.EIndex(_, _, _) => true
+        _ => false
+    }
+}
+
+fn is_call(e: ast.Ex) -> bool {
+    match e {
+        ast.ECall(_, _, _) | ast.EMethod(_, _, _, _) => true
+        _ => false
+    }
+}
+
+pub fn parse(src: str, chunk: str) -> Prog! {
+    ts = lex.lex(src, chunk)?
+    p = P(ts: ts, pos: 0, chunk: chunk, fss: [new_fs(true)], protos: [])
+    body = block(&p)?
+    if kind(p) != lex.K_EOF { return Err(err(p, "'<eof>' expected")) }
+    f = p.fss.pop()
+    pr = ast.Proto(name: "main chunk", line: 0, nparams: 0, vararg: true, nslots: f.nslots, boxed: replace(&f.boxed, []), names: replace(&f.slot_names, []),
+        up_local: replace(&f.up_local, []), up_idx: replace(&f.up_idx, []), up_names: replace(&f.up_names, []), body: body)
+    p.protos.push(pr)
+    main_at = len(p.protos) - 1
+    Ok(Prog(protos: replace(&p.protos, []), main: main_at, chunk: chunk))
+}

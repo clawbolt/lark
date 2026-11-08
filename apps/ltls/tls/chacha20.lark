@@ -1,0 +1,71 @@
+// ChaCha20（RFC 8439 第 2.3、2.4 节）：256 位密钥、96 位 nonce、32 位块计数。
+// 状态是 16 个 32 位的字，存在 int 里，每次加法、移位以后取低 32 位。
+// 先证明再写：对应 formal/Lark/Tls.lean 的 qr / block / xorC（xorC_xorC：异或两次回到原样，长度不变），
+// 规格对上了 RFC 8439 第 2.3.2、2.4.2 节的测试向量。
+// 实验性：没有经过审计。只用加法、异或和固定位数的移位，不按密钥查表、不按密钥分支
+
+const M32 = 0xFFFF_FFFF
+
+fn rotl(x: int, n: int) -> int { ((x << n) | (x >>> (32 - n))) & M32 }
+
+// d[i..i+4) 按小端读成 32 位
+pub fn le32(d: [u8], i: int) -> int {
+    d[i].to_int() | (d[i + 1].to_int() << 8) | (d[i + 2].to_int() << 16) | (d[i + 3].to_int() << 24)
+}
+
+// 第 2.1 节的四分之一轮
+fn qr(inout s: [int], a: int, b: int, c: int, d: int) {
+    s[a] = (s[a] + s[b]) & M32
+    s[d] = rotl(s[d] ^ s[a], 16)
+    s[c] = (s[c] + s[d]) & M32
+    s[b] = rotl(s[b] ^ s[c], 12)
+    s[a] = (s[a] + s[b]) & M32
+    s[d] = rotl(s[d] ^ s[a], 8)
+    s[c] = (s[c] + s[d]) & M32
+    s[b] = rotl(s[b] ^ s[c], 7)
+}
+
+// 第 counter 块的 64 字节密钥流（第 2.3 节）。密钥不是 32 字节或 nonce 不是 12 字节时 panic（调用的人写错了）
+pub fn block(key: [u8], counter: int, nonce: [u8]) -> [u8] {
+    if len(key) != 32 || len(nonce) != 12 { panic("chacha20.block：密钥要 32 字节、nonce 要 12 字节") }
+    s: [int] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]   // "expand 32-byte k"
+    for i in 0..8 { s.push(le32(key, 4 * i)) }
+    s.push(counter & M32)
+    for i in 0..3 { s.push(le32(nonce, 4 * i)) }
+    w = s.copy()
+    for _r in 0..10 {
+        qr(&w, 0, 4, 8, 12)
+        qr(&w, 1, 5, 9, 13)
+        qr(&w, 2, 6, 10, 14)
+        qr(&w, 3, 7, 11, 15)
+        qr(&w, 0, 5, 10, 15)
+        qr(&w, 1, 6, 11, 12)
+        qr(&w, 2, 7, 8, 13)
+        qr(&w, 3, 4, 9, 14)
+    }
+    out: [u8] = []
+    for i in 0..16 {
+        v = (w[i] + s[i]) & M32
+        for k in 0..4 { out.push(((v >>> (8 * k)) & 255).wrap_u8()) }
+    }
+    out
+}
+
+// 从第 counter 块开始的密钥流和 data 逐字节异或（第 2.4 节）：加密和解密是同一个操作
+pub fn xor(key: [u8], counter: int, nonce: [u8], data: [u8]) -> [u8] {
+    out: [u8] = []
+    out.reserve(len(data))
+    i = 0
+    n = counter
+    for i < len(data) {
+        ks = block(key, n, nonce)
+        j = 0
+        for j < 64 && i + j < len(data) {
+            out.push((data[i + j].to_int() ^ ks[j].to_int()).wrap_u8())
+            j += 1
+        }
+        i += 64
+        n += 1
+    }
+    out
+}

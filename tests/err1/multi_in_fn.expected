@@ -1,0 +1,15 @@
+tests/err1/multi_in_fn.lark:8:9: 错误：未定义的变量 qqqq
+ 8 |         qqqq)
+   |         ^
+tests/err1/multi_in_fn.lark:12:14: 错误：类型不匹配：需要 int，实际是 str
+ 12 |     a: int = "x"
+    |              ^
+tests/err1/multi_in_fn.lark:13:22: 错误：未定义的变量 cccc
+ 13 |     print("#{a + 1}#{cccc}")
+    |                      ^
+tests/err1/multi_in_fn.lark:15:18: 错误：未定义的变量 dddd
+ 15 |         print("#{dddd}")
+    |                  ^
+tests/err1/multi_in_fn.lark:17:9: 错误：未定义的变量 eeee
+ 17 |     b = eeee
+    |         ^

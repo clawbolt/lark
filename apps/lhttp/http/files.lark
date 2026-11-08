@@ -1,0 +1,161 @@
+// lhttp · 处理一个请求：读文件、列目录、POST /echo。不碰网络，单元测试直接调用
+import "std/os"
+import "std/str"
+import "std/sort"
+import "std/http"
+
+// 所有连接共用的文件缓存：最近读过的文件（按请求的路径），CACHE_MS 之内再请求就不再打开文件。
+// 过期以后先 stat 一下，大小和修改时间都没变就接着用（只 stat，不重读）。lhttp 的采样里 open 一项就比网络收发多 4 倍。
+// 锁只包住查表和改表，读文件、stat 都在锁外。
+// 修改时间只精确到毫秒，读的时候文件刚改过（不到 CACHE_MS），同一毫秒里可能又改了一次，这样的文件过期后总是重读。
+// 代价：文件改了以后，客户端最多晚 CACHE_MS 看到。
+const CACHE_MS = 1000
+const CACHE_N = 64             // 最多缓存这么多个文件，满了按顺序替换
+const CACHE_MAX_FILE = 1048576 // 大于 1MB 的文件不缓存
+
+pub type Cache {
+    entries: [CacheEntry]
+    next: int
+}
+
+type CacheEntry {
+    path: str       // 请求的路径（/ 对应的是 /index.html 这个文件）
+    file: str       // 文件在磁盘上的路径
+    data: str
+    ctype: str
+    mtime: int      // 读的时候文件的修改时间
+    read_at: int    // 什么时候读的
+    at: int         // 什么时候确认过还是新的（读的时候，或者过期后 stat 没变）
+}
+
+pub fn new_cache() -> Mutex[Cache] { mutex(Cache(entries: [], next: 0)) }
+
+// 找到的话返回一份副本（里面只有 str 和 int，复制只是计数加一）
+fn cache_find(cache: Cache, path: str) -> CacheEntry? {
+    for e in cache.entries {
+        if e.path == path { return Some(e.copy()) }
+    }
+    None
+}
+
+fn cache_touch(inout cache: Cache, path: str, now: int) {
+    for i in 0..len(cache.entries) {
+        if cache.entries[i].path == path { cache.entries[i].at = now }
+    }
+}
+
+fn cache_put(inout cache: Cache, take e: CacheEntry) {
+    if len(e.data) > CACHE_MAX_FILE { return }
+    k = -1
+    for i in 0..len(cache.entries) {
+        if cache.entries[i].path == e.path { k = i }
+    }
+    if k < 0 && len(cache.entries) < CACHE_N {
+        cache.entries.push(e)
+        return
+    }
+    if k < 0 {
+        k = cache.next
+        cache.next = (cache.next + 1) % CACHE_N
+    }
+    cache.entries[k] = e
+}
+
+// 过期的项还能不能用：文件的大小、修改时间都没变，而且读的时候它已经至少 CACHE_MS 没改过了
+fn still_fresh(e: CacheEntry) -> bool {
+    match os.stat(e.file) {
+        Ok(st) => st.is_file && st.size == len(e.data) && st.mtime_ms == e.mtime && e.mtime + CACHE_MS <= e.read_at
+        Err(_) => false
+    }
+}
+
+// 处理一个请求，得到回复（std/http 的 serve 补上 Date、Connection 再发出去；HEAD 时它只发头部）
+pub fn handle(cache: Mutex[Cache], root: str, req: http.Request, now: int) -> http.Response {
+    head = req.method == "HEAD"
+    if req.method == "POST" && req.path == "/echo" {
+        ct = http.header(req, "content-type") ?? "application/octet-stream"
+        return http.reply(200, [("Content-Type", ct)], req.body)
+    }
+    if req.method != "GET" && !head {
+        body, hs = http.error_page(405)
+        hs.push(("Allow", "GET, HEAD"))
+        return http.reply(405, hs, body)
+    }
+    // 不许跳出根目录：路径里不能有 .. 这一段
+    for seg in str.split(req.path, "/") {
+        if seg == ".." { return http.reply_error(403) }
+    }
+    found = lock cache as c { cache_find(c, req.path) }
+    match take found {
+        Some(e) => {
+            if now - e.at < CACHE_MS { return file_ok(req, e) }
+            if still_fresh(e) {
+                lock cache as c { cache_touch(&c, req.path, now) }
+                return file_ok(req, e)
+            }
+        }
+        None => {}
+    }
+    full = root + req.path
+    if os.is_dir(full) {
+        // 目录要以 / 结尾，不然页面里的相对链接会错；先跳转
+        if !str.ends_with(req.path, "/") {
+            loc = http.escape_path(req.path) + "/"
+            return http.reply(301, [("Location", loc)], "")
+        }
+        index = os.join_path(full, "index.html")
+        if os.is_file(index) { return file_reply(cache, req, index, now) }
+        return match take listing(full, req.path) {
+            Ok(html) => http.reply(200, [("Content-Type", "text/html; charset=utf-8")], html)
+            Err(_) => http.reply_error(403)
+        }
+    }
+    if os.is_file(full) { return file_reply(cache, req, full, now) }
+    http.reply_error(404)
+}
+
+// 读文件、记进缓存（key 是请求的路径）。先 stat 再读：读的过程中文件被改了，记下的是旧的修改时间，下次 stat 就对不上
+fn file_reply(cache: Mutex[Cache], req: http.Request, path: str, now: int) -> http.Response {
+    mtime = -1
+    match os.stat(path) {
+        Ok(st) => { mtime = st.mtime_ms }
+        Err(_) => {}
+    }
+    if mtime < 0 { return http.reply_error(403) }
+    match take os.read(path) {
+        Ok(data) => {
+            e = CacheEntry(path: req.path, file: path, data: data, ctype: http.mime_type(path), mtime: mtime, read_at: now, at: now)
+            r = file_ok(req, e)
+            lock cache as c { cache_put(&c, e) }
+            r
+        }
+        Err(_) => http.reply_error(403)
+    }
+}
+
+// 文件的回复。If-Modified-Since 和我们的 Last-Modified 一字不差时回 304（浏览器就是把上次的 Last-Modified 原样发回来）
+fn file_ok(req: http.Request, e: CacheEntry) -> http.Response {
+    lm = http.format_date(e.mtime)
+    if (http.header(req, "if-modified-since") ?? "") == lm {
+        return http.reply(304, [("Last-Modified", lm)], "")
+    }
+    http.reply(200, [("Content-Type", e.ctype), ("Last-Modified", lm)], e.data)
+}
+
+// 目录列表：子目录在前，名字按字节序
+fn listing(dir: str, path: str) -> str! {
+    names = os.read_dir(dir)?
+    sort.sort(&names)
+    t = http.escape_html(path)
+    html = "<!doctype html>\n<meta charset=\"utf-8\">\n<title>#{t}</title>\n<h1>#{t}</h1>\n<ul>\n"
+    if path != "/" { html += "<li><a href=\"../\">../</a></li>\n" }
+    for pass in 0..2 {
+        for n in names {
+            is_dir = os.is_dir(os.join_path(dir, n))
+            if (pass == 0) != is_dir { continue }
+            shown = if is_dir { n + "/" } else { n.copy() }
+            html += "<li><a href=\"#{http.escape_path(shown)}\">#{http.escape_html(shown)}</a></li>\n"
+        }
+    }
+    Ok(html + "</ul>\n")
+}

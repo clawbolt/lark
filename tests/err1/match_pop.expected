@@ -1,0 +1,3 @@
+tests/err1/match_pop.lark:4:5: 错误：match 不支持 [int]：能 match 的是枚举、T?、T!、元组、int、u8、bool、str 和 dyn 接口。xs.pop() 返回的是元素本身（空列表时 panic），要 T? 请用 xs.try_pop()
+ 4 |     match xs.pop() {
+   |     ^

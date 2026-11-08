@@ -1,0 +1,18 @@
+// 期望错误：for in 把迭代器移进了循环，之后不能再用
+type Count {
+    n: int
+}
+
+fn next(inout c: Count) -> int? {
+    if c.n == 0 { return None }
+    c.n -= 1
+    Some(c.n)
+}
+
+fn main() {
+    it = Count(n: 3)
+    for x in it {
+        print("#{x}")
+    }
+    m = it.n
+}

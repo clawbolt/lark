@@ -1,0 +1,136 @@
+// Lark 标准库 · CSV（RFC 4180，用 Lark 自己写）
+// 用法：import "std/csv"
+//
+//   rows = csv.parse(text)?                 // [[str]]：每行一个列表，各行的列数可以不一样
+//   rows = csv.parse_sep(text, '\t')?       // 别的分隔字节（TSV、; 分隔的表格）
+//   k = csv.find_column(rows[0], "name") ?? -1      // 表头里某一列的位置
+//   text = csv.format(rows)                 // 写回去：需要时才加引号，每行以 \n 结尾
+//   line = csv.format_row(["a", "b,c"])            // 一行（不带换行）："a,\"b,c\""
+//
+// 读的规则：字段用 "…" 括起来时可以包含分隔符、换行和写成 "" 的引号；行尾的 \r\n 和 \n 都行；最后一行有没有换行都行；
+// 空的输入是零行，空行是只有一个空字段的行。没有括起来的字段里出现引号、引号没有结束、结束的引号后面不是分隔符或换行时是错误（带行号）。
+// 写的规则：CSV 表示不了零列的行，[] 写出来是一个空行，读回来是 [""]；所以 format 和 parse 来回一趟不变的前提是每行至少一列。
+
+pub fn parse(s: str) -> [[str]]! { parse_sep(s, ',') }
+
+pub fn parse_sep(s: str, sep: int) -> [[str]]! {
+    rows: [[str]] = []
+    row: [str] = []
+    n = len(s)
+    if n == 0 { return Ok(rows) }
+    i = 0
+    line = 1
+    for true {
+        if i < n && byte_at(s, i) == '"' {
+            first = line
+            i += 1
+            f = ""
+            from = i
+            closed = false
+            for i < n {
+                b = byte_at(s, i)
+                if b == '"' {
+                    // "" 是一个引号
+                    f += slice(s, from, i)
+                    i += 1
+                    if i < n && byte_at(s, i) == '"' {
+                        f += "\""
+                        i += 1
+                        from = i
+                    } else {
+                        closed = true
+                        break
+                    }
+                } else {
+                    if b == '\n' { line += 1 }
+                    i += 1
+                }
+            }
+            if !closed { return Err("CSV 第 #{first} 行：引号没有结束") }
+            if i < n && byte_at(s, i) == '\r' && (i + 1 == n || byte_at(s, i + 1) == '\n') { i += 1 }
+            if i < n && byte_at(s, i) != sep && byte_at(s, i) != '\n' {
+                return Err("CSV 第 #{line} 行：结束的引号后面应该是分隔符或换行")
+            }
+            row.push(f)
+        } else {
+            start = i
+            for i < n && byte_at(s, i) != sep && byte_at(s, i) != '\n' {
+                if byte_at(s, i) == '"' { return Err("CSV 第 #{line} 行：没有用引号括起来的字段里不能有引号") }
+                i += 1
+            }
+            e = i
+            if e > start && byte_at(s, e - 1) == '\r' && (i == n || byte_at(s, i) == '\n') { e -= 1 }
+            row.push(slice(s, start, e))
+        }
+        if i >= n {
+            rows.push(row)
+            break
+        }
+        b = byte_at(s, i)
+        i += 1
+        if b == '\n' {
+            fresh: [str] = []
+            rows.push(replace(&row, fresh))
+            line += 1
+            if i >= n { break }
+        }
+    }
+    Ok(rows)
+}
+
+// 表头里名字是 name 的那一列（第一个）
+pub fn find_column(header: [str], name: str) -> int? {
+    for k in 0..len(header) {
+        if header[k] == name { return Some(k) }
+    }
+    None
+}
+
+pub fn format(rows: [[str]]) -> str { format_sep(rows, ',') }
+
+// sep 不能是 \r、\n 或 "：那样写出来的读不回来（panic）
+pub fn format_sep(rows: [[str]], sep: int) -> str {
+    check_sep(sep, "format_sep")
+    out = ""
+    for r in rows {
+        out += format_row_sep(r, sep)
+        out += "\n"
+    }
+    out
+}
+
+pub fn format_row(fields: [str]) -> str { format_row_sep(fields, ',') }
+
+pub fn format_row_sep(fields: [str], sep: int) -> str {
+    check_sep(sep, "format_row_sep")
+    out = ""
+    for k in 0..len(fields) {
+        if k > 0 { out += from_byte(sep) }
+        out += format_field(fields[k], sep)
+    }
+    out
+}
+
+fn check_sep(sep: int, f: str) {
+    if sep == '\r' || sep == '\n' || sep == '"' { panic("csv.#{f}：分隔符不能是 \\r、\\n 或双引号") }
+}
+
+// 含有分隔符、引号、\r 或 \n 时用引号括起来，里面的引号写成 ""
+pub fn format_field(s: str, sep: int) -> str {
+    need = false
+    for i in 0..len(s) {
+        b = byte_at(s, i)
+        if b == sep || b == '"' || b == '\n' || b == '\r' { need = true }
+    }
+    if !need { return s }
+    out = "\""
+    start = 0
+    for i in 0..len(s) {
+        if byte_at(s, i) == '"' {
+            out += slice(s, start, i + 1)
+            out += "\""
+            start = i + 1
+        }
+    }
+    out + slice(s, start, len(s)) + "\""
+}

@@ -1,0 +1,6 @@
+// 期望错误：hash 是接口方法，不属于模块 map，不用加模块名
+import "std/map"
+
+fn bucket(k: str) -> int { map.hash(k) & 15 }
+
+fn main() { print("#{bucket("a")}") }

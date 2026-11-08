@@ -1,0 +1,10 @@
+// 期望错误：结构体不满足内置约束 Ord（结构体可以 ==，但不能比大小）
+type Point {
+    x: int
+}
+
+fn max_of[T: Ord](xs: [T]) -> int { len(xs) }
+
+fn main() {
+    n = max_of([Point(x: 1)])
+}

@@ -1,0 +1,5 @@
+# 测试 lark run：本地依赖、依赖里的 C 源文件、链接 libm
+name = app
+version = 0.1.0
+dep util = ../util
+link = m

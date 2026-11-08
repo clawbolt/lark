@@ -1,0 +1,117 @@
+// Lark 标准库 · 双端队列 Deque[T]（环形缓冲区，用 Lark 自己写）
+// 用法：import "std/deque"
+//
+//   d: deque.Deque[int] = deque.new()   // 或 deque.of([1, 2, 3])
+//   d.push_back(4)、d.push_front(0)     // 两头放进去，O(1)（满了时容量翻倍）
+//   d.pop_front()、d.pop_back()         // T?：两头取出来
+//   d.front()、d.back()、d.get(i)       // T?：元素的副本，不取出；get 的 i 从队头数，越界是 None
+//   len(d)、d.is_empty()、d.clear()
+//   for x in d { … }                    // 借用 d，从队头到队尾，每轮复制一个元素；d.to_list() 是所有元素的副本
+//
+// 元素存成 T?：取出时用 replace 换成 None，不用复制。
+
+pub type Deque[T] {
+    buf: [T?]
+    head: int       // 队头在 buf 里的位置
+    n: int          // 元素个数
+}
+
+pub fn new[T]() -> Deque[T] {
+    Deque(buf: [], head: 0, n: 0)
+}
+
+pub fn of[T](xs: [T]) -> Deque[T] {
+    d: Deque[T] = new()
+    for x in xs { push_back(&d, x.copy()) }
+    d
+}
+
+pub fn is_empty[T](d: Deque[T]) -> bool { d.n == 0 }
+
+pub fn push_back[T](inout d: Deque[T], take x: T) {
+    if d.n == len(d.buf) { grow(&d) }
+    i = (d.head + d.n) % len(d.buf)
+    d.buf[i] = Some(x)
+    d.n += 1
+}
+
+pub fn push_front[T](inout d: Deque[T], take x: T) {
+    if d.n == len(d.buf) { grow(&d) }
+    h = (d.head - 1 + len(d.buf)) % len(d.buf)
+    d.buf[h] = Some(x)
+    d.head = h
+    d.n += 1
+}
+
+pub fn pop_front[T](inout d: Deque[T]) -> T? {
+    if d.n == 0 { return None }
+    h = d.head
+    e: T? = None
+    v = replace(&d.buf[h], e)
+    d.head = (h + 1) % len(d.buf)
+    d.n -= 1
+    v
+}
+
+pub fn pop_back[T](inout d: Deque[T]) -> T? {
+    if d.n == 0 { return None }
+    i = (d.head + d.n - 1) % len(d.buf)
+    e: T? = None
+    v = replace(&d.buf[i], e)
+    d.n -= 1
+    v
+}
+
+pub fn get[T](d: Deque[T], i: int) -> T? {
+    if i < 0 || i >= d.n { return None }
+    d.buf[(d.head + i) % len(d.buf)].copy()
+}
+
+pub fn front[T](d: Deque[T]) -> T? { get(d, 0) }
+
+pub fn back[T](d: Deque[T]) -> T? { get(d, d.n - 1) }
+
+pub fn clear[T](inout d: Deque[T]) {
+    d.buf = []
+    d.head = 0
+    d.n = 0
+}
+
+pub fn to_list[T](d: Deque[T]) -> [T] {
+    out: [T] = []
+    for i in 0..d.n { out.push(iter_at(d, i)) }
+    out
+}
+
+// for x in d：借用 d 遍历，从队头到队尾（借用遍历，见 README）
+pub fn iter_len[T](d: Deque[T]) -> int { d.n }
+
+pub fn iter_at[T](d: Deque[T], i: int) -> T {
+    if i < 0 || i >= d.n { panic("deque.iter_at：下标 #{i} 越界（共 #{d.n} 项）") }
+    match d.buf[(d.head + i) % len(d.buf)] {
+        Some(x) => x.copy()
+        None => panic("deque.iter_at：内部错误，队列里有空位")
+    }
+}
+
+// 容量翻倍，元素按顺序搬到新缓冲区的开头
+fn grow[T](inout d: Deque[T]) {
+    old = replace(&d.buf, [])
+    cap = len(old)
+    ncap = if cap == 0 { 8 } else { cap * 2 }
+    nb: [T?] = []
+    nb.reserve(ncap)
+    for k in 0..d.n {
+        e: T? = None
+        nb.push(replace(&old[(d.head + k) % cap], e))
+    }
+    for _k in d.n..ncap {
+        e2: T? = None
+        nb.push(e2)
+    }
+    d.buf = nb
+    d.head = 0
+}
+
+// "#{d}"：["x", "y"]，从队头到队尾，和列表的写法一样
+pub fn show[T](d: Deque[T]) -> str { "#{to_list(d)}" }

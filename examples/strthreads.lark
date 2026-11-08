@@ -1,0 +1,44 @@
+// 字符串跨线程：线程活着时字符串的计数用原子操作，所有线程都结束以后又回到普通加减（见 runtime/lark_rt.h 的 lk_rc_inc）。
+// 几个线程同时复制、释放同一个 shared 表里的字符串，线程结束后主线程接着用这些字符串
+type Table {
+    words: [str]
+}
+
+type Job {
+    table: shared Table
+    id: int
+    out: Chan[int]
+}
+
+fn work(take job: Job) {
+    total = 0
+    for _ in 0..2000 {
+        kept: [str] = []
+        for w in job.table.words { kept.push(w) }
+        total += len(kept[job.id % len(kept)])
+    }
+    job.out.send(total)
+}
+
+fn main() {
+    words: [str] = []
+    for i in 0..50 { words.push("词#{i}") }
+    table = share(Table(words: words))
+    sums: Chan[int] = chan()
+    scope {
+        for i in 0..4 { spawn(work, Job(table: table.copy(), id: i, out: sums.copy())) }
+    }
+    total = 0
+    for {
+        r = sums.recv()
+        match r {
+            Some(n) => { total += n }
+            None => break
+        }
+    }
+    print("线程里的总长度：#{total}")
+    // 回到单线程：照常复制字符串
+    again: [str] = []
+    for w in table.words { again.push(w + "!") }
+    print("#{again[0]} #{again[49]} 共 #{len(again)} 个")
+}

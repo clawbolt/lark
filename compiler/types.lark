@@ -1,0 +1,1936 @@
+// Lark 编译器 stage1 · 类型表、声明信息与检查上下文
+// 类型用整数编号：0 int、1 bool、2 str、3 ()、4 never、5 unknown、6 [str]、9 float，其余按需登记。
+// 可选类型 T? 的 kind 是 "opt"，结果类型 T!E 的 kind 是 "res"，elems 都记 T；res 的 names 记错误类型编号，"" 表示 str（即 T!）。
+// 预先登记：7 str!、8 int!、10 float!、11 u8（字节，0..255）、12 u8?、13 [u8]、14 u16、15 u32、16 i32、17 u16?、18 u32?、19 i32?。
+
+type TyTab {
+    kinds: [str]    // "int" "bool" "str" "()" "never" "unknown" "list" "struct" "enum" "float"
+    names: [str]
+    elems: [int]
+}
+
+type SInfo {
+    name: str
+    fnames: [str]
+    ftys: [int]
+}
+
+type VInfo {
+    name: str
+    fnames: [str]
+    ftys: [int]
+}
+
+type EInfo {
+    name: str
+    variants: [VInfo]
+}
+
+type FInfo {
+    name: str       // 内部名字（C 函数名用它）；重载的第二个起是 show__o3 这样
+    uname: str      // 源码里写的名字
+    pmodes: [str]
+    ptys: [int]
+    ret: int
+    tvars: [str]    // 类型参数名
+    targs: [int]    // 实例的类型实参；泛型模板为空（模板本身不检查、不生成代码）
+    ptexts: [str]   // 模板的参数类型原文，用来推断类型实参
+    rtext: str      // 模板的返回类型原文：参数推断不出的类型参数，再用期望的返回类型推断
+    tok: int        // 模板的 "fn" token 下标
+    tbounds: [str]  // 模板每个类型参数的约束
+}
+
+// 泛型类型的模板：结构体看作只有一个变体的枚举。模板不进 structs / enums，
+// 每组类型实参实例化成一个普通的结构体或枚举（名字如 Pair__0_2）。
+type GVariant {
+    name: str
+    fnames: [str]
+    ftexts: [str]   // 字段类型原文
+}
+
+type GDecl {
+    kind: str       // "struct" / "enum"
+    name: str
+    tvars: [str]
+    variants: [GVariant]
+    line: int
+    col: int
+}
+
+type TInst {
+    key: str        // 实例名
+    origin: str     // 模板名
+    targs: [int]
+}
+
+// 接口方法，按接口名平铺存放；类型原文里的 Self 在检查约束时代换
+type IMeth {
+    iface: str
+    name: str
+    pmodes: [str]
+    ptexts: [str]
+    ret: str
+    line: int
+    col: int
+}
+
+// 闭包：base 是闭包里第一个局部变量的编号，编号更小的变量都来自外层（即捕获）
+type Clo {
+    id: int         // 闭包表达式的节点 id
+    base: int
+    caps: [int]     // 捕获的变量编号
+    owned: bool     // 存储的闭包（Fn 类型）：捕获的变量复制进堆上的环境
+}
+
+type Local {
+    name: str
+    cname: str
+    ty: int
+    kind: str       // "owned" / "read" / "inout"
+    loop_depth: int
+    line: int       // 声明的位置（警告用）
+    col: int
+    used: bool      // 声明之后读过、调用过或赋过值；名字以 _ 开头的一开始就算用过
+    in_match: bool  // 借用的 match 里模式绑定的名字（只读；报错时提示 match take）
+}
+
+type Sig {
+    modes: [str]
+    tys: [int]
+    ret: int
+}
+
+type Ctx {
+    tt: TyTab
+    structs: [SInfo]
+    enums: [EInfo]
+    fns: [FInfo]
+    ety: [int]          // 节点 id → 类型
+    vid: [int]          // 节点 id → 局部变量编号
+    rkind: [str]        // 调用节点 id → "fn" "builtin" "struct" "variant"
+    rname: [str]        // 函数名、结构体名或枚举名
+    ridx: [int]         // 变体序号
+    decl: [bool]        // 赋值语句 id → 是否为声明
+    ampx: [bool]        // 方法调用的接收者节点 id → 是否自动加 &
+    wrap: [bool]        // 节点 id → 值需要自动包成 T? 或 T!（ety 里记的是包之前的类型）
+    wrapt: [int]        // 节点 id → 包成的目标类型
+    locals: [Local]
+    scope_names: [str]
+    scope_vids: [int]
+    scope_marks: [int]
+    loop_depth: int
+    labels: [str]       // 每层正在检查的循环的标签（没有时为 ""），最外层在前；闭包、defer 里从空的算
+    pend_label: str     // SLabel 刚给的标签，下一个循环取走
+    cur_ret: int
+    nodes: int          // 旁表当前的长度（实例化会分配新的节点 id）
+    toks: [Tok]
+    tdecls: [GDecl]
+    tinsts: [TInst]
+    inames: [str]       // 已声明的接口
+    imeths: [IMeth]
+    clos: [Clo]
+    clo_stack: [int]    // 正在检查的闭包（clos 的下标），内层在后
+    dtor_ty: [int]      // 有自定义析构的类型，与 dtor_fn 一一对应
+    dtor_fn: [int]      // 对应的 fn drop(inout x: T) 在 fns 里的下标
+    show_tys: [int]     // 用泛型的 fn show 插值的类型（比如 map.Map[str, int]），与 show_fis 一一对应
+    show_fis: [int]     // 对应的 show 实例在 fns 里的下标（实例的名字带类型参数，按名字找不到）
+    insts: [FnDecl]     // 泛型实例，第 j 个对应 fns[prog.fns 的长度 + j]
+    tvars: [str]        // 正在解析或检查的实例的类型参数代换
+    targs: [int]
+    nmain: int          // 命令行给出的文件数；序号更大的文件是 import 载入的模块
+    pubs: [int]         // 带 pub 的声明所在的行（含文件序号）
+    vnames: [str]       // 结构体、枚举、变体的名字，与 vlines 一一对应，用来检查可见性
+    vlines: [int]
+    scope_depth: int    // 正在检查的 scope { } 的层数
+    lock_depth: int     // 正在检查的 lock 块的层数
+    defer_depth: int    // 正在检查的 defer 体的层数：里面不能 return、?
+    fmods: [str]        // 每个文件所在的模块（"" 是根模块）
+    mods: [str]         // 每个文件导入的模块，“模块名@文件序号”（见 parse.lark 的 file_imports）
+    dyn_done: [int]     // 已登记方法签名的 dyn 类型
+    dsig_t: [int]       // dyn 方法签名：dyn 类型、方法名、签名（第一个参数是 dyn 本身），一一对应
+    dsig_n: [str]
+    dsig_s: [Sig]
+    dyn_ty: [int]       // 用到的 (dyn 类型, 具体类型) 组合，以及实现各方法的函数（内部名，按接口方法的顺序，逗号分隔）
+    dyn_src: [int]
+    dyn_fns: [str]
+    knames: [str]       // 常量（带模块前缀的名字）及其类型、值、求值状态（0 未求、1 正在求、2 已求）和定义
+    ktys: [int]
+    kints: [int]
+    kstrs: [str]
+    kstate: [int]
+    kexprs: [Expr]
+    wlines: [int]       // 警告：位置（行号里编码了文件序号）和信息，一一对应；main 在编译成功后按位置排序输出
+    wcols: [int]
+    wmsgs: [str]
+    umods: [str]        // 用到过的模块，“模块@文件序号”（见 note_mod）
+    fpriv: [str]        // 模块里的结构体没写 pub 的字段，“类型名.字段名”（泛型结构体用模板的名字）
+    tboxed: [bool]      // 按类型编号：枚举或 T? 是否放在堆上（代码生成用，类型检查结束时由 boxed_types 算出）
+}
+
+// 常量的值：ty 是 int / bool / str / float（0 / 1 / 2 / 9），bool 存在 i 里；float 的 s 是算出它的 C 常量表达式
+type CV {
+    ty: int
+    i: int
+    s: str
+}
+
+// int（64 位有符号）的范围。写成算式，因为 stage0 的 OCaml 整数只有 63 位，读不了这么大的字面量
+fn int_max() -> int { 4611686018427387903 * 2 + 1 }
+fn int_min() -> int { 0 - int_max() - 1 }
+
+// 编译时做整数运算（常量求值）之前先判断会不会溢出；生成的代码里由 lk_add 等检查
+fn add_ok(a: int, b: int) -> bool { if b > 0 { a <= int_max() - b } else { a >= int_min() - b } }
+fn sub_ok(a: int, b: int) -> bool { if b < 0 { a <= int_max() + b } else { a >= int_min() + b } }
+
+// 按两个数的符号分别和 MAX / MIN 除以另一个数比较（除法向零取整，四种情况都成立）
+fn mul_ok(a: int, b: int) -> bool {
+    if a == 0 || b == 0 {
+        true
+    } else if a > 0 && b > 0 {
+        a <= int_max() / b
+    } else if a < 0 && b < 0 {
+        a >= int_max() / b
+    } else if a > 0 {
+        b >= int_min() / a
+    } else {
+        a >= int_min() / b
+    }
+}
+
+// ---------- 常量表达式里的位运算 ----------
+// 编译器自己的源码要能被种子编译，不能用位运算符，所以这里用算术实现，结果和运行时（64 位补码）一致
+
+// x 的低 63 位（非负）
+fn low63(x: int) -> int { if x < 0 { x - int_min() } else { x } }
+
+// 低 63 位 lo（非负）加上第 64 位（符号位）hi
+fn with_top(lo: int, hi: bool) -> int { if hi { lo + int_min() } else { lo } }
+
+// k 为 0、1、2 时分别是 &、|、^：低 63 位逐位算，符号位单独算
+fn bit_op(k: int, x: int, y: int) -> int {
+    a = low63(x)
+    b = low63(y)
+    r = 0
+    p = 1
+    for i in 0..63 {
+        u = a % 2
+        v = b % 2
+        bit = 0
+        if k == 0 {
+            bit = u * v
+        } else if k == 1 {
+            bit = if u + v > 0 { 1 } else { 0 }
+        } else {
+            bit = (u + v) % 2
+        }
+        r += bit * p
+        a = a / 2
+        b = b / 2
+        if i < 62 { p = p * 2 }
+    }
+    hx = x < 0
+    hy = y < 0
+    hi = false
+    if k == 0 {
+        hi = hx && hy
+    } else if k == 1 {
+        hi = hx || hy
+    } else {
+        hi = hx != hy
+    }
+    with_top(r, hi)
+}
+
+fn bit_not(x: int) -> int { 0 - 1 - x }
+
+fn shl_bits(x: int, n: int) -> int {
+    r = x
+    for _k in 0..n {
+        lo = low63(r)
+        r = with_top(lo % 4611686018427387904 * 2, lo >= 4611686018427387904)
+    }
+    r
+}
+
+// 补符号位的右移，就是向下取整地除以 2^n
+fn shr_bits(x: int, n: int) -> int {
+    r = x
+    for _k in 0..n {
+        if r >= 0 {
+            r = r / 2
+        } else {
+            r = 0 - (0 - (r + 1)) / 2 - 1
+        }
+    }
+    r
+}
+
+// 补 0 的右移：第一步把符号位移进第 63 位，之后都是非负数
+fn ushr_bits(x: int, n: int) -> int {
+    if n == 0 || x >= 0 { return shr_bits(x, n) }
+    first = low63(x) / 2 + 4611686018427387904
+    shr_bits(first, n - 1)
+}
+
+// 回绕的加减：溢出时先把两边各挪 2^63 再算，中间结果都不越界
+fn wrap_add(a: int, b: int) -> int {
+    if add_ok(a, b) {
+        a + b
+    } else if a > 0 {
+        (a + int_min()) + (b + int_min())
+    } else {
+        (a - int_min()) + (b - int_min())
+    }
+}
+
+fn wrap_sub(a: int, b: int) -> int {
+    if sub_ok(a, b) {
+        a - b
+    } else if a >= 0 {
+        (a + int_min()) - (b - int_min())
+    } else {
+        (a - int_min()) - (b + int_min())
+    }
+}
+
+// 回绕的乘法：b 的每个 1 位加上相应移位的 a
+fn wrap_mul(a: int, b: int) -> int {
+    r = 0
+    x = a
+    lb = low63(b)
+    for i in 0..64 {
+        set = if i < 63 { lb % 2 == 1 } else { b < 0 }
+        if set { r = wrap_add(r, x) }
+        lb = lb / 2
+        x = shl_bits(x, 1)
+    }
+    r
+}
+
+// 常量表达式里的位运算、移位、回绕运算（移位数已检查过在 0..63）
+fn const_bit(op: str, a: int, b: int) -> int {
+    if op == "&" {
+        bit_op(0, a, b)
+    } else if op == "|" {
+        bit_op(1, a, b)
+    } else if op == "^" {
+        bit_op(2, a, b)
+    } else if op == "<<" {
+        shl_bits(a, b)
+    } else if op == ">>" {
+        shr_bits(a, b)
+    } else if op == ">>>" {
+        ushr_bits(a, b)
+    } else if op == "+%" {
+        wrap_add(a, b)
+    } else if op == "-%" {
+        wrap_sub(a, b)
+    } else {
+        wrap_mul(a, b)
+    }
+}
+
+// 能用 + - * / 和 < 比较的数：int、float
+fn is_num(t: int) -> bool { t == 0 || t == 9 }
+
+// 定宽整数：11 u8、14 u16、15 u32、16 i32（值都在 C 的同宽类型里）。只存不算：可以比较、做 & | ^ !、打印、当键比较，
+// 不能做 + - * / %（先 .to_int()，算完用 .to_u16() 这类转回来）。读写寄存器、二进制格式用
+fn is_fixed(t: int) -> bool { t == 11 || t == 14 || t == 15 || t == 16 }
+
+fn fixed_ids() -> [int] { [11, 14, 15, 16] }
+
+fn fixed_name(t: int) -> str { if t == 11 { "u8" } else if t == 14 { "u16" } else if t == 15 { "u32" } else { "i32" } }
+
+fn fixed_cty(t: int) -> str {
+    if t == 11 { "uint8_t" } else if t == 14 { "uint16_t" } else if t == 15 { "uint32_t" } else { "int32_t" }
+}
+
+fn fixed_lo(t: int) -> int { if t == 16 { -2_147_483_648 } else { 0 } }
+
+fn fixed_hi(t: int) -> int {
+    if t == 11 { 255 } else if t == 14 { 65_535 } else if t == 15 { 4_294_967_295 } else { 2_147_483_647 }
+}
+
+// 名字对应的定宽整数；不是时为 -1
+fn fixed_of(name: str) -> int {
+    for t in fixed_ids() {
+        if fixed_name(t) == name { return t }
+    }
+    -1
+}
+
+// 预先登记的 T?：12 u8?、17 u16?、18 u32?、19 i32?
+fn fixed_opt(t: int) -> int { if t == 11 { 12 } else { t + 3 } }
+
+// n.to_u16() 这类内置函数转成的定宽整数：to_X（超出范围 panic）、wrap_X（只取低位）、try_X（X?）；不是时为 -1
+fn fixed_conv(b: str) -> int {
+    for t in fixed_ids() {
+        n = fixed_name(t)
+        if b == "to_" + n || b == "wrap_" + n || b == "try_" + n { return t }
+    }
+    -1
+}
+
+// 编译器自己也用泛型了（需要支持泛型的种子，见 README“自举路线”）
+fn fill[T](n: int, v: T) -> [T] {
+    xs: [T] = []
+    for _i in 0..n { xs.push(v.copy()) }
+    xs
+}
+
+// 第一个满足 f 的元素的下标；没有时为 -1
+fn index_where[T](xs: [T], f: fn(T) -> bool) -> int {
+    for i in 0..len(xs) {
+        if f(xs[i]) { return i }
+    }
+    -1
+}
+
+fn has[T: Eq](xs: [T], v: T) -> bool {
+    for x in xs {
+        if x == v { return true }
+    }
+    false
+}
+
+fn new_ctx(nodes: int, take toks: [Tok]) -> Ctx {
+    tt = TyTab(
+        kinds: ["int", "bool", "str", "()", "never", "unknown", "list", "res", "res", "float", "res", "u8", "opt", "list",
+            "u16", "u32", "i32", "opt", "opt", "opt"],
+        names: ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""],
+        elems: [-1, -1, -1, -1, -1, -1, 2, 2, 0, -1, 9, -1, 11, 11, -1, -1, -1, 14, 15, 16])
+    Ctx(tt: tt, structs: [], enums: [], fns: [],
+        ety: fill(nodes, 5), vid: fill(nodes, -1),
+        rkind: fill(nodes, ""), rname: fill(nodes, ""), ridx: fill(nodes, 0),
+        decl: fill(nodes, false), ampx: fill(nodes, false), wrap: fill(nodes, false), wrapt: fill(nodes, -1),
+        locals: [], scope_names: [], scope_vids: [], scope_marks: [],
+        loop_depth: 0, labels: [], pend_label: "", cur_ret: 3, nodes: nodes, toks: toks, tdecls: [], tinsts: [], inames: [], imeths: [], clos: [], clo_stack: [], dtor_ty: [], dtor_fn: [], show_tys: [], show_fis: [], insts: [], tvars: [], targs: [],
+        nmain: 1, pubs: [], vnames: [], vlines: [], scope_depth: 0, lock_depth: 0, defer_depth: 0, fmods: [], mods: [],
+        dyn_done: [], dsig_t: [], dsig_n: [], dsig_s: [], dyn_ty: [], dyn_src: [], dyn_fns: [],
+        knames: [], ktys: [], kints: [], kstrs: [], kstate: [], kexprs: [], wlines: [], wcols: [], wmsgs: [], umods: [], fpriv: [], tboxed: [])
+}
+
+// 可见性：命令行给出的文件之间互相可见；import 载入的模块里没有 pub 的项只在本文件可见。
+// dline 是声明所在的行，uline 是使用处的行（行号里编码了文件序号）
+fn visible(c: Ctx, dline: int, uline: int) -> bool {
+    f = dline / 100000
+    f < c.nmain || f == uline / 100000 || has(c.pubs, dline)
+}
+
+fn check_vis(c: Ctx, name: str, line: int, col: int) {
+    i = index_where(c.vnames, |n| n == name)
+    if i >= 0 && !visible(c, c.vlines[i], line) {
+        fail(line, col, "#{name} 没有 pub，只能在声明它的模块里使用")
+    }
+}
+
+fn check_fn_vis(c: Ctx, fi: int, line: int, col: int) {
+    if fi < 0 || c.fns[fi].tok < 0 { return }
+    if !visible(c, c.toks[c.fns[fi].tok].line, line) {
+        fail(line, col, "#{c.fns[fi].uname} 没有 pub，只能在声明它的模块里使用")
+    }
+}
+
+fn intern(inout tt: TyTab, kind: str, name: str, elem: int) -> int {
+    for i in 0..len(tt.kinds) {
+        if tt.kinds[i] == kind && tt.names[i] == name && tt.elems[i] == elem { return i }
+    }
+    tt.kinds.push(kind)
+    tt.names.push(name)
+    tt.elems.push(elem)
+    len(tt.kinds) - 1
+}
+
+fn tkind(c: Ctx, t: int) -> str { c.tt.kinds[t] }
+fn tname(c: Ctx, t: int) -> str { c.tt.names[t] }
+fn telem(c: Ctx, t: int) -> int { c.tt.elems[t] }
+
+fn is_trivial(t: int) -> bool { t == 0 || t == 1 || t == 3 || t == 4 || t == 9 || is_fixed(t) }
+
+// T? 或 T! 这类“装一个值的容器”
+fn is_box(c: Ctx, t: int) -> bool { t >= 0 && (tkind(c, t) == "opt" || tkind(c, t) == "res") }
+fn is_copy(t: int) -> bool { is_trivial(t) || t == 2 }
+fn managed(t: int) -> bool { !is_trivial(t) }
+fn unit_like(t: int) -> bool { t == 3 || t == 4 }
+
+fn show_ty(c: Ctx, t: int) -> str {
+    k = tkind(c, t)
+    if k == "list" {
+        "[" + show_ty(c, telem(c, t)) + "]"
+    } else if k == "opt" {
+        show_ty(c, telem(c, t)) + "?"
+    } else if k == "res" {
+        er = res_err(c, t)
+        es = if er == 2 { "" } else { show_ty(c, er) }
+        show_ty(c, telem(c, t)) + "!" + es
+    } else if k == "shared" {
+        "shared " + show_ty(c, telem(c, t))
+    } else if k == "chan" {
+        "Chan[" + show_ty(c, telem(c, t)) + "]"
+    } else if k == "mutex" {
+        "Mutex[" + show_ty(c, telem(c, t)) + "]"
+    } else if k == "dyn" {
+        "dyn " + tname(c, t)
+    } else if k == "struct" || k == "enum" {
+        show_named(c, tname(c, t))
+    } else if k == "fn" || k == "ofn" {
+        ps: [str] = []
+        fps = fn_params(c, t)
+        for p in fps { ps.push(show_ty(c, p)) }
+        r = telem(c, t)
+        rs = if r == 3 { "" } else { " -> " + show_ty(c, r) }
+        head = if k == "fn" { "fn(" } else { "Fn(" }
+        head + join(ps, ", ") + ")" + rs
+    } else if k == "never" || k == "unknown" {
+        k
+    } else {
+        k
+    }
+}
+
+fn find_struct(c: Ctx, name: str) -> int {
+    index_where(c.structs, |s| s.name == name)
+}
+
+fn find_enum(c: Ctx, name: str) -> int {
+    index_where(c.enums, |e| e.name == name)
+}
+
+fn find_fn(c: Ctx, name: str) -> int {
+    index_where(c.fns, |f| f.name == name)
+}
+
+// 变体所在的枚举编号；不存在时为 -1
+fn variant_enum(c: Ctx, name: str) -> int {
+    for i in 0..len(c.enums) {
+        for j in 0..len(c.enums[i].variants) {
+            if c.enums[i].variants[j].name == name { return i }
+        }
+    }
+    -1
+}
+
+fn variant_index(c: Ctx, ei: int, name: str) -> int {
+    index_where(c.enums[ei].variants, |v| v.name == name)
+}
+
+fn is_builtin(name: str) -> bool {
+    name == "print" || name == "eprint" || name == "len" || name == "byte_at" || name == "slice" ||
+        name == "from_byte" || name == "int_str" || name == "parse_int" || name == "read_file" ||
+        name == "write_file" || name == "args" || name == "exit" || name == "panic" ||
+        name == "push" || name == "pop" || name == "try_pop" || name == "insert_at" || name == "remove_at" || name == "reserve" || name == "copy" || name == "join" || name == "system" ||
+        name == "replace" || name == "downcast" || name == "Some" || name == "None" || name == "Ok" || name == "Err" ||
+        name == "try_read_file" || name == "try_parse_int" || name == "share" ||
+        name == "spawn" || name == "chan" || name == "mutex" || name == "send" || name == "recv" || name == "sleep_ms" ||
+        name == "assert" || name == "assert_eq" ||
+        is_float_builtin(name) || is_os_builtin(name)
+}
+
+// 文件系统、环境变量、子进程的内置函数（std/os 在它们上面包了一层）。
+// 结果是 str! 的：try_getenv、try_list_dir、try_capture、try_cwd、try_fd_read；结果是 int!（成功时为 0）的：其余 try_*
+fn os_try_str() -> [str] { ["try_getenv", "try_list_dir", "try_capture", "try_cwd", "try_fd_read"] }
+
+fn os_try_int() -> [str] { ["try_write_file", "try_append_file", "try_rename", "try_remove", "try_mkdir", "try_open", "try_fd_write", "try_fd_close", "try_tcp_connect", "try_tcp_listen", "try_tcp_accept", "try_sock_port", "try_sock_write", "try_sock_timeout"] }
+
+fn is_os_builtin(name: str) -> bool {
+    has(os_try_str(), name) || has(os_try_int(), name) || name == "file_kind" || name == "run_cmd" || name == "now_ms" || name == "now_ns" || name == "mono_ns"
+}
+
+// 会用到运行时可选部分的内置函数（见运行时开头的 LK_CORE）：任务、通道、锁、sleep_ms，
+// 以及文件系统、子进程、套接字这些系统的内置函数。读时间的 now_ms / now_ns / mono_ns 在核心里（std/rand 用）
+fn needs_full_rt(b: str) -> bool {
+    if b == "now_ms" || b == "now_ns" || b == "mono_ns" { return false }
+    b == "spawn" || b == "chan" || b == "mutex" || b == "send" || b == "recv" || b == "sleep_ms" || is_os_builtin(b)
+}
+
+// 浮点数的内置函数：转换、解析，以及 C 的数学库（float -> float）
+fn float_math1() -> [str] {
+    ["sqrt", "floor", "ceil", "round", "trunc", "exp", "ln", "log10", "sin", "cos", "tan", "asin", "acos", "atan"]
+}
+
+fn is_float_builtin(name: str) -> bool {
+    name == "to_float" || name == "to_int" || name == "float_str" || name == "parse_float" ||
+        name == "try_parse_float" || name == "atan2" || name == "float_pow" || has(float_math1(), name) || is_byte_builtin(name)
+}
+
+// 定宽整数和字节的内置函数：n.to_u8()（超出 0..255 时 panic）、n.wrap_u8()（只取低 8 位）、n.try_u8()（u8?），
+// u16、u32、i32 一样（to_u16、wrap_u32、try_i32……，见 fixed_conv）；
+// s.to_bytes()（str 的字节，[u8]）、from_bytes(bs)（字节原样拼成 str）；b.to_int() 见 to_int
+fn is_byte_builtin(name: str) -> bool {
+    fixed_conv(name) >= 0 || name == "to_bytes" || name == "from_bytes"
+}
+
+// extern "c" 签名里能写的类型。c_int 这些只在 extern 里有意义，在 Lark 这边都是 int：
+// 传给 C 时检查范围（超出 panic），C 返回的无符号数放不进 int 时也 panic
+// Fn() -> () 只能作参数（运行时的 lk_hook：函数指针和环境），用来把闭包交给运行时（os.at_exit）
+fn ext_c_names() -> [str] { ["int", "c_int", "c_uint", "c_long", "c_ulong", "usize", "isize", "float", "bool", "u8", "u16", "u32", "i32", "str", "[u8]", "()", "Fn()->()"] }
+
+fn ext_c_types() -> [str] {
+    ["int64_t", "int", "unsigned int", "long", "unsigned long", "size_t", "ptrdiff_t", "double", "bool", "uint8_t", "uint16_t", "uint32_t", "int32_t", "const char*", "uint8_t*", "void", "lk_hook"]
+}
+
+// C 里的类型；不支持的类型是 ""
+fn ext_c(s: str) -> str {
+    ns = ext_c_names()
+    ts = ext_c_types()
+    for k in 0..len(ns) {
+        if ns[k] == s { return ts[k].copy() }
+    }
+    ""
+}
+
+// Lark 这边的类型原文
+fn ext_lark(s: str) -> str {
+    if s == "c_int" || s == "c_uint" || s == "c_long" || s == "c_ulong" || s == "usize" || s == "isize" { "int" } else { s.copy() }
+}
+
+fn ext_names() -> str { "int、c_int、c_uint、c_long、c_ulong、usize、isize、float、bool、u8、u16、u32、i32、str、[u8]" }
+
+fn is_generic(rk: str, rn: str) -> bool {
+    rk == "builtin" && (rn == "len" || rn == "copy" || rn == "push" || rn == "pop" || rn == "try_pop" || rn == "insert_at" || rn == "remove_at" || rn == "reserve" || rn == "replace" || rn == "share" || rn == "mutex" ||
+        rn == "send" || rn == "recv" || rn == "assert_eq" || rn == "to_int")
+}
+
+fn resolve_ty(inout c: Ctx, s: str, line: int, col: int) -> int {
+    n = len(s)
+    if n > 3 && slice(s, 0, 3) == "Fn(" {
+        return resolve_ofn_ty(&c, s, line, col)
+    }
+    if n > 3 && slice(s, 0, 3) == "fn(" {
+        return resolve_fn_ty(&c, s, line, col)
+    }
+    if n > 2 && byte_at(s, n - 1) == '>' {
+        // T!<E>：找到与末尾 > 配对的 <
+        depth = 0
+        j = n - 1
+        for j >= 0 {
+            b = byte_at(s, j)
+            if b == '>' { depth += 1 }
+            if b == '<' {
+                depth -= 1
+                if depth == 0 { break }
+            }
+            j -= 1
+        }
+        el = resolve_ty(&c, slice(s, 0, j - 1), line, col)
+        if el == 4 { fail(line, col, "never 不能是结果类型") }
+        no_fn(c, el, "列表、T? 或 T! 的元素", line, col)
+        er = resolve_ty(&c, slice(s, j + 1, n - 1), line, col)
+        if unit_like(er) { fail(line, col, "错误类型不能是 ()") }
+        no_fn(c, er, "错误类型", line, col)
+        return res_of(&c, el, er)
+    }
+    if n > 1 && byte_at(s, n - 1) == '!' {
+        e = resolve_ty(&c, slice(s, 0, n - 1), line, col)
+        no_fn(c, e, "列表、T? 或 T! 的元素", line, col)
+        if e == 4 { fail(line, col, "never 不能是结果类型") }
+        intern(&c.tt, "res", "", e)
+    } else if n > 1 && byte_at(s, n - 1) == '?' {
+        e = resolve_ty(&c, slice(s, 0, n - 1), line, col)
+        no_fn(c, e, "列表、T? 或 T! 的元素", line, col)
+        if unit_like(e) { fail(line, col, "() 不能是可选类型") }
+        intern(&c.tt, "opt", "", e)
+    } else if byte_at(s, 0) == '%' {
+        resolve_dyn(&c, slice(s, 1, n), line, col)
+    } else if byte_at(s, 0) == '@' {
+        e = resolve_ty(&c, slice(s, 1, n), line, col)
+        if unit_like(e) { fail(line, col, "() 不能 shared") }
+        no_fn(c, e, "shared 的内容", line, col)
+        intern(&c.tt, "shared", "", e)
+    } else if s == "int" {
+        0
+    } else if fixed_of(s) >= 0 {
+        fixed_of(s)
+    } else if s == "float" {
+        9
+    } else if s == "bool" {
+        1
+    } else if s == "str" {
+        2
+    } else if s == "()" {
+        3
+    } else if byte_at(s, 0) == '(' && n > 2 {
+        resolve_tuple(&c, s, line, col)
+    } else if byte_at(s, 0) != '[' && byte_at(s, n - 1) == ']' {
+        resolve_generic(&c, s, line, col)
+    } else if byte_at(s, 0) == '[' {
+        e = resolve_ty(&c, slice(s, 1, len(s) - 1), line, col)
+        no_fn(c, e, "列表、T? 或 T! 的元素", line, col)
+        intern(&c.tt, "list", "", e)
+    } else if find_tvar(c, s) >= 0 {
+        c.targs[find_tvar(c, s)]
+    } else {
+        resolve_named(&c, resolve_name(c, s, line), line, col)
+    }
+}
+
+// 结构体或枚举的名字（已按模块解析）
+fn resolve_named(inout c: Ctx, s: str, line: int, col: int) -> int {
+    if find_tdecl(c, s) >= 0 {
+        fail(line, col, "泛型类型 #{s} 需要类型实参，例如 #{s}[int]")
+        exit(1)
+    } else if find_struct(c, s) >= 0 {
+        check_vis(c, s, line, col)
+        intern(&c.tt, "struct", s, -1)
+    } else if find_enum(c, s) >= 0 {
+        check_vis(c, s, line, col)
+        intern(&c.tt, "enum", s, -1)
+    } else {
+        fail(line, col, "未知类型 #{s}" + did_you_mean(s, type_cands(c)))
+        exit(1)
+    }
+}
+
+fn mk_sig(modes: [str], tys: [int], ret: int) -> Sig {
+    Sig(modes: modes.copy(), tys: tys.copy(), ret: ret)
+}
+
+// 调用签名。泛型内置函数需要第一个参数的类型 first。
+fn sig_of(c: Ctx, rk: str, rn: str, ri: int, first: int, line: int, col: int) -> Sig {
+    if rk == "fn" {
+        f = find_fn(c, rn)
+        mk_sig(c.fns[f].pmodes, c.fns[f].ptys, c.fns[f].ret)
+    } else if rk == "dyn" {
+        // ri 是接收者的 dyn 类型
+        dyn_sig(c, ri, rn)
+    } else if rk == "closure" {
+        // ri 是闭包的函数类型；参数一律只读
+        ps = fn_params(c, ri)
+        modes: [str] = []
+        for _p in ps { modes.push("read") }
+        mk_sig(modes, ps, telem(c, ri))
+    } else if rk == "struct" {
+        s = find_struct(c, rn)
+        modes: [str] = []
+        for _i in 0..len(c.structs[s].ftys) { modes.push("take") }
+        mk_sig(modes, c.structs[s].ftys, intern_lookup(c, "struct", rn))
+    } else if rk == "variant" {
+        ei = find_enum(c, rn)
+        modes: [str] = []
+        for _i in 0..len(c.enums[ei].variants[ri].ftys) { modes.push("take") }
+        mk_sig(modes, c.enums[ei].variants[ri].ftys, intern_lookup(c, "enum", rn))
+    } else {
+        builtin_sig(c, rn, first, line, col)
+    }
+}
+
+// 已登记过的类型编号（结构体、枚举在解析声明时都已登记）
+fn intern_lookup(c: Ctx, kind: str, name: str) -> int {
+    for i in 0..len(c.tt.kinds) {
+        if c.tt.kinds[i] == kind && c.tt.names[i] == name { return i }
+    }
+    -1
+}
+
+// 已登记的 T? 编号（检查阶段遇到时都会登记）
+fn opt_of(c: Ctx, elem: int) -> int {
+    for i in 0..len(c.tt.kinds) {
+        if c.tt.kinds[i] == "opt" && c.tt.elems[i] == elem { return i }
+    }
+    -1
+}
+
+fn builtin_sig(c: Ctx, b: str, first: int, line: int, col: int) -> Sig {
+    if b == "Some" {
+        Sig(modes: ["take"], tys: [first], ret: opt_of(c, first))
+    } else if b == "None" {
+        Sig(modes: [], tys: [], ret: -1)
+    } else if b == "send" {
+        Sig(modes: ["read", "take"], tys: [first, telem(c, first)], ret: 3)
+    } else if b == "recv" {
+        Sig(modes: ["read"], tys: [first], ret: opt_of(c, telem(c, first)))
+    } else if b == "chan_close" {
+        Sig(modes: ["read"], tys: [first], ret: 3)
+    } else if b == "spawn" {
+        // 检查和代码生成都单独处理（见 check_spawn），这里只给出返回类型
+        Sig(modes: ["read", "take"], tys: [first, first], ret: 3)
+    } else if b == "mutex" {
+        Sig(modes: ["take"], tys: [first], ret: intern_lookup_elem(c, "mutex", first))
+    } else if b == "share" {
+        Sig(modes: ["take"], tys: [first], ret: intern_lookup_elem(c, "shared", first))
+    } else if b == "try_read_file" {
+        Sig(modes: ["read"], tys: [2], ret: 7)
+    } else if b == "try_parse_int" {
+        Sig(modes: ["read"], tys: [2], ret: 8)
+    } else if b == "try_cwd" {
+        Sig(modes: [], tys: [], ret: 7)
+    } else if b == "try_open" {
+        Sig(modes: ["read", "read"], tys: [2, 2], ret: 8)
+    } else if b == "try_fd_read" {
+        Sig(modes: ["read", "read"], tys: [0, 0], ret: 7)
+    } else if b == "try_tcp_connect" || b == "try_tcp_listen" {
+        Sig(modes: ["read", "read"], tys: [2, 0], ret: 8)
+    } else if b == "try_tcp_accept" || b == "try_sock_port" {
+        Sig(modes: ["read"], tys: [0], ret: 8)
+    } else if b == "try_sock_timeout" {
+        Sig(modes: ["read", "read"], tys: [0, 0], ret: 8)
+    } else if b == "try_fd_write" || b == "try_sock_write" {
+        Sig(modes: ["read", "read"], tys: [0, 2], ret: 8)
+    } else if b == "try_fd_close" {
+        Sig(modes: ["read"], tys: [0], ret: 8)
+    } else if has(os_try_str(), b) {
+        Sig(modes: ["read"], tys: [2], ret: 7)
+    } else if b == "try_write_file" || b == "try_append_file" || b == "try_rename" {
+        Sig(modes: ["read", "read"], tys: [2, 2], ret: 8)
+    } else if has(os_try_int(), b) {
+        Sig(modes: ["read"], tys: [2], ret: 8)
+    } else if b == "file_kind" || b == "run_cmd" {
+        Sig(modes: ["read"], tys: [2], ret: 0)
+    } else if b == "now_ms" || b == "now_ns" || b == "mono_ns" {
+        Sig(modes: [], tys: [], ret: 0)
+    } else if b == "to_float" {
+        Sig(modes: ["read"], tys: [0], ret: 9)
+    } else if fixed_conv(b) >= 0 && slice(b, 0, 4) == "try_" {
+        Sig(modes: ["read"], tys: [0], ret: fixed_opt(fixed_conv(b)))
+    } else if fixed_conv(b) >= 0 {
+        Sig(modes: ["read"], tys: [0], ret: fixed_conv(b))
+    } else if b == "to_bytes" {
+        Sig(modes: ["read"], tys: [2], ret: 13)
+    } else if b == "from_bytes" {
+        Sig(modes: ["read"], tys: [13], ret: 2)
+    } else if b == "to_int" && is_fixed(first) {
+        Sig(modes: ["read"], tys: [first], ret: 0)
+    } else if b == "to_int" {
+        Sig(modes: ["read"], tys: [9], ret: 0)
+    } else if b == "float_str" {
+        Sig(modes: ["read"], tys: [9], ret: 2)
+    } else if b == "parse_float" {
+        Sig(modes: ["read"], tys: [2], ret: 9)
+    } else if b == "try_parse_float" {
+        Sig(modes: ["read"], tys: [2], ret: 10)
+    } else if b == "atan2" || b == "float_pow" {
+        Sig(modes: ["read", "read"], tys: [9, 9], ret: 9)
+    } else if has(float_math1(), b) {
+        Sig(modes: ["read"], tys: [9], ret: 9)
+    } else if b == "print" || b == "eprint" {
+        Sig(modes: ["read"], tys: [2], ret: 3)
+    } else if b == "byte_at" {
+        Sig(modes: ["read", "read"], tys: [2, 0], ret: 0)
+    } else if b == "slice" {
+        Sig(modes: ["read", "read", "read"], tys: [2, 0, 0], ret: 2)
+    } else if b == "sleep_ms" {
+        Sig(modes: ["read"], tys: [0], ret: 3)
+    } else if b == "from_byte" || b == "int_str" {
+        Sig(modes: ["read"], tys: [0], ret: 2)
+    } else if b == "parse_int" {
+        Sig(modes: ["read"], tys: [2], ret: 0)
+    } else if b == "read_file" {
+        Sig(modes: ["read"], tys: [2], ret: 2)
+    } else if b == "write_file" {
+        Sig(modes: ["read", "read"], tys: [2, 2], ret: 3)
+    } else if b == "args" {
+        Sig(modes: [], tys: [], ret: 6)
+    } else if b == "exit" {
+        Sig(modes: ["read"], tys: [0], ret: 4)
+    } else if b == "panic" {
+        Sig(modes: ["read"], tys: [2], ret: 4)
+    } else if b == "join" {
+        Sig(modes: ["read", "read"], tys: [6, 2], ret: 2)
+    } else if b == "downcast" {
+        // 返回类型来自期望类型（见 check_downcast），这里只给出参数是只读的
+        Sig(modes: ["read"], tys: [first], ret: 5)
+    } else if b == "assert" {
+        // 条件不成立时 panic，信息里带上 assert 所在的文件和行列
+        Sig(modes: ["read"], tys: [1], ret: 3)
+    } else if b == "assert_eq" {
+        // 两边不相等时 panic，信息里带上位置和两边的值（类型要能比较、能插值，见 check_call）
+        if first < 0 { fail(line, col, "assert_eq 需要两个参数") }
+        Sig(modes: ["read", "read"], tys: [first, first], ret: 3)
+    } else if b == "system" {
+        Sig(modes: ["read"], tys: [2], ret: 0)
+    } else {
+        if first < 0 {
+            fail(line, col, "#{b} 缺少参数")
+        }
+        k = tkind(c, first)
+        if b == "len" {
+            if first != 2 && k != "list" { fail(line, col, "len 只能用于 str、列表，或者定义了 fn iter_len(x: T) -> int 的类型，而不是 #{show_ty(c, first)}") }
+            Sig(modes: ["read"], tys: [first], ret: 0)
+        } else if b == "copy" {
+            if has_dtor(c, first) { fail(line, col, "#{show_ty(c, first)} 有析构函数（或包含有析构函数的值），不能复制") }
+            Sig(modes: ["read"], tys: [first], ret: first)
+        } else if b == "replace" {
+            Sig(modes: ["inout", "take"], tys: [first, first], ret: first)
+        } else if b == "push" {
+            if k != "list" { fail(line, col, "push 的第一个参数必须是列表") }
+            Sig(modes: ["inout", "take"], tys: [first, telem(c, first)], ret: 3)
+        } else if b == "insert_at" {
+            // xs.insert_at(i, x)：放在第 i 个位置，后面的往后挪；i 可以等于长度（放在最后）
+            if k != "list" { fail(line, col, "insert_at 的第一个参数必须是列表") }
+            Sig(modes: ["inout", "read", "take"], tys: [first, 0, telem(c, first)], ret: 3)
+        } else if b == "remove_at" {
+            // xs.remove_at(i)：拿走第 i 个并返回，后面的往前挪
+            if k != "list" { fail(line, col, "remove_at 的第一个参数必须是列表") }
+            Sig(modes: ["inout", "read"], tys: [first, 0], ret: telem(c, first))
+        } else if b == "try_pop" {
+            // xs.try_pop()：拿走最后一个，空列表时是 None（pop 在空列表上 panic）
+            if k != "list" { fail(line, col, "try_pop 的参数必须是列表") }
+            Sig(modes: ["inout"], tys: [first], ret: opt_of(c, telem(c, first)))
+        } else if b == "reserve" {
+            if k != "list" { fail(line, col, "reserve 的第一个参数必须是列表") }
+            Sig(modes: ["inout", "read"], tys: [first, 0], ret: 3)
+        } else {
+            if k != "list" { fail(line, col, "pop 的参数必须是列表") }
+            Sig(modes: ["inout"], tys: [first], ret: telem(c, first))
+        }
+    }
+}
+
+// 结构体 / 变体构造的字段名
+fn ctor_fnames(c: Ctx, rk: str, rn: str, ri: int) -> [str] {
+    if rk == "struct" {
+        c.structs[find_struct(c, rn)].fnames.copy()
+    } else {
+        c.enums[find_enum(c, rn)].variants[ri].fnames.copy()
+    }
+}
+
+// 第 k 个字段对应第几个实参；有标签时按标签对应，缺失为 -1
+fn ctor_order(c: Ctx, rk: str, rn: str, ri: int, args: [Arg]) -> [int] {
+    names = ctor_fnames(c, rk, rn, ri)
+    order_by_names(names, args)
+}
+
+fn order_by_names(names: [str], args: [Arg]) -> [int] {
+    labeled = false
+    for a in args {
+        if a.label != "" { labeled = true }
+    }
+    order: [int] = []
+    for k in 0..len(names) {
+        if !labeled {
+            order.push(k)
+        } else {
+            found = -1
+            for i in 0..len(args) {
+                if args[i].label == names[k] { found = i }
+            }
+            order.push(found)
+        }
+    }
+    order
+}
+
+// 调用的参数顺序：构造按字段顺序，其余按书写顺序（第 k 个形参对应第几个实参）
+fn call_order(c: Ctx, e: Expr, args: [Arg]) -> [int] {
+    rk = c.rkind[e.id]
+    if rk == "struct" || rk == "variant" {
+        ctor_order(c, rk, c.rname[e.id], c.ridx[e.id], args)
+    } else {
+        order: [int] = []
+        for i in 0..len(args) { order.push(i) }
+        order
+    }
+}
+
+// call_order 反过来：第 i 个实参对应第几个形参（字段）。求值都按实参的书写顺序，P(b: f(), a: g()) 先 f 后 g，和普通调用一样
+fn arg_slots(order: [int]) -> [int] {
+    slots = fill(len(order), -1)
+    for k in 0..len(order) {
+        if order[k] >= 0 { slots[order[k]] = k }
+    }
+    slots
+}
+
+fn call_sig(c: Ctx, e: Expr, args: [Arg]) -> Sig {
+    rn = c.rname[e.id]
+    if c.rkind[e.id] == "builtin" && rn == "chan" {
+        return Sig(modes: [], tys: [], ret: c.ety[e.id])
+    }
+    if c.rkind[e.id] == "builtin" && (rn == "None" || rn == "Ok" || rn == "Err") {
+        // 类型来自上下文，检查时已记在 ety 里
+        ret = c.ety[e.id]
+        if rn == "None" || len(args) == 0 {
+            return Sig(modes: [], tys: [], ret: ret)
+        }
+        at = if rn == "Err" { res_err(c, ret) } else { telem(c, ret) }
+        return Sig(modes: ["take"], tys: [at], ret: ret)
+    }
+    first = if len(args) > 0 { c.ety[args[0].value.id] } else { -1 }
+    sig_of(c, c.rkind[e.id], c.rname[e.id], c.ridx[e.id], first, e.line, e.col)
+}
+
+fn arg_amp(c: Ctx, a: Arg) -> bool {
+    a.amp || c.ampx[a.value.id]
+}
+
+fn is_place(e: Expr) -> bool {
+    match e.kind {
+        EVar(_) => true
+        EField(b, _) => is_place(b)
+        EIndex(b, _) => is_place(b)
+        _ => false
+    }
+}
+
+// ---------- 作用域 ----------
+
+// 注意排他性：c.xs.push(...) 的参数里不能再出现 c，需要先存到局部变量
+fn push_scope(inout c: Ctx) {
+    n = len(c.scope_names)
+    c.scope_marks.push(n)
+}
+
+// 离开作用域时，从没用到的变量记一条警告
+fn pop_scope(inout c: Ctx) {
+    m = c.scope_marks.pop()
+    for len(c.scope_names) > m {
+        nm = c.scope_names.pop()
+        v = c.scope_vids.pop()
+        used = c.locals[v].used
+        ln = c.locals[v].line
+        cl = c.locals[v].col
+        if !used { warn(&c, ln, cl, "变量 #{nm} 没有用到（不需要的话写成 _，或者改成以 _ 开头的名字）") }
+    }
+}
+
+// 记一条警告；泛型实例会把同一段代码检查多次，同一位置的同一条只记一次
+fn warn(inout c: Ctx, line: int, col: int, msg: str) {
+    for i in 0..len(c.wmsgs) {
+        if c.wlines[i] == line && c.wcols[i] == col && c.wmsgs[i] == msg { return }
+    }
+    c.wlines.push(line)
+    c.wcols.push(col)
+    c.wmsgs.push(msg)
+}
+
+fn lookup(c: Ctx, name: str) -> int {
+    i = len(c.scope_names) - 1
+    for i >= 0 {
+        if c.scope_names[i] == name { return c.scope_vids[i] }
+        i -= 1
+    }
+    -1
+}
+
+fn declare(inout c: Ctx, name: str, ty: int, kind: str, line: int, col: int) -> int {
+    // _ 专门用来丢弃值，可以反复声明（但不能读，见 check.lark 的 EVar）
+    if name != "_" && lookup(c, name) >= 0 { fail(line, col, "变量 #{name} 已存在（Lark 不允许遮蔽）") }
+    if has(c.mods, mod_key(name, line)) { fail(line, col, "#{name} 是这个文件导入的模块名，不能用作变量名") }
+    v = len(c.locals)
+    depth = c.loop_depth
+    quiet = len(name) > 0 && byte_at(name, 0) == '_'
+    c.locals.push(Local(name: name, cname: "v_#{name}_#{v}", ty: ty, kind: kind, loop_depth: depth, line: line, col: col, used: quiet, in_match: false))
+    c.scope_names.push(name)
+    c.scope_vids.push(v)
+    v
+}
+
+// ---------- 泛型 ----------
+
+fn is_template(c: Ctx, fi: int) -> bool { len(c.fns[fi].tvars) > 0 && len(c.fns[fi].targs) == 0 }
+
+fn find_tvar(c: Ctx, s: str) -> int {
+    index_where(c.tvars, |t| t == s)
+}
+
+// 实例化会分配新的节点 id，旁表跟着加长
+fn grow(inout c: Ctx, n: int) {
+    for c.nodes < n {
+        c.ety.push(5)
+        c.vid.push(-1)
+        c.rkind.push("")
+        c.rname.push("")
+        c.ridx.push(0)
+        c.decl.push(false)
+        c.ampx.push(false)
+        c.wrap.push(false)
+        c.wrapt.push(-1)
+        c.nodes += 1
+    }
+}
+
+// ---------- 泛型类型 ----------
+
+fn find_tdecl(c: Ctx, name: str) -> int {
+    index_where(c.tdecls, |d| d.name == name)
+}
+
+fn gvariant_index(c: Ctx, ti: int, vn: str) -> int {
+    index_where(c.tdecls[ti].variants, |v| v.name == vn)
+}
+
+// 类型 t 是哪个泛型类型的实例（c.tinsts 的下标）；不是时为 -1
+fn inst_of(c: Ctx, t: int) -> int {
+    if t < 0 { return -1 }
+    k = tkind(c, t)
+    if k != "struct" && k != "enum" { return -1 }
+    n = tname(c, t)
+    for i in 0..len(c.tinsts) {
+        if c.tinsts[i].key == n { return i }
+    }
+    -1
+}
+
+// 实例在报错里显示成 Pair[int, str]，而不是内部名字
+fn show_named(c: Ctx, name: str) -> str {
+    if len(name) > 5 && slice(name, 0, 5) == "Tup__" {
+        es: [str] = []
+        for t in c.structs[find_struct(c, name)].ftys { es.push(show_ty(c, t)) }
+        return "(" + join(es, ", ") + ")"
+    }
+    for x in c.tinsts {
+        if x.key == name {
+            parts: [str] = []
+            for t in x.targs { parts.push(show_ty(c, t)) }
+            return x.origin + "[" + join(parts, ", ") + "]"
+        }
+    }
+    name
+}
+
+// "Pair[int,[str]]" → ["Pair", "int", "[str]"]
+fn split_generic(s: str) -> [str] {
+    out: [str] = []
+    i = 0
+    for byte_at(s, i) != '[' { i += 1 }
+    out.push(slice(s, 0, i))
+    depth = 0
+    start = i + 1
+    j = i + 1
+    for j < len(s) - 1 {
+        b = byte_at(s, j)
+        if b == '[' {
+            depth += 1
+        } else if b == ']' {
+            depth -= 1
+        } else if b == ',' && depth == 0 {
+            out.push(slice(s, start, j))
+            start = j + 1
+        }
+        j += 1
+    }
+    out.push(slice(s, start, len(s) - 1))
+    out
+}
+
+fn is_word_byte(b: int) -> bool { is_ident_start(b) || is_digit(b) }
+
+// 类型原文里是否用到了还没确定的类型参数
+fn unbound_in(text: str, tvars: [str], bound: [int]) -> bool {
+    i = 0
+    n = len(text)
+    for i < n {
+        if is_word_byte(byte_at(text, i)) {
+            j = i
+            for j < n && is_word_byte(byte_at(text, j)) { j += 1 }
+            w = slice(text, i, j)
+            for k in 0..len(tvars) {
+                if tvars[k] == w && bound[k] < 0 { return true }
+            }
+            i = j
+        } else {
+            i += 1
+        }
+    }
+    false
+}
+
+// 在给定的类型参数代换下解析类型原文；保存并恢复外层的代换
+fn resolve_with(inout c: Ctx, text: str, tvars: [str], targs: [int], line: int, col: int) -> int {
+    tv = tvars.copy()
+    ta = targs.copy()
+    old_v = replace(&c.tvars, tv)
+    old_a = replace(&c.targs, ta)
+    t = resolve_ty(&c, text, line, col)
+    c.tvars = old_v
+    c.targs = old_a
+    t
+}
+
+fn resolve_generic(inout c: Ctx, s: str, line: int, col: int) -> int {
+    parts = split_generic(s)
+    name = parts[0]
+    if name == "Chan" {
+        // 内置的 Chan[T]
+        if len(parts) != 2 { fail(line, col, "Chan 需要 1 个类型实参，例如 Chan[int]") }
+        el = resolve_ty(&c, parts[1], line, col)
+        if unit_like(el) { fail(line, col, "Chan 的元素不能是 ()") }
+        no_fn(c, el, "Chan 的元素", line, col)
+        _ot = intern(&c.tt, "opt", "", el)
+        return intern(&c.tt, "chan", "", el)
+    }
+    if name == "Mutex" {
+        // 内置的 Mutex[T]：mutex(v) 创建，lock m as x { … } 使用
+        if len(parts) != 2 { fail(line, col, "Mutex 需要 1 个类型实参，例如 Mutex[[int]]") }
+        el = resolve_ty(&c, parts[1], line, col)
+        if unit_like(el) { fail(line, col, "Mutex 的内容不能是 ()") }
+        no_fn(c, el, "Mutex 的内容", line, col)
+        return intern(&c.tt, "mutex", "", el)
+    }
+    ti = find_tdecl(c, resolve_name(c, name, line))
+    if ti < 0 { fail(line, col, "#{name} 不是泛型类型") }
+    check_vis(c, c.tdecls[ti].name, line, col)
+    nv = len(c.tdecls[ti].tvars)
+    if len(parts) - 1 != nv {
+        fail(line, col, "#{name} 需要 #{nv} 个类型实参，给了 #{len(parts) - 1} 个")
+    }
+    targs: [int] = []
+    for k in 1..len(parts) {
+        t = resolve_ty(&c, parts[k], line, col)
+        if unit_like(t) { fail(line, col, "() 不能作为类型实参") }
+        no_fn(c, t, "类型实参", line, col)
+        targs.push(t)
+    }
+    key = instantiate_type(&c, ti, targs)
+    kind = c.tdecls[ti].kind
+    intern_lookup(c, kind, key)
+}
+
+// 返回实例名。先登记再解析字段类型，这样 enum Tree[T] 里引用 Tree[T] 不会无限展开。
+fn instantiate_type(inout c: Ctx, ti: int, targs: [int]) -> str {
+    ids: [str] = []
+    for t in targs { ids.push(int_str(t)) }
+    name = c.tdecls[ti].name
+    key = name + "__" + join(ids, "_")
+    for x in c.tinsts {
+        if x.key == key { return key }
+    }
+    if len(c.tinsts) > 5000 {
+        tl = c.tdecls[ti].line
+        tc = c.tdecls[ti].col
+        fail(tl, tc, "泛型类型 #{name} 的实例过多，可能在无限展开")
+    }
+    ta = targs.copy()
+    c.tinsts.push(TInst(key: key, origin: name, targs: ta))
+    kind = c.tdecls[ti].kind
+    if kind == "struct" {
+        names0 = c.tdecls[ti].variants[0].fnames.copy()
+        c.structs.push(SInfo(name: key, fnames: names0, ftys: []))
+        _st = intern(&c.tt, "struct", key, -1)
+    } else {
+        vs: [VInfo] = []
+        for v in c.tdecls[ti].variants {
+            vnames = v.fnames.copy()
+            vs.push(VInfo(name: v.name, fnames: vnames, ftys: []))
+        }
+        c.enums.push(EInfo(name: key, variants: vs))
+        _et = intern(&c.tt, "enum", key, -1)
+    }
+    si = if kind == "struct" { len(c.structs) - 1 } else { len(c.enums) - 1 }
+    tv = c.tdecls[ti].tvars.copy()
+    line = c.tdecls[ti].line
+    col = c.tdecls[ti].col
+    for j in 0..len(c.tdecls[ti].variants) {
+        for k in 0..len(c.tdecls[ti].variants[j].ftexts) {
+            tx = c.tdecls[ti].variants[j].ftexts[k]
+            ft = resolve_with(&c, tx, tv, targs, line, col)
+            no_fn(c, ft, "字段类型", line, col)
+            if kind == "struct" {
+                c.structs[si].ftys.push(ft)
+            } else {
+                c.enums[si].variants[j].ftys.push(ft)
+            }
+        }
+    }
+    key
+}
+
+// ---------- 重载 ----------
+// 同名函数按第一个参数的类型区分。方法调用 x.f() 和普通调用 f(x) 用同一套规则。
+
+fn count_uname(c: Ctx, name: str) -> int {
+    n = 0
+    for f in c.fns {
+        if f.uname == name { n += 1 }
+    }
+    n
+}
+
+fn overload_for(c: Ctx, name: str, t: int) -> int {
+    for i in 0..len(c.fns) {
+        if c.fns[i].uname == name && len(c.fns[i].ptys) > 0 && c.fns[i].ptys[0] == t { return i }
+    }
+    -1
+}
+
+// ---------- 函数类型 ----------
+// 函数类型的 kind 是 "fn"，names 记参数类型编号（逗号分隔），elems 记返回类型。
+// 函数类型的值（闭包）只能作为参数传递：不能存进变量、字段、列表，也不能返回。
+
+fn fn_params(c: Ctx, t: int) -> [int] {
+    out: [int] = []
+    s = tname(c, t)
+    if s == "" { return out }
+    start = 0
+    for i in 0..len(s) + 1 {
+        if i == len(s) || byte_at(s, i) == ',' {
+            out.push(parse_int(slice(s, start, i)))
+            start = i + 1
+        }
+    }
+    out
+}
+
+// "fn(int,[str])->bool" → ["bool", "int", "[str]"]（返回类型在前）
+fn split_fn(s: str) -> [str] {
+    depth = 0
+    close = -1
+    i = 2
+    for i < len(s) && close < 0 {
+        b = byte_at(s, i)
+        if b == '(' || b == '[' {
+            depth += 1
+        } else if b == ')' || b == ']' {
+            depth -= 1
+            if depth == 0 && b == ')' { close = i }
+        }
+        i += 1
+    }
+    out: [str] = [slice(s, close + 3, len(s))]
+    if close == 3 { return out }
+    d = 0
+    start = 3
+    for j in 3..close {
+        b = byte_at(s, j)
+        if b == '(' || b == '[' {
+            d += 1
+        } else if b == ')' || b == ']' {
+            d -= 1
+        } else if b == ',' && d == 0 {
+            out.push(slice(s, start, j))
+            start = j + 1
+        }
+    }
+    out.push(slice(s, start, close))
+    out
+}
+
+fn is_fn_ty(c: Ctx, t: int) -> bool { t >= 0 && tkind(c, t) == "fn" }
+
+fn no_fn(c: Ctx, t: int, what: str, line: int, col: int) {
+    if is_fn_ty(c, t) { fail(line, col, "fn(…) 类型只能用作函数参数，不能用作#{what}；要存起来请用 Fn(…)") }
+}
+
+fn fn_ty_of(inout c: Ctx, ps: [int], ret: int) -> int {
+    ids: [str] = []
+    for p in ps { ids.push(int_str(p)) }
+    intern(&c.tt, "fn", join(ids, ","), ret)
+}
+
+fn resolve_fn_ty(inout c: Ctx, s: str, line: int, col: int) -> int {
+    parts = split_fn(s)
+    ps: [int] = []
+    for k in 1..len(parts) {
+        t = resolve_ty(&c, parts[k], line, col)
+        if is_fn_ty(c, t) { fail(line, col, "闭包的参数不能是函数类型") }
+        if unit_like(t) { fail(line, col, "函数类型的参数不能是 ()") }
+        ps.push(t)
+    }
+    r = resolve_ty(&c, parts[0], line, col)
+    no_fn(c, r, "返回类型", line, col)
+    fn_ty_of(&c, ps, r)
+}
+
+// ---------- 存储的闭包 Fn(…) -> R ----------
+// kind 是 "ofn"，编码同 fn。值是 { 函数指针, 环境 }，环境在堆上、带引用计数（原子操作），
+// 闭包创建时把捕获的变量复制进去，之后只读：所以 Fn 值可以存进变量、字段、列表，可以返回，
+// 复制只是计数加一，也可以通过 Chan 交给别的线程。传给 fn(…) 参数时直接借用。
+
+fn is_ofn(c: Ctx, t: int) -> bool { t >= 0 && tkind(c, t) == "ofn" }
+
+// 可以当函数调用的类型
+fn is_callable(c: Ctx, t: int) -> bool { is_fn_ty(c, t) || is_ofn(c, t) }
+
+// Fn 值能否传给 fn 参数：参数和返回类型都相同
+fn ofn_fits(c: Ctx, want: int, got: int) -> bool {
+    is_fn_ty(c, want) && is_ofn(c, got) && tname(c, want) == tname(c, got) && telem(c, want) == telem(c, got)
+}
+
+fn resolve_ofn_ty(inout c: Ctx, s: str, line: int, col: int) -> int {
+    ft = resolve_fn_ty(&c, s, line, col)
+    intern(&c.tt, "ofn", tname(c, ft), telem(c, ft))
+}
+
+fn is_closure(e: Expr) -> bool {
+    match e.kind {
+        EClosure(_, _) => true
+        _ => false
+    }
+}
+
+fn find_clo(c: Ctx, id: int) -> int {
+    index_where(c.clos, |k| k.id == id)
+}
+
+// 变量在闭包里被使用：对每个更外层定义的变量，记为该闭包的捕获
+fn note_use(inout c: Ctx, v: int) {
+    c.locals[v].used = true
+    for i in 0..len(c.clo_stack) {
+        k = c.clo_stack[i]
+        if v < c.clos[k].base && !has(c.clos[k].caps, v) { c.clos[k].caps.push(v) }
+    }
+}
+
+// 能否用 == 比较：除了函数类型都可以（结构体、枚举、列表、T?、T! 按值逐个比较）。
+// 函数类型不会出现在字段和元素里，所以不用递归检查。
+// dyn 也能比较：先比装的类型，再比值（值不能比较时在运行时 panic）
+fn is_eq(c: Ctx, t: int) -> bool { t >= 0 && t != 3 && t != 4 && t != 5 && !is_fn_ty(c, t) }
+
+// ---------- 自定义析构 ----------
+// fn drop(inout x: T)：T 的值被销毁时先调用它，再释放各个字段。
+
+// T 自己的析构函数在 fns 里的下标；没有时为 -1
+fn dtor_of(c: Ctx, t: int) -> int {
+    k = index_where(c.dtor_ty, |d| d == t)
+    if k < 0 { -1 } else { c.dtor_fn[k] }
+}
+
+// t 本身或它包含的值（字段、元素）有没有自定义析构。有的话不能复制，否则同一个资源会被释放两次
+fn has_dtor(c: Ctx, t: int) -> bool {
+    seen: [int] = []
+    has_dtor_in(c, t, &seen)
+}
+
+fn has_dtor_in(c: Ctx, t: int, inout seen: [int]) -> bool {
+    if t < 0 || has(seen, t) { return false }
+    seen.push(t)
+    if dtor_of(c, t) >= 0 { return true }
+    k = tkind(c, t)
+    // shared 的复制只是计数加一，内容只在最后一个持有者释放时析构一次，所以可以复制
+    if k == "shared" || k == "chan" || k == "mutex" || k == "dyn" { return false }
+    if k == "list" || k == "opt" { return has_dtor_in(c, telem(c, t), &seen) }
+    if k == "res" { return has_dtor_in(c, telem(c, t), &seen) || has_dtor_in(c, res_err(c, t), &seen) }
+    if k == "struct" {
+        si = find_struct(c, tname(c, t))
+        for ft in c.structs[si].ftys {
+            if has_dtor_in(c, ft, &seen) { return true }
+        }
+    } else if k == "enum" {
+        ei = find_enum(c, tname(c, t))
+        for v in c.enums[ei].variants {
+            for ft in v.ftys {
+                if has_dtor_in(c, ft, &seen) { return true }
+            }
+        }
+    }
+    false
+}
+
+// ---------- 错误类型 ----------
+
+// T!E 的错误类型 E；T! 的是 str
+fn res_err(c: Ctx, t: int) -> int {
+    s = tname(c, t)
+    if s == "" { 2 } else { parse_int(s) }
+}
+
+fn res_of(inout c: Ctx, el: int, er: int) -> int {
+    nm = if er == 2 { "" } else { int_str(er) }
+    intern(&c.tt, "res", nm, el)
+}
+
+// ---------- shared T ----------
+// 引用计数的共享所有权：share(x) 放到堆上，.copy() 计数加一，最后一个持有者释放时才释放内容。内容只读。
+
+fn is_shared(c: Ctx, t: int) -> bool { t >= 0 && tkind(c, t) == "shared" }
+
+// t 里面（字段、元素）的第一个 Mutex 或 Chan；没有时为 -1。
+// share 的内容不能有它们：lock、send 能经由 shared 改掉内容，还能把 shared 自己的副本存进去成环
+fn cell_in(c: Ctx, t: int, inout seen: [int]) -> int {
+    if t < 0 || has(seen, t) { return -1 }
+    seen.push(t)
+    k = tkind(c, t)
+    if k == "chan" || k == "mutex" { return t }
+    if k == "list" || k == "opt" || k == "shared" { return cell_in(c, telem(c, t), &seen) }
+    if k == "res" {
+        a = cell_in(c, telem(c, t), &seen)
+        if a >= 0 { return a }
+        return cell_in(c, res_err(c, t), &seen)
+    }
+    if k == "struct" {
+        si = find_struct(c, tname(c, t))
+        for ft in c.structs[si].ftys {
+            x = cell_in(c, ft, &seen)
+            if x >= 0 { return x }
+        }
+    } else if k == "enum" {
+        ei = find_enum(c, tname(c, t))
+        for v in c.enums[ei].variants {
+            for ft in v.ftys {
+                x = cell_in(c, ft, &seen)
+                if x >= 0 { return x }
+            }
+        }
+    }
+    -1
+}
+
+// 已登记的 kind[elem] 类型（如 shared int）；没有时为 -1
+fn intern_lookup_elem(c: Ctx, kind: str, elem: int) -> int {
+    for i in 0..len(c.tt.kinds) {
+        if c.tt.kinds[i] == kind && c.tt.elems[i] == elem { return i }
+    }
+    -1
+}
+
+// ---------- Chan[T] ----------
+// 线程之间传值的队列：send 把值移进去，recv 取出最早的一个；没有值时等待，
+// 除自己以外的持有者都放手、队列也空了以后 recv 返回 None。复制 Chan 只是计数加一。
+
+fn is_chan(c: Ctx, t: int) -> bool { t >= 0 && tkind(c, t) == "chan" }
+fn is_mutex(c: Ctx, t: int) -> bool { t >= 0 && tkind(c, t) == "mutex" }
+
+// ---------- 尾调用 ----------
+// 函数在尾部调用自己时编译成跳回开头（不占栈）。要求每个参数都是 take，或者是 int / bool / float：
+// 这样新的实参都是自己拥有的值，跳回去之前可以放心释放当前这一轮的局部变量。
+
+fn tail_ok(c: Ctx, fi: int) -> bool {
+    if fi < 0 { return false }
+    for k in 0..len(c.fns[fi].ptys) {
+        t = c.fns[fi].ptys[k]
+        if c.fns[fi].pmodes[k] != "take" && !(c.fns[fi].pmodes[k] == "read" && (t == 0 || t == 1 || t == 9 || is_fixed(t))) { return false }
+    }
+    true
+}
+
+// fi 里的调用 e 是否是对 fi 自己的、可以变成跳转的调用
+fn is_self_tail(c: Ctx, fi: int, e: Expr) -> bool {
+    match e.kind {
+        ECall(_, _, _) => c.rkind[e.id] == "fn" && find_fn(c, c.rname[e.id]) == fi && tail_ok(c, fi)
+        _ => false
+    }
+}
+
+// ---------- 命名空间 ----------
+// import 载入的文件是一个模块，模块名是文件名（不带 .lark）。模块里声明的类型、枚举、函数在内部叫 "m.x"，
+// 模块外写 m.x（解析时已经拼成限定名），模块内直接写 x。变体名不加前缀，按所属枚举的模块区分。
+// 接口、接口方法的实现、drop、from、main 是“协议”名字，不加前缀（任何模块里的实现都能被找到）。
+
+fn mod_of(c: Ctx, line: int) -> str {
+    f = line / 100000
+    if f < len(c.fmods) { c.fmods[f] } else { "" }
+}
+
+// 限定名的模块部分："geo.Vec2" → "geo"，"Vec2" → ""；泛型实例 "map.Map__0" → "map"
+fn mod_part(s: str) -> str {
+    i = len(s) - 1
+    for i >= 0 {
+        if byte_at(s, i) == '.' { return slice(s, 0, i) }
+        i -= 1
+    }
+    ""
+}
+
+fn has_dot(s: str) -> bool { mod_part(s) != "" }
+
+// 在 line 所在的文件里声明 name 时，它在内部叫什么
+fn decl_name(c: Ctx, name: str, line: int) -> str {
+    m = mod_of(c, line)
+    if m == "" { name } else { m + "." + name }
+}
+
+fn is_protocol_fn(c: Ctx, name: str) -> bool {
+    name == "drop" || name == "from" || name == "main" || name == "eq" || name == "cmp" || name == "next" || index_where(c.imeths, |m| m.name == name) >= 0
+}
+
+fn item_exists(c: Ctx, name: str) -> bool {
+    count_uname(c, name) > 0 || find_struct(c, name) >= 0 || find_enum(c, name) >= 0 || find_tdecl(c, name) >= 0
+}
+
+// 在 line 处写的名字指的是哪一个：限定名原样；否则先找本模块，再找根模块
+fn resolve_name(c: Ctx, name: str, line: int) -> str {
+    if has_dot(name) { return name }
+    m = mod_of(c, line)
+    if m != "" && item_exists(c, m + "." + name) { return m + "." + name }
+    name
+}
+
+// 变体（可能带模块限定）属于哪个枚举：只在对应模块的枚举里找。不存在时为 -1
+fn variant_enum_at(c: Ctx, name: str, line: int) -> int {
+    vn = last_part(name)
+    if has_dot(name) { return variant_enum_in(c, mod_part(name), vn) }
+    m = mod_of(c, line)
+    if m != "" {
+        ei = variant_enum_in(c, m, vn)
+        if ei >= 0 { return ei }
+    }
+    variant_enum_in(c, "", vn)
+}
+
+fn variant_enum_in(c: Ctx, m: str, vn: str) -> int {
+    for i in 0..len(c.enums) {
+        if mod_part(c.enums[i].name) == m && variant_index(c, i, vn) >= 0 { return i }
+    }
+    -1
+}
+
+// 泛型枚举模板的版本
+fn tvariant_at(c: Ctx, name: str, line: int) -> int {
+    vn = last_part(name)
+    if has_dot(name) { return tvariant_in(c, mod_part(name), vn) }
+    m = mod_of(c, line)
+    if m != "" {
+        ti = tvariant_in(c, m, vn)
+        if ti >= 0 { return ti }
+    }
+    tvariant_in(c, "", vn)
+}
+
+fn tvariant_in(c: Ctx, m: str, vn: str) -> int {
+    for i in 0..len(c.tdecls) {
+        if c.tdecls[i].kind == "enum" && mod_part(c.tdecls[i].name) == m && gvariant_index(c, i, vn) >= 0 { return i }
+    }
+    -1
+}
+
+// 方法调用时接收者类型所在的模块（结构体、枚举及其泛型实例）；其它类型为 ""
+fn type_mod(c: Ctx, t: int) -> str {
+    if t < 0 { return "" }
+    k = tkind(c, t)
+    if k == "shared" { return type_mod(c, telem(c, t)) }
+    if k == "struct" || k == "enum" { mod_part(tname(c, t)) } else { "" }
+}
+
+fn fn_decl_name(c: Ctx, f: FnDecl) -> str {
+    if is_protocol_fn(c, f.name) { f.name } else { decl_name(c, f.name, f.line) }
+}
+
+// ---------- 接口对象 dyn I ----------
+// kind 是 "dyn"，name 是接口名。值是 { 堆上的具体值, 虚表 }：虚表里有释放、复制和接口的每个方法。
+// 需要 dyn I 的地方给了实现 I 的具体类型的值，就自动装箱（同 T → T? 的自动包装，记在 wrap / wrapt 里）。
+// 能用作 dyn 的接口：每个方法的第一个参数是只读的 Self，其它参数和返回类型里不出现 Self。
+
+fn is_dyn(c: Ctx, t: int) -> bool { t >= 0 && tkind(c, t) == "dyn" }
+
+fn resolve_dyn(inout c: Ctx, name: str, line: int, col: int) -> int {
+    if !has(c.inames, name) { fail(line, col, "dyn 后面需要接口名，#{name} 不是接口") }
+    t = intern(&c.tt, "dyn", name, -1)
+    if has(c.dyn_done, t) { return t }
+    c.dyn_done.push(t)
+    for i in 0..len(c.imeths) {
+        if c.imeths[i].iface == name {
+            m = c.imeths[i].copy()
+            if m.ptexts[0] != "Self" || m.pmodes[0] != "read" {
+                fail(line, col, "接口 #{name} 不能用作 dyn：方法 #{m.name} 的第一个参数必须是只读的 Self")
+            }
+            tys: [int] = [t]
+            for k in 1..len(m.ptexts) {
+                if mentions_self(m.ptexts[k]) { fail(line, col, "接口 #{name} 不能用作 dyn：方法 #{m.name} 的其它参数里用到了 Self") }
+                tys.push(resolve_ty(&c, m.ptexts[k], m.line, m.col))
+            }
+            if mentions_self(m.ret) { fail(line, col, "接口 #{name} 不能用作 dyn：方法 #{m.name} 的返回类型里用到了 Self") }
+            r = resolve_ty(&c, m.ret, m.line, m.col)
+            c.dsig_t.push(t)
+            c.dsig_n.push(m.name)
+            c.dsig_s.push(Sig(modes: m.pmodes.copy(), tys: tys, ret: r))
+        }
+    }
+    t
+}
+
+fn mentions_self(s: str) -> bool {
+    n = len(s)
+    for i in 0..n {
+        if i + 4 <= n && slice(s, i, i + 4) == "Self" {
+            before = i == 0 || !is_ident_char(byte_at(s, i - 1))
+            after = i + 4 == n || !is_ident_char(byte_at(s, i + 4))
+            if before && after { return true }
+        }
+    }
+    false
+}
+
+fn is_ident_char(b: int) -> bool { is_ident_start(b) || is_digit(b) }
+
+// dyn 类型 dt 的方法 name 在接口里的序号；没有时为 -1
+fn dyn_method(c: Ctx, dt: int, name: str) -> int {
+    k = 0
+    for i in 0..len(c.dsig_t) {
+        if c.dsig_t[i] == dt {
+            if c.dsig_n[i] == name { return k }
+            k += 1
+        }
+    }
+    -1
+}
+
+fn dyn_sig(c: Ctx, dt: int, name: str) -> Sig {
+    for i in 0..len(c.dsig_t) {
+        if c.dsig_t[i] == dt && c.dsig_n[i] == name { return c.dsig_s[i].copy() }
+    }
+    Sig(modes: [], tys: [], ret: 3)
+}
+
+// 把类型 t 的值装进 dyn 类型 dt：找出实现接口每个方法的函数，登记这个组合
+fn dyn_impl(inout c: Ctx, dt: int, t: int, line: int, col: int) {
+    for i in 0..len(c.dyn_ty) {
+        if c.dyn_ty[i] == dt && c.dyn_src[i] == t { return }
+    }
+    if unit_like(t) || is_fn_ty(c, t) || is_dyn(c, t) { fail(line, col, "#{show_ty(c, t)} 不能装进 #{show_ty(c, dt)}") }
+    if has_dtor(c, t) { fail(line, col, "#{show_ty(c, t)} 有自定义析构，暂时不能装进 #{show_ty(c, dt)}") }
+    name = tname(c, dt)
+    fns: [str] = []
+    for i in 0..len(c.dsig_t) {
+        if c.dsig_t[i] == dt {
+            sg = c.dsig_s[i].copy()
+            tys = sg.tys.copy()
+            tys[0] = t
+            fi = find_impl_idx(c, c.dsig_n[i], sg.modes, tys, sg.ret)
+            if fi < 0 { fail(line, col, "#{show_ty(c, t)} 不满足接口 #{name}：缺少方法 #{c.dsig_n[i]}") }
+            fns.push(c.fns[fi].name)
+        }
+    }
+    c.dyn_ty.push(dt)
+    c.dyn_src.push(t)
+    c.dyn_fns.push(join(fns, ","))
+}
+
+fn find_impl_idx(c: Ctx, name: str, modes: [str], tys: [int], ret: int) -> int {
+    for i in 0..len(c.fns) {
+        f = c.fns[i].copy()
+        if f.uname == name && len(f.targs) == 0 && len(f.tvars) == 0 && f.ret == ret && len(f.ptys) == len(tys) {
+            same = true
+            for k in 0..len(tys) {
+                if f.ptys[k] != tys[k] || f.pmodes[k] != modes[k] { same = false }
+            }
+            if same { return i }
+        }
+    }
+    -1
+}
+
+// ---------- 元组 (A, B, …) ----------
+// 元组就是一个匿名结构体：内部名字是 Tup__<各元素的类型编号>，字段名是 "0"、"1"…，
+// 所以构造、t.0、复制、释放、== 和 C 里按值存放都沿用结构体的那一套。
+
+fn tuple_of(inout c: Ctx, tys: [int]) -> int {
+    ids: [str] = []
+    for t in tys { ids.push(int_str(t)) }
+    name = "Tup__" + join(ids, "_")
+    if find_struct(c, name) < 0 {
+        fs: [str] = []
+        for k in 0..len(tys) { fs.push(int_str(k)) }
+        c.structs.push(SInfo(name: name, fnames: fs, ftys: tys.copy()))
+    }
+    intern(&c.tt, "struct", name, -1)
+}
+
+fn is_tuple(c: Ctx, t: int) -> bool {
+    t >= 0 && tkind(c, t) == "struct" && len(tname(c, t)) > 5 && slice(tname(c, t), 0, 5) == "Tup__"
+}
+
+fn tuple_elems(c: Ctx, t: int) -> [int] {
+    c.structs[find_struct(c, tname(c, t))].ftys.copy()
+}
+
+// "(int,[str])" → ["int", "[str]"]
+fn split_tuple(s: str) -> [str] {
+    out: [str] = []
+    d = 0
+    start = 1
+    for j in 1..len(s) - 1 {
+        b = byte_at(s, j)
+        if b == '(' || b == '[' {
+            d += 1
+        } else if b == ')' || b == ']' {
+            d -= 1
+        } else if b == ',' && d == 0 {
+            out.push(slice(s, start, j))
+            start = j + 1
+        }
+    }
+    out.push(slice(s, start, len(s) - 1))
+    out
+}
+
+fn resolve_tuple(inout c: Ctx, s: str, line: int, col: int) -> int {
+    parts = split_tuple(s)
+    tys: [int] = []
+    for p in parts {
+        t = resolve_ty(&c, p, line, col)
+        if unit_like(t) { fail(line, col, "元组的元素不能是 ()") }
+        no_fn(c, t, "元组的元素", line, col)
+        tys.push(t)
+    }
+    tuple_of(&c, tys)
+}
+
+// ---------- 拼写提示 ----------
+// 名字找不到时，在当前能用的名字里找编辑距离最小的一个，报错里加上“是不是想写 X？”。
+// 只在足够像的时候提示：距离不超过名字长度的三分之一（至少允许 1）。
+
+// 两个字符串的编辑距离（按字节：插入、删除、替换、交换相邻两个字节各算 1）
+fn edit_dist(a: str, b: str) -> int {
+    n = len(b)
+    pp: [int] = []       // 上上一行（算相邻交换用）
+    prev: [int] = []
+    for j in 0..n + 1 { prev.push(j) }
+    for i in 1..len(a) + 1 {
+        cur: [int] = [i]
+        for j in 1..n + 1 {
+            cost = if byte_at(a, i - 1) == byte_at(b, j - 1) { 0 } else { 1 }
+            x = prev[j] + 1
+            y = cur[j - 1] + 1
+            z = prev[j - 1] + cost
+            m = if x < y { x } else { y }
+            best = if m < z { m } else { z }
+            if i > 1 && j > 1 && byte_at(a, i - 1) == byte_at(b, j - 2) && byte_at(a, i - 2) == byte_at(b, j - 1) {
+                w = pp[j - 2] + 1
+                if w < best { best = w }
+            }
+            cur.push(best)
+        }
+        pp = replace(&prev, cur)
+    }
+    prev[n]
+}
+
+fn has_sub(s: str, sub: str) -> bool {
+    n = len(sub)
+    for i in 0..len(s) - n + 1 {
+        if slice(s, i, i + n) == sub { return true }
+    }
+    false
+}
+
+// 候选里最像 name 的一个；没有足够像的时为 ""。内部名字（泛型实例、重载的第二个起）不算。
+// 完全同名的模块里的项（距离 0）也会被提示出来
+fn closest(name: str, cands: [str]) -> str {
+    best = ""
+    limit = len(name) / 3
+    if limit < 1 { limit = 1 }
+    bd = limit + 1
+    for s in cands {
+        if s != name && !has_sub(s, "__") {
+            // 没写模块前缀时只比最后一段：dist2 能提示 geo.dist2
+            t = if has_dot(s) && !has_dot(name) { last_part(s) } else { s.copy() }
+            d = edit_dist(name, t)
+            if d < bd {
+                bd = d
+                best = s.copy()
+            }
+        }
+    }
+    best
+}
+
+// 报错信息后面接的提示（以“；”开头），没有时为 ""
+fn did_you_mean(name: str, cands: [str]) -> str {
+    s = closest(name, cands)
+    if s == "" { "" } else { "；是不是想写 #{s}？" }
+}
+
+fn builtin_names() -> [str] {
+    ["print", "eprint", "len", "byte_at", "slice", "from_byte", "int_str", "parse_int", "read_file",
+        "write_file", "args", "exit", "panic", "push", "pop", "try_pop", "insert_at", "remove_at", "reserve", "copy", "join", "system", "replace", "downcast",
+        "Some", "None", "Ok", "Err", "try_read_file", "try_parse_int", "share", "spawn", "chan", "mutex",
+        "send", "recv", "sleep_ms", "to_float", "to_int", "float_str", "parse_float", "try_parse_float", "to_u8", "wrap_u8", "try_u8", "to_u16", "wrap_u16", "try_u16", "to_u32", "wrap_u32", "try_u32", "to_i32", "wrap_i32", "try_i32", "to_bytes", "from_bytes",
+        "atan2", "float_pow", "sqrt", "floor", "ceil", "round", "trunc", "exp", "ln", "log10", "sin", "cos",
+        "tan", "asin", "acos", "atan", "try_getenv", "try_list_dir", "try_capture", "try_cwd", "try_write_file",
+        "try_append_file", "try_rename", "try_remove", "try_mkdir", "try_open", "try_fd_read", "try_fd_write", "try_fd_close", "try_tcp_connect", "try_tcp_listen", "try_tcp_accept", "try_sock_port", "try_sock_write", "try_sock_timeout", "file_kind", "run_cmd", "now_ms", "now_ns", "mono_ns", "assert", "assert_eq"]
+}
+
+// 当前作用域里的变量，加上常量
+fn var_cands(c: Ctx) -> [str] {
+    out = c.scope_names.copy()
+    for k in c.knames { out.push(last_part(k)) }
+    out
+}
+
+// 函数、结构体、变体、常量和内置函数的名字
+fn call_cands(c: Ctx) -> [str] {
+    out = builtin_names()
+    for f in c.fns { out.push(f.uname.copy()) }
+    for s in c.structs { out.push(s.name.copy()) }
+    for t in c.tdecls { out.push(t.name.copy()) }
+    for en in c.enums {
+        for v in en.variants { out.push(v.name.copy()) }
+    }
+    for k in c.knames { out.push(k.copy()) }
+    out
+}
+
+fn type_cands(c: Ctx) -> [str] {
+    out = ["int", "bool", "str", "float", "u8", "u16", "u32", "i32"]
+    for s in c.structs { out.push(s.name.copy()) }
+    for en in c.enums { out.push(en.name.copy()) }
+    for t in c.tdecls { out.push(t.name.copy()) }
+    out
+}
+
+// ---------- 警告：模块的使用 ----------
+
+// 在 line 所在的文件里用到了内部名 name：它属于别的模块时记下 “模块@文件序号”
+fn note_mod(inout c: Ctx, name: str, line: int) {
+    m = mod_part(name)
+    if m == "" || m == mod_of(c, line) { return }
+    key = "#{m}@#{line / 100000}"
+    if !has(c.umods, key) { c.umods.push(key) }
+}
+
+// ---------- 单元测试（lark1 --test，见 make unit-compiler） ----------
+
+test "类型表：常量求值的溢出判断" {
+    assert_eq(int_max(), 9223372036854775807)
+    assert_eq(int_min() + int_max(), -1)
+    assert(add_ok(int_max(), 0))
+    assert(!add_ok(int_max(), 1))
+    assert(!add_ok(int_min(), -1))
+    assert(sub_ok(0, int_max()))
+    assert(!sub_ok(int_min(), 1))
+    assert(mul_ok(3, -4))
+    assert(mul_ok(int_min(), 1))
+    assert(!mul_ok(int_max(), 2))
+    assert(!mul_ok(int_min(), -1))
+    assert(!mul_ok(-1, int_min()))
+}
+
+test "类型表：常量求值的位运算" {
+    assert_eq(const_bit("&", 12, 10), 8)
+    assert_eq(const_bit("|", 12, 10), 14)
+    assert_eq(const_bit("^", 12, 10), 6)
+    assert_eq(const_bit("&", -1, 5), 5)
+    assert_eq(const_bit("^", -1, 0), -1)
+    assert_eq(const_bit("&", int_min(), -1), int_min())
+    assert_eq(bit_not(0), -1)
+    assert_eq(bit_not(int_min()), int_max())
+    assert_eq(const_bit("<<", 1, 63), int_min())
+    assert_eq(const_bit("<<", 3, 62), 0 - 4611686018427387904)
+    assert_eq(const_bit(">>", -8, 1), -4)
+    assert_eq(const_bit(">>", -1, 63), -1)
+    assert_eq(const_bit(">>>", -1, 60), 15)
+    assert_eq(const_bit(">>>", int_min(), 63), 1)
+    assert_eq(const_bit("+%", int_max(), 1), int_min())
+    assert_eq(const_bit("+%", int_min(), -1), int_max())
+    assert_eq(const_bit("-%", int_min(), 1), int_max())
+    assert_eq(const_bit("-%", int_max(), -1), int_min())
+    assert_eq(const_bit("*%", int_max(), 2), -2)
+    assert_eq(const_bit("*%", -1, -1), 1)
+    assert_eq(const_bit("*%", 4294967296, 4294967296), 0)
+}
+
+test "类型表：列表小工具" {
+    assert_eq(fill(3, 0), [0, 0, 0])
+    assert(has(["a", "b"], "b"))
+    assert(!has([1, 2], 3))
+    assert_eq(index_where(["a", "b", "c"], |s| s == "c"), 2)
+    assert_eq(index_where([1, 2], |n| n > 5), -1)
+}
+
+test "类型表：解析和显示类型" {
+    no_toks: [Tok] = []
+    c = new_ctx(0, no_toks)
+    assert_eq(resolve_ty(&c, "int", 1, 1), 0)
+    assert_eq(resolve_ty(&c, "int!", 1, 1), 8)
+    assert_eq(resolve_ty(&c, "[str]", 1, 1), 6)
+    nested = resolve_ty(&c, "[[int?]]", 1, 1)
+    assert_eq(show_ty(c, nested), "[[int?]]")
+    // 同一个类型只登记一次
+    assert_eq(resolve_ty(&c, "[[int?]]", 1, 1), nested)
+    assert_eq(show_ty(c, 7), "str!")
+}
+
+test "类型表：内置函数" {
+    assert(is_builtin("print"))
+    assert(is_builtin("assert_eq"))
+    assert(!is_builtin("test"))
+    assert(is_os_builtin("try_capture"))
+    assert_eq(ext_c("c_int"), "int")
+    assert_eq(ext_c("[u8]"), "uint8_t*")
+    assert_eq(ext_c("Point"), "")
+    assert_eq(ext_lark("usize"), "int")
+    assert_eq(ext_lark("[u8]"), "[u8]")
+    assert(is_generic("builtin", "push"))
+    assert(!is_generic("fn", "push"))
+}

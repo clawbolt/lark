@@ -1,0 +1,92 @@
+// std/url 的测试：Go 的 QueryEscape / ParseQuery 的结果、出错信息的原文、随机字节的往返
+import "std/url"
+import "std/rand"
+
+test "escape_query" {
+    assert_eq(url.escape_query(""), "")
+    assert_eq(url.escape_query("AZaz09-._~"), "AZaz09-._~")
+    assert_eq(url.escape_query("a b&c=d/é"), "a+b%26c%3Dd%2F%C3%A9")
+    assert_eq(url.escape_query("云;+%"), "%E4%BA%91%3B%2B%25")
+    assert_eq(url.escape_query("\x00\xFF"), "%00%FF")
+}
+
+test "unescape_query" {
+    assert_eq(unq("a+b%26c%3dd"), "a b&c=d")
+    assert_eq(unq("%E4%BA%91"), "云")
+    assert_eq(unq(""), "")
+    assert_eq(unq("100%25"), "100%")
+    assert_eq(unq_err("%4"), "查询串 第 1 个字节：% 后面要两个十六进制数字")
+    assert_eq(unq_err("ab%zz"), "查询串 第 3 个字节：% 后面要两个十六进制数字")
+    assert_eq(unq_err("%"), "查询串 第 1 个字节：% 后面要两个十六进制数字")
+}
+
+test "format_query 和 parse_query" {
+    assert_eq(url.format_query([]), "")
+    assert_eq(url.format_query([("q", "云 雀"), ("n", "1")]), "q=%E4%BA%91+%E9%9B%80&n=1")
+    assert(pq("a=1&&b=%26&c") == [("a", "1"), ("b", "&"), ("c", "")])
+    assert(pq("") == [])
+    assert(pq("&&") == [])
+    assert(pq("=x") == [("", "x")])
+    assert(pq("a=b=c") == [("a", "b=c")])
+    assert(pq("n=1&n=2&n=1") == [("n", "1"), ("n", "2"), ("n", "1")])
+    assert_eq(pq_err("a=1;b=2"), "查询串 第 4 个字节：不能用 ; 分隔，要写成 &")
+    assert_eq(pq_err("a=1&b=%g1"), "查询串 第 7 个字节：% 后面要两个十六进制数字")
+    assert_eq(pq_err("a%=1"), "查询串 第 2 个字节：% 后面要两个十六进制数字")
+}
+
+test "随机字节的往返" {
+    r = rand.new(5)
+    wrong = 0
+    for _i in 0..300 {
+        ps: [(str, str)] = []
+        for _j in 0..r.range(0, 5) { ps.push((rand_str(&r), rand_str(&r))) }
+        s = url.format_query(ps)
+        if pq(s) != ps { wrong += 1 }
+        for (k, v) in ps {
+            if unq(url.escape_query(k)) != k || unq(url.escape_query(v)) != v { wrong += 1 }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+// 0..6 个随机字节，偏向 % + & = ; 空格这些要编码的
+fn rand_str(inout r: rand.Rng) -> str {
+    special = "%+&=; "
+    out: [u8] = []
+    for _i in 0..r.range(0, 7) {
+        if r.range(0, 2) == 0 {
+            out.push(byte_at(special, r.range(0, len(special))).wrap_u8())
+        } else {
+            out.push(r.range(0, 256).wrap_u8())
+        }
+    }
+    from_bytes(out)
+}
+
+fn unq(s: str) -> str {
+    match url.unescape_query(s) {
+        Ok(x) => x.copy()
+        Err(e) => panic(e)
+    }
+}
+
+fn unq_err(s: str) -> str {
+    match url.unescape_query(s) {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}
+
+fn pq(q: str) -> [(str, str)] {
+    match url.parse_query(q) {
+        Ok(ps) => ps.copy()
+        Err(e) => panic(e)
+    }
+}
+
+fn pq_err(q: str) -> str {
+    match url.parse_query(q) {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}

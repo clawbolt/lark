@@ -1,0 +1,28 @@
+// 基准：字符串的复制和释放。每构造一个 Rec 复制两个字符串（计数加一），释放时再减一；最后拼接六百万段
+type Rec {
+    name: str
+    tag: str
+}
+
+fn total_len(rs: [Rec]) -> int {
+    n = 0
+    for r in rs { n += len(r.name) + len(r.tag) }
+    n
+}
+
+fn main() {
+    names: [str] = []
+    for i in 0..1000 { names.push("名字#{i}") }
+    sum = 0
+    for r0 in 0..18000 {
+        rs: [Rec] = []
+        for k in 0..len(names) {
+            rs.push(Rec(name: names[k], tag: names[(k + r0) % len(names)]))
+        }
+        sum += total_len(rs)
+    }
+    parts: [str] = []
+    for i in 0..6000000 { parts.push(names[i % 1000]) }
+    s = join(parts, "")
+    print("#{sum} #{len(s)}")
+}

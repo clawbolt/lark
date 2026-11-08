@@ -1,0 +1,3 @@
+tests/err/lock_move.lark:3:20: 错误：xs 是借用的，不能移走；需要副本请写 xs.copy()
+ 3 |     lock m as xs { xs }
+   |                    ^

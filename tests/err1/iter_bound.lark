@@ -1,0 +1,6 @@
+// 期望错误：int 不是列表也不是迭代器，不满足 Iter
+import "std/iter"
+
+fn main() {
+    n = iter.count(5)
+}

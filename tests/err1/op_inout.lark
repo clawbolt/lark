@@ -1,0 +1,11 @@
+// 期望错误：运算符函数的参数只能是只读的
+type Vec {
+    x: int
+}
+
+fn add(inout a: Vec, b: Vec) -> Vec { Vec(x: a.x + b.x) }
+
+fn main() {
+    a = Vec(x: 1)
+    b = a + Vec(x: 2)
+}

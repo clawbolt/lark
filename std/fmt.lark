@@ -1,0 +1,204 @@
+// Lark 标准库 · 格式化（用 Lark 自己写）
+// 用法：import "std/fmt"
+//
+//   fmt.hex(255)               // "ff"
+//   fmt.bin(5)                 // "101"
+//   fmt.radix(-35, 36)         // "-z"
+//   fmt.thousands(1234567)         // "1,234,567"
+//   fmt.fixed(31416, 4)        // "3.1416"：整数按 10^digits 缩小后显示
+//   fmt.fixed(3.14159, 2)      // "3.14"：float 四舍五入到 digits 位小数
+//   fmt.width("中文ab")        // 6：终端里占几列（中日韩字符算两列）
+//   fmt.align_left(s, 8) / fmt.align_right(s, 8) / fmt.align_center(s, 8)   // 按显示宽度补空格
+//   fmt.table([["名字", "数量"], ["苹果", "3"]])          // 对齐的多行文本，第一行下面画分隔线
+//   fmt.byte_size(1536)            // "1.5 KiB"：字节数，按 1024 进位，保留一位小数
+
+import "std/utf8"
+
+// n 的 base 进制表示（2 <= base <= 36），字母用小写
+pub fn radix(n: int, base: int) -> str {
+    if base < 2 || base > 36 { panic("fmt.radix：进制要在 2 到 36 之间") }
+    if n == 0 { return "0" }
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    neg = n < 0
+    // 用负数累计，这样最小的 int 也不会溢出
+    k = if neg { n } else { -n }
+    out = ""
+    for k != 0 {
+        d = -(k % base)
+        out = slice(digits, d, d + 1) + out
+        k = k / base
+    }
+    if neg { "-" + out } else { out }
+}
+
+pub fn hex(n: int) -> str { radix(n, 16) }
+
+pub fn bin(n: int) -> str { radix(n, 2) }
+
+// 每三位加一个逗号
+pub fn thousands(n: int) -> str {
+    s = int_str(n)
+    start = if n < 0 { 1 } else { 0 }
+    body = slice(s, start, len(s))
+    out = ""
+    for i in 0..len(body) {
+        if i > 0 && (len(body) - i) % 3 == 0 { out += "," }
+        out += slice(body, i, i + 1)
+    }
+    if n < 0 { "-" + out } else { out }
+}
+
+// n / 10^digits，保留 digits 位小数（digits >= 0）
+pub fn fixed(n: int, digits: int) -> str {
+    if digits <= 0 { return int_str(n) }
+    s = int_str(n)
+    neg = n < 0
+    body = if neg { slice(s, 1, len(s)) } else { s }
+    for len(body) <= digits { body = "0" + body }
+    k = len(body) - digits
+    r = slice(body, 0, k) + "." + slice(body, k, len(body))
+    if neg { "-" + r } else { r }
+}
+
+// float 保留 digits 位小数（四舍五入，0.5 远离 0）：fmt.fixed(3.14159, 2) → "3.14"。
+// inf 和 nan 原样显示；|x| 乘以 10^digits 要在 int 的范围里
+pub fn fixed(x: float, digits: int) -> str {
+    if x - x != 0.0 { return float_str(x) }
+    if digits <= 0 { return int_str(to_int(round(x))) }
+    scale = 1.0
+    for _i in 0..digits { scale = scale * 10.0 }
+    fixed(to_int(round(x * scale)), digits)
+}
+
+// 显示宽度：按 UTF-8 解出每个字符（码点），中日韩文字、假名、谚文、全角符号和表情算两列，组合用的附加符号和零宽字符算 0 列，
+// 其余（包括 — … · → 这类标点）算一列。按 Unicode 东亚宽度表里“宽”和“全宽”的主要区间，不读系统的 locale。
+// 字符按 utf8.code_points 解：不合法的字节每个算一个 U+FFFD，占一列
+pub fn width(s: str) -> int {
+    w = 0
+    for cp in utf8.code_points(s) { w += char_width(cp) }
+    w
+}
+
+// 一个码点占几列
+pub fn char_width(cp: int) -> int {
+    if cp < 0x300 { return 1 }
+    if cp <= 0x36F || (cp >= 0x200B && cp <= 0x200F) || cp == 0xFE0F || (cp >= 0x20D0 && cp <= 0x20FF) { return 0 }
+    if cp < 0x1100 { return 1 }
+    if cp <= 0x115F || (cp >= 0x2E80 && cp <= 0x303E) || (cp >= 0x3041 && cp <= 0x33FF) || (cp >= 0x3400 && cp <= 0x4DBF) ||
+        (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xA000 && cp <= 0xA4CF) || (cp >= 0xAC00 && cp <= 0xD7A3) ||
+        (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFE30 && cp <= 0xFE4F) || (cp >= 0xFF00 && cp <= 0xFF60) ||
+        (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x1F300 && cp <= 0x1F64F) || (cp >= 0x1F900 && cp <= 0x1F9FF) ||
+        (cp >= 0x20000 && cp <= 0x3FFFD) {
+        return 2
+    }
+    1
+}
+
+fn spaces(n: int) -> str { repeat_byte(32, n) }
+
+pub fn align_left(s: str, w: int) -> str {
+    pad = w - width(s)
+    if pad <= 0 { s } else { s + spaces(pad) }
+}
+
+pub fn align_right(s: str, w: int) -> str {
+    pad = w - width(s)
+    if pad <= 0 { s } else { spaces(pad) + s }
+}
+
+pub fn align_center(s: str, w: int) -> str {
+    pad = w - width(s)
+    if pad <= 0 { return s }
+    a = pad / 2
+    spaces(a) + s + spaces(pad - a)
+}
+
+// 把若干行排成对齐的表格：列之间空两格，第一行（表头）下面画一行 -。
+// 全是数字（可以带 - . ,）的列靠右对齐，其它靠左。行可以长短不一：短的行只写到自己的最后一格，行尾不留空格。
+pub fn table(rows: [[str]]) -> str {
+    ncol = 0
+    for r in rows {
+        if len(r) > ncol { ncol = len(r) }
+    }
+    ws: [int] = []
+    nums: [bool] = []
+    for _j in 0..ncol {
+        ws.push(0)
+        nums.push(true)
+    }
+    for i in 0..len(rows) {
+        for j in 0..len(rows[i]) {
+            cw = width(rows[i][j])
+            if cw > ws[j] { ws[j] = cw }
+            if i > 0 && !numeric(rows[i][j]) { nums[j] = false }
+        }
+    }
+    lines: [str] = []
+    for i in 0..len(rows) {
+        cells: [str] = []
+        nc = len(rows[i])
+        for j in 0..nc {
+            cell = rows[i][j].copy()
+            last = j == nc - 1
+            if nums[j] && i > 0 {
+                cells.push(align_right(cell, ws[j]))
+            } else if last {
+                cells.push(cell)
+            } else {
+                cells.push(align_left(cell, ws[j]))
+            }
+        }
+        lines.push(join(cells, "  "))
+        if i == 0 && len(rows) > 1 {
+            total = 0
+            for j in 0..ncol { total += ws[j] }
+            total += 2 * (ncol - 1)
+            lines.push(repeat_byte('-', total))
+        }
+    }
+    join(lines, "\n")
+}
+
+fn numeric(s: str) -> bool {
+    if len(s) == 0 { return false }
+    for i in 0..len(s) {
+        b = byte_at(s, i)
+        ok = (b >= '0' && b <= '9') || b == '-' || b == '.' || b == ','
+        if !ok { return false }
+    }
+    true
+}
+
+fn repeat_byte(b: int, n: int) -> str {
+    bs: [u8] = []
+    if n <= 0 { return "" }
+    bs.reserve(n)
+    for _i in 0..n { bs.push(b.wrap_u8()) }
+    from_bytes(bs)
+}
+
+// 字节数写成人看的大小：不到 1024 时是 "512 B"，再往上是 KiB、MiB、GiB、TiB、PiB、EiB（保留一位小数，四舍五入，".0" 省掉）
+pub fn byte_size(n: int) -> str {
+    // 最小的 int 没有相反数，它正好是 -8 EiB
+    if n == -9223372036854775807 - 1 { return "-8 EiB" }
+    if n < 0 { return "-" + byte_size(0 - n) }
+    if n < 1024 { return "#{n} B" }
+    units = ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]
+    k = 0
+    div = 1024
+    for k + 1 < len(units) && n / div >= 1024 {
+        k += 1
+        div *= 1024
+    }
+    whole = n / div
+    // 余数先缩到 0..1023 再乘 10，大数也不会溢出
+    frac = (n % div) / (div / 1024)
+    tenth = (frac * 10 + 512) / 1024
+    if tenth == 10 {
+        whole += 1
+        tenth = 0
+    }
+    // 四舍五入进到 1024 时换下一个单位，比如 1048575 写成 "1 MiB" 而不是 "1024 KiB"
+    if whole == 1024 && k + 1 < len(units) { return "1 #{units[k + 1]}" }
+    if tenth == 0 { "#{whole} #{units[k]}" } else { "#{whole}.#{tenth} #{units[k]}" }
+}

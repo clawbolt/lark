@@ -1,0 +1,28 @@
+// 顶层常量 const（需要 lark1 及以后的版本）
+// const N = 值：值在编译时算出，只能是 int / bool / str；值里可以用字面量、别的常量（可以先使用后声明）、
+// 算术、比较、逻辑运算和字符串的 +。用到常量的地方直接换成它的值。模块里写 pub const 才能在外面用 m.N。
+// 编译：lark1 examples/consts.lark -o out.c
+import "modules/geo"
+
+const WIDTH = 8
+const HEIGHT = WIDTH / 2
+const AREA = WIDTH * HEIGHT
+const MAX_RETRY = 3
+const name = "云雀"
+const GREETING = "你好，" + name + "！"
+const BIG = AREA > 30 && !DEBUG      // 用到了后面才声明的 DEBUG
+const DEBUG = false
+const NEG = -AREA % 5
+
+fn main() {
+    print(GREETING)
+    print("#{WIDTH} × #{HEIGHT} = #{AREA}，大吗：#{BIG}")
+    for i in 0..MAX_RETRY {
+        print("第 #{i + 1} 次，共 #{MAX_RETRY} 次")
+    }
+    row = ""
+    for _x in 0..WIDTH { row = row + "#" }
+    print(row)
+    if !DEBUG { print("NEG = #{NEG}") }
+    print("模块里的常量：#{geo.ORIGIN_NAME}，#{geo.UNIT}")
+}

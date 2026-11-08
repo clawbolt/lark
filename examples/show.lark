@@ -1,0 +1,60 @@
+// 插值支持任意类型（需要 lark1 及以后的版本）
+// "#{x}"：int / bool / str 直接拼；其它类型调用 fn show(x: T) -> str（按类型重载，参数只读）。
+// 没写 show 的列表、T?、元组按元素拼：[1, 2]、Some(3) / None、(1, "甲")（容器里的字符串加引号）。
+// 结构体和枚举要自己写 show；写了之后它们放进列表、T?、元组里也能直接插值。
+// 编译：lark1 examples/show.lark -o out.c
+
+type Point {
+    x: int
+    y: int
+}
+
+fn show(p: Point) -> str { "(#{p.x}, #{p.y})" }
+
+enum Shape {
+    Circle(c: Point, r: int)
+    Rect(a: Point, b: Point)
+}
+
+fn show(s: Shape) -> str {
+    match s {
+        Circle(c, r) => "圆心 #{c} 半径 #{r}"
+        Rect(a, b) => "矩形 #{a}–#{b}"
+    }
+}
+
+// show 里也可以插值别的类型（这里是 [str]）
+type Bag {
+    items: [str]
+}
+
+fn show(b: Bag) -> str { "袋子里有 #{len(b.items)} 样：#{b.items}" }
+
+interface Show {
+    fn show(x: Self) -> str
+}
+
+fn describe[T: Show](x: T) -> str { "值是 #{x}" }
+
+fn main() {
+    p = Point(x: 1, y: 2)
+    print("点：#{p}")
+    ns = [1, 2, 3]
+    print("列表：#{ns}")
+    words = ["甲", "乙"]
+    print("字符串列表：#{words}")
+    m: int? = Some(3)
+    n: int? = None
+    print("可选值：#{m} #{n}")
+    t = (7, "七", true)
+    print("元组：#{t}")
+    shapes = [Circle(Point(x: 0, y: 0), 5), Rect(Point(x: 1, y: 1), Point(x: 4, y: 3))]
+    print("形状：#{shapes}")
+    nested = [[1], [2, 3], [4]]
+    print("嵌套：#{nested}")
+    found: Point? = Some(p.copy())
+    print("找到：#{found}")
+    bag = Bag(items: ["笔", "纸"])
+    print(bag.show())
+    print(describe(p))
+}

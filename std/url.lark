@@ -1,0 +1,108 @@
+// Lark 标准库 · URL 查询串（照 Go 的 net/url；先证明再写，见 formal/Lark/Url.lean）
+// 用法：import "std/url"
+//
+//   url.escape_query("a b&c")                     // "a+b%26c"
+//   url.unescape_query("a+b%26c")                 // str!：Ok("a b&c")
+//   url.format_query([("q", "云 雀"), ("n", "1")])  // "q=%E4%BA%91+%E9%9B%80&n=1"
+//   url.parse_query("q=a+b&n=1&n=2")              // [(str, str)]!：按原来的顺序，重复的键都留着
+//
+// 编码规则是 HTML 表单的 application/x-www-form-urlencoded（Go 的 QueryEscape）：
+// 字母、数字和 -._~ 不变，空格写成 +，别的字节写成 %XX（大写）；解码时 %XX 大小写都行。
+// 证明了：任何字节串 escape 再 unescape 回到原样；escape 的结果里没有 & = ;；
+// 任何键值对列表（可以有重复的键、空串、任意字节）format 再 parse 回到原样，顺序不变。
+// 和 Go 不同的地方：format_query 按给的顺序写，不按键排序；parse_query 返回列表，不是 Map。
+// 模块名和常用的变量名 url 重名，是 docs/std.md 第五节写明的例外。
+
+const HEX = "0123456789ABCDEF"
+
+// 字母、数字和 -._~ 不变，空格写成 +，别的字节写成 %XX
+pub fn escape_query(s: str) -> str {
+    out: [u8] = []
+    out.reserve(len(s))
+    for i in 0..len(s) {
+        c = byte_at(s, i)
+        if unreserved(c) {
+            out.push(c.wrap_u8())
+        } else if c == ' ' {
+            out.push(0x2B)
+        } else {
+            out.push(0x25)
+            out.push(byte_at(HEX, c / 16).wrap_u8())
+            out.push(byte_at(HEX, c % 16).wrap_u8())
+        }
+    }
+    from_bytes(out)
+}
+
+// %XX 解码，+ 是空格；% 后面不是两个十六进制数字时出错（“查询串 第 3 个字节：…”）。解出来的字节不检查 UTF-8
+pub fn unescape_query(s: str) -> str! { unescape_range(s, 0, len(s)) }
+
+// 每对写成 k=v（两边 escape_query），用 & 连起来；按给的顺序。空列表是 ""
+pub fn format_query(ps: [(str, str)]) -> str {
+    parts: [str] = []
+    for (k, v) in ps { parts.push(escape_query(k) + "=" + escape_query(v)) }
+    join(parts, "&")
+}
+
+// 按 & 切开，跳过空的段；每段在第一个 = 处分成键和值（没有 = 时值是 ""），两边 unescape_query。
+// 有 ; 时出错（照 Go 1.17：; 不再当分隔符）。出错的位置按整个 q 数
+pub fn parse_query(q: str) -> [(str, str)]! {
+    n = len(q)
+    semi = find_byte(q, ';', 0, n)
+    if semi < n { return Err("查询串 第 #{semi + 1} 个字节：不能用 ; 分隔，要写成 &") }
+    out: [(str, str)] = []
+    start = 0
+    for start <= n {
+        end = find_byte(q, '&', start, n)
+        if end > start {
+            eq = find_byte(q, '=', start, end)
+            k = unescape_range(q, start, eq)?
+            v = ""
+            if eq < end { v = unescape_range(q, eq + 1, end)? }
+            out.push((k, v))
+        }
+        start = end + 1
+    }
+    Ok(out)
+}
+
+// 对应 formal/Lark/Url.lean 的 unres
+fn unreserved(c: int) -> bool {
+    (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~'
+}
+
+// 对应 hexv；不是十六进制数字时 -1
+fn hex_val(c: int) -> int {
+    if c >= '0' && c <= '9' { return c - '0' }
+    if c >= 'A' && c <= 'F' { return c - 'A' + 10 }
+    if c >= 'a' && c <= 'f' { return c - 'a' + 10 }
+    -1
+}
+
+// s[start..end) 里第一个字节 c 的位置，没有时是 end
+fn find_byte(s: str, c: int, start: int, end: int) -> int {
+    i = start
+    for i < end && byte_at(s, i) != c { i += 1 }
+    i
+}
+
+// 对应 unesc：解 s[start..end)，出错的位置按整个 s 数
+fn unescape_range(s: str, start: int, end: int) -> str! {
+    out: [u8] = []
+    out.reserve(end - start)
+    i = start
+    for i < end {
+        c = byte_at(s, i)
+        if c == '%' {
+            hi = if i + 1 < end { hex_val(byte_at(s, i + 1)) } else { -1 }
+            lo = if i + 2 < end { hex_val(byte_at(s, i + 2)) } else { -1 }
+            if hi < 0 || lo < 0 { return Err("查询串 第 #{i + 1} 个字节：% 后面要两个十六进制数字") }
+            out.push((hi * 16 + lo).wrap_u8())
+            i += 3
+        } else {
+            if c == '+' { out.push(0x20) } else { out.push(c.wrap_u8()) }
+            i += 1
+        }
+    }
+    Ok(from_bytes(out))
+}

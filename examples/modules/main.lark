@@ -1,0 +1,24 @@
+// import 与命名空间：lark1 examples/modules/main.lark -o out.c（需要 lark1 及以后的版本）
+// 路径相对于本文件所在目录，找不到再相对于当前目录（所以 "std/str" 在仓库根目录下能找到）。
+// 模块名就是文件名：geo.Vec2、geo.add、str.words；方法调用 a.add(b) 按 a 的类型找到 geo 模块。
+import "geo"
+import "std/str"
+
+// 根模块里可以有同名的函数，和 geo.add 互不干扰
+fn add(a: int, b: int) -> int { a + b }
+
+fn main() {
+    a = geo.Vec2(x: 1, y: 2)
+    b = geo.add(a, geo.Vec2(x: 3, y: 4))
+    c = b.add(geo.Vec2(x: 10, y: 10))
+    print("b = (#{b.x}, #{b.y})，c = (#{c.x}, #{c.y})，距离的平方：#{geo.dist2(a, b)}")
+    print("根模块的 add：#{add(1, 2)}")
+    for w in str.words("  模块 只 导出 pub 的项  ") {
+        print(w)
+    }
+    match geo.classify(b) {
+        Origin => print("原点")
+        geo.OnAxis(n) => print("在坐标轴上：#{n}")
+        Other => print("其它位置")
+    }
+}

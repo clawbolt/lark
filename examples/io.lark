@@ -1,0 +1,78 @@
+// std/io：带缓冲的按行读、写（需要 lark1 及以后的版本）
+// 在临时目录（$TMPDIR，没有时用 /tmp）里写一个文件再读回来，最后删掉
+import "std/io"
+import "std/os"
+import "std/time"
+
+fn read_lines(path: str) -> [str]! {
+    r = io.open(path)?
+    out: [str] = []
+    for true {
+        line = match r.read_line() {
+            Some(s) => s
+            None => break
+        }
+        out.push(line)
+    }
+    if r.last_error() != "" { return Err(r.last_error()) }
+    r.close()?
+    Ok(out)
+}
+
+fn add_mark(path: str) -> ()! {
+    a = io.open_append(path)?
+    a.write("！")?
+}
+
+fn demo(path: str) -> ()! {
+    // 写 30000 行，超过 64KB 的缓冲区好几次：有的行会被切在两块之间
+    w = io.create(path)?
+    for i in 0..30000 { w.write_line("第 #{i} 行")? }
+    w.close()?
+    lines = read_lines(path)?
+    ok = len(lines) == 30000
+    total = 0
+    for i in 0..len(lines) {
+        if lines[i] != "第 #{i} 行" { ok = false }
+        total += len(lines[i])
+    }
+    print("读回 #{len(lines)} 行，共 #{total} 字节（不含换行），每行都对：#{ok}")
+
+    // \r\n 结尾的行、空行、最后一行没有换行
+    os.write(path, "甲\r\n\n乙\n丙")?
+    got = read_lines(path)?
+    print("逐行：#{got}")
+    r = io.open(path)?
+    first = r.read_line() ?? ""
+    rest = r.read_all()?
+    print("先读一行 #{first}，剩下 #{len(rest)} 字节")
+
+    // 追加；add_mark 里没有调用 close，函数结束时自动写出并关闭
+    add_mark(path)?
+    after = os.read(path)?
+    print("追加之后 #{len(after)} 字节")
+
+    // stdout 的 Writer：内容在 flush 时才写出去，所以 print 的那行在前面
+    out = io.stdout()
+    out.write("缓冲的一行\n")?
+    print("这行在前面")
+    out.flush()?
+    Ok()
+}
+
+fn main() {
+    tmp = os.env("TMPDIR") ?? "/tmp"
+    path = os.join_path(tmp, "lark_io_demo_#{time.unix_ms()}.txt")
+    match demo(path) {
+        Ok => print("完成")
+        Err(e) => print("出错：#{e}")
+    }
+    match io.open(os.join_path(tmp, "lark_io_no_such_file")) {
+        Ok(_) => print("不应该打开")
+        Err(e) => print("打不开的文件报错了：#{len(e) > 0}")
+    }
+    match os.remove(path) {
+        Ok => print("删掉了")
+        Err(e) => print("删除失败：#{e}")
+    }
+}

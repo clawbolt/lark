@@ -1,0 +1,74 @@
+// std/sort 的边界：空列表、一个元素、重复的元素、稳定性、大量随机数据
+import "std/sort"
+import "std/rand"
+
+test "边界" {
+    e: [int] = []
+    sort.sort(&e)
+    assert_eq(len(e), 0)
+    one = [7]
+    sort.sort(&one)
+    assert(one == [7])
+    assert(sort.is_sorted(e))
+    assert(sort.is_sorted([1, 1, 1]))
+    assert(!sort.is_sorted([2, 1]))
+    assert_eq(sort.min_of(e) ?? -1, -1)
+    assert_eq(sort.max_of(e) ?? -1, -1)
+    assert_eq(sort.min_of([3, -1, 2]) ?? 0, -1)
+    assert_eq(sort.max_of(["b", "c", "a"]) ?? "", "c")
+    assert(sort.reversed([1, 2, 3]) == [3, 2, 1])
+    // 字符串按字节比较
+    assert(sort.sorted(["b", "a", "云", "B"]) == ["B", "a", "b", "云"])
+    assert(sort.sorted([3.5, -1.0, 2.0]) == [-1.0, 2.0, 3.5])
+}
+
+test "稳定和大量数据" {
+    // 按长度排：长度相同的保持原来的先后
+    ws = ["ccc", "a", "bb", "b", "aa", "c"]
+    ys = sort.sorted_by(ws, |x, y| len(x) - len(y))
+    assert(ys == ["a", "b", "c", "bb", "aa", "ccc"])
+    r = rand.new(7)
+    xs: [int] = []
+    for _i in 0..5000 { xs.push(r.range(-100, 100)) }
+    total = 0
+    for x in xs { total += x }
+    sort.sort(&xs)
+    assert(sort.is_sorted(xs))
+    assert_eq(len(xs), 5000)
+    after = 0
+    for x in xs { after += x }
+    assert_eq(after, total)
+    sort.sort_by(&xs, |a, b| b - a)
+    assert_eq(xs[0], sort.max_of(xs) ?? 0)
+    assert_eq(xs[4999], sort.min_of(xs) ?? 0)
+}
+
+test "二分查找和去重" {
+    xs = [1, 3, 3, 3, 5, 8]
+    assert_eq(sort.lower_bound(xs, 3), 1)
+    assert_eq(sort.upper_bound(xs, 3), 4)
+    assert_eq(sort.lower_bound(xs, 0), 0)
+    assert_eq(sort.lower_bound(xs, 9), 6)
+    assert_eq(sort.upper_bound(xs, 8), 6)
+    assert_eq(sort.lower_bound(xs, 4), 4)
+    assert_eq(sort.binary_search(xs, 3) ?? -1, 1)
+    assert_eq(sort.binary_search(xs, 8) ?? -1, 5)
+    assert_eq(sort.binary_search(xs, 4) ?? -1, -1)
+    assert_eq(sort.binary_search(xs, 99) ?? -1, -1)
+    e: [int] = []
+    assert_eq(sort.lower_bound(e, 1), 0)
+    assert_eq(sort.binary_search(e, 1) ?? -1, -1)
+    names = ["amy", "bob", "eve"]
+    assert_eq(sort.binary_search(names, "eve") ?? -1, 2)
+    assert_eq(sort.lower_bound(names, "carl"), 2)
+    // 去重：只去掉相邻的；先排序就是全部去重
+    ys = [1, 1, 2, 1, 1, 3, 3]
+    sort.dedup(&ys)
+    assert(ys == [1, 2, 1, 3])
+    ws = ["b", "a", "b", "c", "a"]
+    sort.sort(&ws)
+    sort.dedup(&ws)
+    assert(ws == ["a", "b", "c"])
+    sort.dedup(&e)
+    assert_eq(len(e), 0)
+}

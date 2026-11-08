@@ -1,0 +1,9 @@
+// 期望错误：Pair 需要 2 个类型实参
+type Pair[A, B] {
+    a: A
+    b: B
+}
+
+fn first(p: Pair[int]) -> int { p.a }
+
+fn main() {}

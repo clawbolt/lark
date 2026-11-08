@@ -1,0 +1,3 @@
+tests/err/lock_not_mutex.lark:4:10: 错误：lock 需要 Mutex[T]，而不是 [int]
+ 4 |     lock xs as v { print("#{len(v)}") }
+   |          ^

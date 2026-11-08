@@ -1,0 +1,54 @@
+// rt deep       主线程上递归太深：打印“栈溢出”和调用栈，退出码 101（以前是不留任何提示地被系统杀掉）
+// rt deep-task  任务的栈上递归太深：同上
+// rt stdin      一个任务等着读标准输入（管道）时，别的任务照常运行：只有一个工作线程时也一样
+import "std/io"
+
+// 调用之后还要释放 xs，C 编译器不能把递归改成循环
+fn down(n: int) -> int {
+    if n < 0 { return 0 }
+    xs = [n]
+    down(n + 1) + len(xs)
+}
+
+fn dive(take n: int) {
+    print("不会执行到这里：#{down(n)}")
+}
+
+fn reader(take out: Chan[str]) {
+    r = io.stdin()
+    s = r.read_all() ?? "<读取失败>"
+    out.send("读到 #{len(s)} 个字节")
+}
+
+fn ticker(take out: Chan[str]) {
+    for i in 0..3 {
+        sleep_ms(100)
+        out.send("第 #{i + 1} 次")
+    }
+}
+
+fn main() {
+    a = args()
+    mode = if len(a) > 1 { a[1].copy() } else { "" }
+    print("开始")
+    if mode == "deep" {
+        print("不会执行到这里：#{down(0)}")
+    } else if mode == "deep-task" {
+        scope {
+            spawn(dive, 0)
+        }
+    } else if mode == "stdin" {
+        ch: Chan[str] = chan()
+        scope {
+            spawn(reader, ch.copy())
+            spawn(ticker, ch.copy())
+        }
+        for {
+            r = ch.recv()
+            match r {
+                Some(m) => print(m)
+                None => break
+            }
+        }
+    }
+}

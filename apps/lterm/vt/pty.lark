@@ -1,0 +1,61 @@
+// 伪终端和外面真的终端（lterm run 用；没有证明，tests.lark 里不测，要在真的终端里试）。
+// 伪终端的几个函数在 native/pty.c；外面终端的原始模式、大小、SIGWINCH 用运行时里的 lark_term_*（和 std/term 一样，
+// 这里不能 import "std/term"：它和 vt/term 同名）。
+extern "c" {
+    fn lterm_spawn(cmd: str, rows: c_int, cols: c_int) -> c_int
+    fn lterm_resize(fd: c_int, rows: c_int, cols: c_int) -> c_int
+    fn lterm_poll(a: c_int, b: c_int, ms: c_int) -> c_int
+    fn lterm_exited() -> c_int
+    fn isatty(fd: c_int) -> c_int
+    fn strerror(e: c_int) -> str
+    fn lark_term_raw(tenths: c_int) -> c_int
+    fn lark_term_restore() -> c_int
+    fn lark_term_size(fd: c_int) -> int
+    fn lark_term_resizes() -> int
+}
+
+// 在伪终端里跑 cmd（空串时跑 $SHELL），返回主端的文件描述符
+pub fn spawn(cmd: str, rows: int, cols: int) -> int! {
+    fd = lterm_spawn(cmd, rows, cols)
+    if fd < 0 { return Err("开伪终端失败：#{strerror(0 - fd)}") }
+    Ok(fd)
+}
+
+pub fn resize(fd: int, rows: int, cols: int) { _e = lterm_resize(fd, rows, cols) }
+
+// 等标准输入和伪终端最多 ms 毫秒：(标准输入能读了, 伪终端能读了)
+pub fn wait(fd: int, ms: int) -> (bool, bool) {
+    r = lterm_poll(0, fd, ms)
+    if r < 0 { return (false, false) }
+    ((r & 1) != 0, (r & 2) != 0)
+}
+
+// 只等伪终端（lterm app 用：键盘从窗口来，不看标准输入；poll 不管负的文件描述符）
+pub fn ready(fd: int, ms: int) -> bool {
+    r = lterm_poll(-1, fd, ms)
+    r > 0 && (r & 2) != 0
+}
+
+pub fn exited() -> bool { lterm_exited() == 1 }
+
+pub fn is_tty(fd: int) -> bool { isatty(fd) == 1 }
+
+// 外面终端的大小（行, 列）
+pub fn size() -> (int, int)? {
+    for fd in [1, 0, 2] {
+        v = lark_term_size(fd)
+        if v >= 0 { return Some((v >> 16, v & 0xFFFF)) }
+    }
+    None
+}
+
+// 原始模式：按一个键就能读到、不回显，Ctrl-C 也当作字节交给 shell
+pub fn raw() -> ()! {
+    e = lark_term_raw(0)
+    if e != 0 { return Err("进入原始模式失败：#{strerror(e)}") }
+    Ok()
+}
+
+pub fn restore() { _e = lark_term_restore() }
+
+pub fn resized() -> bool { lark_term_resizes() > 0 }

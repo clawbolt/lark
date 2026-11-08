@@ -1,0 +1,6 @@
+﻿ // 文件开头有 UTF-8 BOM（EF BB BF）：编译器跳过它（需要 lark1 及以后的版本）
+// 编译：lark1 examples/bom.lark -o out.c
+
+fn main() {
+    print("开头的 BOM 跳过了")
+}

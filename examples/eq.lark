@@ -1,0 +1,62 @@
+// 结构体、枚举、列表、T? 的 ==（需要 lark1 及以后的版本）
+// 按值逐个比较；函数类型以外的类型都满足 Eq。
+// 用 Map 时还要 Hash：自己写一个 fn hash(p: Point) -> int 就行。
+// 编译：lark1 examples/eq.lark -o out.c
+import "std/map"
+
+type Point {
+    x: int
+    y: int
+}
+
+enum Shape {
+    Circle(c: Point, r: int)
+    Poly(pts: [Point])
+    Empty
+}
+
+fn hash(p: Point) -> int { hash(p.x * 31 + p.y) }
+
+fn index_of[T: Eq](xs: [T], x: T) -> int {
+    for i in 0..len(xs) {
+        if xs[i] == x { return i }
+    }
+    -1
+}
+
+fn main() {
+    a = Point(x: 1, y: 2)
+    b = Point(x: 1, y: 2)
+    c = Point(x: 2, y: 1)
+    r1 = a == b
+    r2 = a != c
+    print("结构体：#{r1} #{r2}")
+
+    s1 = Poly([a.copy(), c.copy()])
+    s2 = Poly([b.copy(), c.copy()])
+    s3 = Circle(a.copy(), 3)
+    r3 = s1 == s2
+    r4 = s1 == s3
+    r5 = Empty == Empty
+    print("枚举：#{r3} #{r4} #{r5}")
+
+    r6 = [1, 2, 3] == [1, 2, 3]
+    r7 = ["甲"] == ["甲", "乙"]
+    print("列表：#{r6} #{r7}")
+
+    n1: int? = 5
+    n2: int? = None
+    r8 = n1 == n2
+    r9 = n2 == None
+    print("可选值：#{r8} #{r9}")
+
+    pts = [a.copy(), c.copy()]
+    i = index_of(pts, c)
+    print("c 在第 #{i} 个")
+
+    // 结构体当 Map 的键
+    names: map.Map[Point, str] = map.new()
+    names.insert(a.copy(), "起点")
+    names.insert(c.copy(), "终点")
+    print("b 是：#{names.get(b) ?? "？"}")
+}

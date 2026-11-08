@@ -1,0 +1,119 @@
+// std/zlib 的测试：三种格式来回一趟、和系统的 gzip 互相解对方写的、压缩率、坏数据
+import "std/zlib"
+import "std/proc"
+import "std/str"
+
+fn back(r: [u8]!) -> [u8] {
+    match r {
+        Ok(b) => b.copy()
+        Err(e) => panic(e)
+    }
+}
+
+fn err_of(r: [u8]!) -> str {
+    match r {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}
+
+// 有重复也有变化的文字：像源码和日志那样能压得很小
+fn sample(n: int) -> [u8] {
+    s = ""
+    i = 0
+    for len(s) < n {
+        s += "第 #{i} 行：fn f#{i % 17}(x: int) -> int { x * #{i % 5} }\n"
+        i += 1
+    }
+    slice(s, 0, n).to_bytes()
+}
+
+test "来回一趟" {
+    for n in [0, 1, 2, 3, 100, 258, 259, 32768, 40000, 200000] {
+        d = sample(n)
+        assert(back(zlib.decompress(zlib.compress(d))) == d)
+        assert(back(zlib.gunzip(zlib.gzip(d))) == d)
+        assert(back(zlib.inflate(zlib.deflate(d))) == d)
+    }
+    // 很长的重复（距离 1，长度 258 一段接一段）和压不小的数据
+    same: [u8] = []
+    for _i in 0..100000 { same.push(0x61) }
+    assert(back(zlib.decompress(zlib.compress(same))) == same)
+    noise: [u8] = []
+    x = 12345
+    for _i in 0..70000 {
+        x = (x * 1103515245 + 12345) & 0x7FFF_FFFF
+        noise.push((x >>> 16).wrap_u8())
+    }
+    z = zlib.compress(noise)
+    // 压不小时改用不压缩的块：多出来的只有头、块头和校验和
+    assert(len(z) <= len(noise) + 2 * 5 + 6)
+    assert(back(zlib.decompress(z)) == noise)
+}
+
+test "压缩率" {
+    d = sample(100000)
+    assert(len(zlib.compress(d)) * 3 < len(d))
+    same: [u8] = []
+    for _i in 0..100000 { same.push(0x61) }
+    assert(len(zlib.compress(same)) < 1000)
+}
+
+test "和系统的 gzip 互相解" {
+    d = sample(50000)
+    // 我们写的，gzip -d 解得开
+    o = match take proc.run_with(["gzip", "-dc"], from_bytes(zlib.gzip(d)), "") {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    assert_eq(o.code, 0)
+    assert(o.out.to_bytes() == d)
+    // gzip -9 写的（动态 Huffman 码），我们解得开；两段连在一起的也行
+    g = match take proc.run_with(["gzip", "-9c"], from_bytes(d.copy()), "") {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    assert_eq(g.code, 0)
+    assert(back(zlib.gunzip(g.out.to_bytes())) == d)
+    two = back(zlib.gunzip((g.out + from_bytes(zlib.gzip("尾巴".to_bytes()))).to_bytes()))
+    assert(str.ends_with(from_bytes(two), "尾巴"))
+    assert_eq(len(two), len(d) + len("尾巴"))
+}
+
+test "坏数据" {
+    z = zlib.compress("一段文字".to_bytes())
+    z[len(z) - 1] = z[len(z) - 1] ^ 1
+    // 出错信息写明第几个字节：zlib 的校验和是最后 4 个字节，gzip 的是倒数第 8 到第 5 个
+    assert_eq(err_of(zlib.decompress(z)), "zlib 第 #{len(z) - 3} 个字节：校验和不对，数据坏了")
+    g = zlib.gzip("一段文字".to_bytes())
+    g[len(g) - 5] = g[len(g) - 5] ^ 1
+    assert_eq(err_of(zlib.gunzip(g)), "gzip 第 #{len(g) - 7} 个字节：校验和不对，数据坏了")
+    assert_eq(err_of(zlib.gunzip("不是 gzip 数据，长度也够了".to_bytes())), "gzip 第 1 个字节：头不对（不是 gzip 数据）")
+    assert_eq(err_of(zlib.decompress([0x78, 0x9c])), "zlib：数据太短")
+    // 只剩一半
+    h = zlib.compress(sample(1000))
+    cut: [u8] = []
+    for k in 0..len(h) / 2 { cut.push(h[k]) }
+    e = err_of(zlib.decompress(cut))
+    assert(str.starts_with(e, "deflate 第 ") && str.ends_with(e, " 个字节：数据提前结束"))
+    assert_eq(zlib.adler32("Wikipedia".to_bytes()), 0x11E60398)
+}
+
+test "解压上限" {
+    // 10 万个 0 压成几百字节；上限 1000 时报错，不把整段解出来
+    zeros: [u8] = []
+    for _i in 0..100_000 { zeros.push(0) }
+    g = zlib.gzip(zeros)
+    assert(len(g) < 1000)
+    assert(str.contains(err_of(zlib.gunzip_max(g, 1000)), "解出来超过"))
+    assert(str.contains(err_of(zlib.decompress_max(zlib.compress(zeros), 99_999)), "解出来超过"))
+    assert(str.contains(err_of(zlib.inflate_max(zlib.deflate(zeros), 10)), "解出来超过"))
+    // 刚好等于上限可以；几段连在一起时上限管总长
+    assert_eq(len(back(zlib.inflate_max(zlib.deflate(zeros), 100_000))), 100_000)
+    two: [u8] = []
+    for b in g { two.push(b) }
+    for b in g { two.push(b) }
+    assert_eq(len(back(zlib.gunzip_max(two, 200_000))), 200_000)
+    assert(str.contains(err_of(zlib.gunzip_max(two, 199_999)), "解出来超过"))
+    assert_eq(zlib.MAX_OUT, 256 << 20)
+}

@@ -1,0 +1,10 @@
+// 期望错误：第二个实参（一个块）把 v 移走了，同时 &v 又借给了被调用的函数
+fn f(inout a: [int], b: [int]) {
+    a.push(len(b))
+}
+
+fn main() {
+    v = [1, 2]
+    f(&v, { v })
+    print("#{v}")
+}

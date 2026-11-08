@@ -1,0 +1,87 @@
+// dyn 值的比较和取回具体类型（需要 lark1 及以后的版本）
+// match 里的类型模式 r: Rect 借用 dyn 里装的值；d.downcast() 得到一份副本（T?）；
+// 两个 dyn 值用 == 比较：装的类型不同就不相等，相同时比较里面的值。
+
+interface Shape {
+    fn area(s: Self) -> int
+}
+
+type Rect {
+    w: int
+    h: int
+}
+
+type Circle {
+    r: int
+}
+
+type Dot {
+    x: int
+}
+
+fn area(s: Rect) -> int { s.w * s.h }
+
+fn area(s: Circle) -> int { 3 * s.r * s.r }
+
+fn area(s: Dot) -> int { s.x * 0 }
+
+fn area(s: str) -> int { len(s) }
+
+fn describe(s: dyn Shape) -> str {
+    d = match s {
+        r: Rect => "矩形 #{r.w}x#{r.h}"
+        c: Circle => "圆 r=#{c.r}"
+        _: str => "字符串，面积 #{s.area()}"
+        _ => "别的形状"
+    }
+    d
+}
+
+fn is_round(s: dyn Shape) -> bool {
+    b = match s {
+        _: Circle | _: Dot => true
+        _ => false
+    }
+    b
+}
+
+fn main() {
+    shapes: [dyn Shape] = [Rect(w: 2, h: 3), Circle(r: 2), "lark", Dot(x: 1)]
+    for s in shapes {
+        print("#{describe(s)}，圆的：#{is_round(s)}")
+    }
+
+    // downcast：类型对上时得到 Some(副本)，否则 None；要转成的类型由标注给出
+    r: Rect? = shapes[0].downcast()
+    match r {
+        Some(x) => print("第 0 个是矩形，宽 #{x.w}")
+        None => print("第 0 个不是矩形")
+    }
+    c: Circle? = shapes[0].downcast()
+    is_c = match c {
+        Some(_) => true
+        None => false
+    }
+    print("第 0 个是圆吗：#{is_c}")
+    t: str? = shapes[2].downcast()
+    match t {
+        Some(x) => print("第 2 个的字符串：#{x}")
+        None => print("第 2 个不是字符串")
+    }
+
+    // 嵌在别的模式里也可以
+    first: dyn Shape? = Some(shapes[0].copy())
+    match first {
+        Some(q: Rect) => print("Some 里是矩形 #{q.w}x#{q.h}")
+        Some(_) => print("Some 里是别的")
+        None => print("没有")
+    }
+
+    // ==：同类型同值才相等
+    a: dyn Shape = Rect(w: 2, h: 3)
+    b: dyn Shape = Rect(w: 2, h: 3)
+    e: dyn Shape = Rect(w: 3, h: 2)
+    f: dyn Shape = Circle(r: 2)
+    print("a == b：#{a == b}，a == e：#{a == e}，a == f：#{a == f}，a != f：#{a != f}")
+    print("列表里的圆 == f：#{shapes[1] == f}，自己 == 自己：#{shapes[2] == shapes[2]}")
+}

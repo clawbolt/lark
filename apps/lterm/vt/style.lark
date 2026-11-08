@@ -1,0 +1,217 @@
+// 颜色和样式（SGR，CSI … m）：0 复位，1 粗体，31 红字，38;5;208 256 色里的第 208 个，48;2;r;g;b 真彩色背景……
+// 先证明再写：对应 formal/Lark/VtSgr.lean，函数和定义一一对应：
+//   Color ↔ Color、color_ok ↔ colorOk、Sty ↔ Sty、dflt ↔ dflt、ok ↔ Ok、set_c ↔ setC、one ↔ one、
+//   X ↔ X（Plain ↔ none、Pick ↔ pick、Index ↔ idx、Red / Green / Blue ↔ r / g / b、Dead ↔ dead）、step ↔ step、run ↔ run、apply ↔ apply。
+// 证明了：任何参数序列以后颜色都在范围里，不合法的颜色不会写进去（one_ok、step_ok、run_ok、apply_ok）；
+// 参数分两段走结果一样（run_append）；CSI m 和 CSI 0 m 都复位（apply_nil、apply_zero）。
+// 屏幕上每一格的样式存成一个整数（pack / unpack，没有证明，tests.lark 里检查来回一样）：
+//   低 8 位是粗体、暗淡、斜体、下划线、闪烁、反显、隐藏、删除线；之后 26 位前景色、26 位背景色；
+//   颜色：0 默认，1 << 24 | 下标，2 << 24 | r << 16 | g << 8 | b。默认样式是 0。
+// sgr 把样式写回成一个 CSI … m（lterm --ansi 用它把屏幕带着颜色写出来）。
+// 没做：冒号的子参数（38:2::r:g:b，解析器把 : 当成 ;，所以会读错）；21 双下划线、53 上划线这些不常用的。
+
+pub enum Color {
+    Dflt                          // 默认色
+    Idx(n: int)                   // 256 色：0–7 普通、8–15 亮色、16–255
+    Rgb(r: int, g: int, b: int)   // 真彩色
+}
+
+pub fn color_ok(c: Color) -> bool {
+    match c {
+        Dflt => true
+        Idx(n) => n >= 0 && n < 256
+        Rgb(r, g, b) => r >= 0 && r < 256 && g >= 0 && g < 256 && b >= 0 && b < 256
+    }
+}
+
+pub type Sty {
+    pub fg: Color
+    pub bg: Color
+    pub bold: bool
+    pub dim: bool
+    pub italic: bool
+    pub under: bool
+    pub blink: bool
+    pub inverse: bool
+    pub hidden: bool
+    pub strike: bool
+}
+
+pub fn dflt() -> Sty {
+    Sty(fg: Dflt, bg: Dflt, bold: false, dim: false, italic: false, under: false, blink: false, inverse: false, hidden: false, strike: false)
+}
+
+pub fn ok(s: Sty) -> bool { color_ok(s.fg) && color_ok(s.bg) }
+
+// 改前景色（true）或者背景色（false）（setC）
+fn set_c(inout s: Sty, fg: bool, c: Color) {
+    if fg { s.fg = c.copy() } else { s.bg = c.copy() }
+}
+
+// 一个普通的参数（one）
+fn one(inout s: Sty, p: int) {
+    if p == 0 {
+        s = dflt()
+    } else if p == 1 {
+        s.bold = true
+    } else if p == 2 {
+        s.dim = true
+    } else if p == 3 {
+        s.italic = true
+    } else if p == 4 {
+        s.under = true
+    } else if p == 5 {
+        s.blink = true
+    } else if p == 7 {
+        s.inverse = true
+    } else if p == 8 {
+        s.hidden = true
+    } else if p == 9 {
+        s.strike = true
+    } else if p == 22 {
+        s.bold = false
+        s.dim = false
+    } else if p == 23 {
+        s.italic = false
+    } else if p == 24 {
+        s.under = false
+    } else if p == 25 {
+        s.blink = false
+    } else if p == 27 {
+        s.inverse = false
+    } else if p == 28 {
+        s.hidden = false
+    } else if p == 29 {
+        s.strike = false
+    } else if 30 <= p && p <= 37 {
+        set_c(&s, true, Idx(p - 30))
+    } else if p == 39 {
+        set_c(&s, true, Dflt)
+    } else if 40 <= p && p <= 47 {
+        set_c(&s, false, Idx(p - 40))
+    } else if p == 49 {
+        set_c(&s, false, Dflt)
+    } else if 90 <= p && p <= 97 {
+        set_c(&s, true, Idx(p - 90 + 8))
+    } else if 100 <= p && p <= 107 {
+        set_c(&s, false, Idx(p - 100 + 8))
+    }
+}
+
+// 是不是在读扩展色；fg：读的是前景色（38）还是背景色（48）
+pub enum X {
+    Plain
+    Pick(fg: bool)
+    Index(fg: bool)
+    Red(fg: bool)
+    Green(fg: bool, r: int)
+    Blue(fg: bool, r: int, g: int)
+    Dead
+}
+
+// step：s 跟着改，返回下一个 X
+pub fn step(inout s: Sty, x: X, p: int) -> X {
+    match x {
+        Plain => {
+            if p == 38 { return Pick(true) }
+            if p == 48 { return Pick(false) }
+            one(&s, p)
+            Plain
+        }
+        Pick(fg) => {
+            if p == 5 { return Index(fg) }
+            if p == 2 { return Red(fg) }
+            Dead
+        }
+        Index(fg) => {
+            if p >= 0 && p < 256 { set_c(&s, fg, Idx(p)) }
+            Plain
+        }
+        Red(fg) => Green(fg, p)
+        Green(fg, r) => Blue(fg, r, p)
+        Blue(fg, r, g) => {
+            if r < 256 && g < 256 && p >= 0 && p < 256 { set_c(&s, fg, Rgb(r, g, p)) }
+            Plain
+        }
+        Dead => Dead
+    }
+}
+
+// run：参数一个一个走；x 留着，下一段接着走
+pub fn run(inout s: Sty, inout x: X, ps: [int]) {
+    for p in ps {
+        nx = step(&s, x, p)
+        x = nx
+    }
+}
+
+// CSI … m：没有参数时等于 0（apply）
+pub fn apply(inout s: Sty, ps: [int]) {
+    if len(ps) == 0 {
+        s = dflt()
+        return
+    }
+    x = Plain
+    run(&s, &x, ps)
+}
+
+// ---------- 存成一个整数 ----------
+
+fn pack_c(c: Color) -> int {
+    match c {
+        Dflt => 0
+        Idx(n) => (1 << 24) | n
+        Rgb(r, g, b) => (2 << 24) | (r << 16) | (g << 8) | b
+    }
+}
+
+fn unpack_c(v: int) -> Color {
+    k = v >>> 24
+    if k == 1 { return Idx(v & 0xFF) }
+    if k == 2 { return Rgb((v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF) }
+    Dflt
+}
+
+fn bit(b: bool, k: int) -> int { if b { 1 << k } else { 0 } }
+
+pub fn pack(s: Sty) -> int {
+    a = bit(s.bold, 0) | bit(s.dim, 1) | bit(s.italic, 2) | bit(s.under, 3) | bit(s.blink, 4) | bit(s.inverse, 5) | bit(s.hidden, 6) | bit(s.strike, 7)
+    a | (pack_c(s.fg) << 8) | (pack_c(s.bg) << 34)
+}
+
+fn has(v: int, k: int) -> bool { ((v >>> k) & 1) == 1 }
+
+pub fn unpack(v: int) -> Sty {
+    m = (1 << 26) - 1
+    Sty(fg: unpack_c((v >>> 8) & m), bg: unpack_c((v >>> 34) & m), bold: has(v, 0), dim: has(v, 1), italic: has(v, 2), under: has(v, 3), blink: has(v, 4), inverse: has(v, 5), hidden: has(v, 6), strike: has(v, 7))
+}
+
+// ---------- 写回成 CSI … m ----------
+
+fn color_args(c: Color, base: int) -> str {
+    match c {
+        Dflt => ""
+        Idx(n) => {
+            if n < 8 { return ";#{base + n}" }
+            if n < 16 { return ";#{base + 60 + n - 8}" }
+            ";#{base + 8};5;#{n}"
+        }
+        Rgb(r, g, b) => ";#{base + 8};2;#{r};#{g};#{b}"
+    }
+}
+
+// 从默认样式开始设成 s：ESC [ 0 ; … m
+pub fn sgr(s: Sty) -> str {
+    out = "\x1b[0"
+    if s.bold { out += ";1" }
+    if s.dim { out += ";2" }
+    if s.italic { out += ";3" }
+    if s.under { out += ";4" }
+    if s.blink { out += ";5" }
+    if s.inverse { out += ";7" }
+    if s.hidden { out += ";8" }
+    if s.strike { out += ";9" }
+    out += color_args(s.fg, 30)
+    out += color_args(s.bg, 40)
+    out + "m"
+}

@@ -1,0 +1,50 @@
+// ?? 用于任意类型（需要 lark1 及以后的版本）
+// a ?? b：a 是 T? 或 T!，有值时取出里面的值，否则才求 b。
+// T 是 int / bool / str / float 时 a 可以是变量（取值时复制一份）；别的 T 要求 a 是临时的值（函数调用的结果等），
+// 里面的值直接移出来，不复制。a 是变量时请写 x.copy() ?? b，或者用 match take。
+// 编译：lark1 examples/coalesce.lark -o out.c
+import "std/map"
+
+type P {
+    x: int
+    y: int
+}
+
+fn show(p: P) -> str { "(#{p.x}, #{p.y})" }
+
+fn find(ps: [P], x: int) -> P? {
+    for p in ps {
+        if p.x == x { return Some(p.copy()) }
+    }
+    None
+}
+
+fn digits(s: str) -> [int]! {
+    if s == "" { return Err("空的") }
+    out: [int] = []
+    for i in 0..len(s) { out.push(byte_at(s, i) - '0') }
+    Ok(out)
+}
+
+fn main() {
+    m: map.Map[str, [int]] = map.new()
+    m.insert("a", [1, 2])
+    xs = m.get("a") ?? []
+    ys = m.get("b") ?? [0]
+    print("#{xs} #{ys}")
+    ps = [P(x: 1, y: 2), P(x: 3, y: 4)]
+    print("#{find(ps, 3) ?? P(x: 0, y: 0)} #{find(ps, 9) ?? P(x: 0, y: 0)}")
+    print("#{digits("405") ?? []} #{digits("") ?? [-1]}")
+    o: [str]? = Some(["甲"])
+    zs = o.copy() ?? []
+    print("#{zs} #{o}")
+    // 可以连着写：从左往右找第一个有值的
+    w = find(ps, 7) ?? find(ps, 1) ?? P(x: 0, y: 0)
+    print("#{w}")
+    // 取不出值就退出：?? 右边可以是 exit、panic 这类不返回的调用
+    n: int? = Some(5)
+    k = n ?? exit(1)
+    q = find(ps, 3) ?? panic("找不到")
+    r = digits("7") ?? panic("不是数字")
+    print("#{k} #{q} #{r}")
+}

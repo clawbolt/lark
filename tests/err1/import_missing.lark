@@ -1,0 +1,4 @@
+// 期望错误：找不到文件
+import "no_such_module"
+
+fn main() {}

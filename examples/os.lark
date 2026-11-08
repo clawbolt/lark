@@ -1,0 +1,86 @@
+// 文件、目录、环境变量和子进程（需要 lark1 及以后的版本）
+// 编译：lark1 examples/os.lark -o out.c
+// 在临时目录（$TMPDIR，没有时用 /tmp）里建一个目录做实验，最后删掉；打印的路径都相对于它
+import "std/os"
+import "std/time"
+
+fn outcome(r: ()!) -> str {
+    match r {
+        Ok => "成功"
+        Err(_) => "失败"
+    }
+}
+
+fn demo(root: str) -> ()! {
+    os.mkdir_all(os.join_path(root, "src/util"))?
+    os.write(os.join_path(root, "src/main.lark"), "fn main() {}\n")?
+    os.write(os.join_path(root, "src/util/str.lark"), "第一行\n")?
+    os.append(os.join_path(root, "src/util/str.lark"), "第二行\n")?
+    os.write(os.join_path(root, "README.md"), "# 说明\n")?
+    os.mkdir(os.join_path(root, "empty"))?
+
+    names = os.read_dir(root)?
+    print("根目录：#{names}")
+    for n in names {
+        p = os.join_path(root, n)
+        kind = if os.is_dir(p) { "目录" } else if os.is_file(p) { "文件" } else { "其它" }
+        print("  #{n}：#{kind}")
+    }
+    text = os.read(os.join_path(root, "src/util/str.lark"))?
+    print("str.lark 有 #{len(text)} 字节：#{text}")
+    info = os.stat(os.join_path(root, "src/util/str.lark"))?
+    now = time.unix_ms()
+    print("stat：#{info.size} 字节，是文件 #{info.is_file}，是目录 #{info.is_dir}，修改时间在一分钟之内 #{info.mtime_ms > now - 60000 && info.mtime_ms <= now + 1000}")
+    d = os.stat(os.join_path(root, "src"))?
+    missing = match os.stat(os.join_path(root, "没有")) {
+        Ok(_) => "意外成功"
+        Err(_) => "失败"
+    }
+    print("stat 目录：是目录 #{d.is_dir}，stat 不存在的：#{missing}")
+
+    os.rename(os.join_path(root, "README.md"), os.join_path(root, "docs.md"))?
+    after = os.read_dir(root)?
+    print("改名后：#{after}，README.md 还在吗：#{os.exists(os.join_path(root, "README.md"))}")
+    print("删除不是空目录的 src：#{outcome(os.remove(os.join_path(root, "src")))}")
+    os.remove_all(os.join_path(root, "src"))?
+    os.remove(os.join_path(root, "empty"))?
+    left = os.read_dir(root)?
+    print("清理后：#{left}")
+}
+
+fn main() {
+    // 路径
+    print("#{os.join_path("out", "a.txt")} #{os.join_path("out/", "a.txt")} #{os.join_path("out", "/etc")}")
+    for p in ["a/b.tar.gz", "a/b/", "b.txt", "/b", ".bashrc"] {
+        print("#{p}：base #{os.base(p)}，dir #{os.dir(p)}，ext \"#{os.ext(p)}\"，stem #{os.stem(p)}")
+    }
+
+    // 文件和目录
+    tmp = os.env("TMPDIR") ?? "/tmp"
+    root = os.join_path(tmp, "lark_os_demo_#{time.unix_ms()}")
+    match demo(root) {
+        Ok => {}
+        Err(e) => print("出错：#{e}")
+    }
+    _r = os.remove_all(root)
+    print("实验目录删掉了：#{!os.exists(root)}")
+    match os.read(os.join_path(root, "没有.txt")) {
+        Ok(_) => print("意外成功")
+        Err(_) => print("读不存在的文件：失败")
+    }
+
+    // 环境变量
+    print("LARK_NO_SUCH_VAR：#{os.env("LARK_NO_SUCH_VAR")}，env ?? 默认值：#{os.env("LARK_NO_SUCH_VAR") ?? "默认值"}")
+    print("有 PATH 吗：#{os.env("PATH") != None}")
+
+    // 子进程
+    match os.shell_output("echo 你好; echo 世界") {
+        Ok(out) => print("capture：#{out}")
+        Err(e) => print("capture 失败：#{e}")
+    }
+    match os.shell_output("echo 一半; exit 3") {
+        Ok(out) => print("意外成功：#{out}")
+        Err(e) => print(e)
+    }
+    print("run(\"exit 2\") = #{os.shell("exit 2")}，run(\"true\") = #{os.shell("true")}")
+}

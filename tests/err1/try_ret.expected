@@ -1,0 +1,3 @@
+tests/err1/try_ret.lark:3:27: 错误：? 要求当前函数返回 T!，而它返回 int
+ 3 |     n = try_parse_int("1")?
+   |                           ^

@@ -1,0 +1,40 @@
+// std/map 的删除、原地更新等（需要 lark1 及以后的版本）
+// 编译：lark1 examples/maps.lark -o out.c
+import "std/map"
+import "std/str"
+
+fn main() {
+    text = "a rose is a rose is a rose"
+    counts: map.Map[str, int] = map.new()
+    ws = str.words(text)
+    for w in ws {
+        counts.update(w, 1, |n| n + 1)     // 有则加一，无则放入 1
+    }
+    print("计数：#{counts.to_list()}")
+    print("所有值：#{counts.vals}")
+
+    gone = counts.remove("is")
+    missing = counts.remove("lily")
+    print("删除 is：#{gone}，删除 lily：#{missing}")
+    still = counts.contains_key("is")
+    print("删除后：#{counts.keys}，还有 is 吗：#{still}")
+
+    // 删除后槽位重建，其它键照样找得到，插入顺序不变
+    sq: map.Map[int, int] = map.new()
+    for i in 0..20 { sq.insert(i, i * i) }
+    for i in 0..20 {
+        if i % 3 != 0 { dropped = sq.remove(i) }
+    }
+    print("剩下的键：#{sq.keys}")
+    print("18 的平方：#{sq.get(18) ?? -1}，5 的平方：#{sq.get(5) ?? -1}")
+    sq.insert(5, 25)
+    print("重新放入 5 之后：#{sq.keys}")
+
+    // retain：一次删掉不满足条件的（只重建一次槽位）
+    limit = 100
+    n_gone = sq.retain(|_k, v| v < limit)
+    print("retain 删掉 #{n_gone} 项，剩下：#{sq.keys}，9 的平方：#{sq.get(9) ?? -1}")
+
+    sq.clear()
+    print("清空后为空：#{sq.is_empty()}，个数 #{len(sq)}")
+}

@@ -1,0 +1,176 @@
+// X25519（RFC 7748）：Curve25519 上的 Diffie-Hellman，TLS 1.3 用它交换密钥。
+// 照 TweetNaCl：模 p = 2^255 - 19 的数拆成 16 个 16 位（存在 int 里，中间结果可以超出 16 位或是负数），
+// 2^256 ≡ 38 (mod p)，所以超出 16 段的部分乘 38 折回来。蒙哥马利阶梯一共走 255 步，每步都做同样的运算，
+// 交换用掩码（cswap），不按私钥的位分支。
+// 先证明再写：规格是 formal/Lark/Tls.lean 的 x25519（直接模 p 算，对上了 RFC 7748 第 5.2、6.1 节的向量）。证明了：
+// 每步前后都按这一位交换（这里的写法，tnLoop）和 RFC 的写法（rfcLoop）结果一样（ladder_swap）；cswap 的掩码交换
+// （cswap_zero / cswap_one）；inv 的平方-乘序列算的是 a^(p-2)（inv_ok）；私钥截位以后是 8 的倍数，在 [2^254, 2^255) 里（clamp_ok）。
+// 16 段的乘法和进位和规格一致没有证明，靠测试向量。
+// 实验性：没有经过审计；Lark 编译成 C 以后是不是常数时间没有验证过
+
+// 公钥 = 私钥 × 基点（u = 9）
+pub fn public_key(private: [u8]) -> [u8] {
+    base: [u8] = [9]
+    for _i in 1..32 { base.push(0) }
+    scalar_mult(private, base)
+}
+
+// 共享的密钥 = 自己的私钥 × 对方的公钥。结果全是 0 时是错误（对方给了小阶点，RFC 8446 第 7.4.2 节要求检查）
+pub fn shared(private: [u8], peer: [u8]) -> [u8]! {
+    if len(peer) != 32 { return Err("x25519：对方的公钥要 32 字节，这里是 #{len(peer)} 字节") }
+    k = scalar_mult(private, peer)
+    acc = 0
+    for b in k { acc = acc | b.to_int() }
+    if acc == 0 { return Err("x25519：对方的公钥是小阶点，算出来全是 0") }
+    Ok(k)
+}
+
+// RFC 7748 第 5 节的 X25519(k, u)：k 按第 5 节截掉一些位；u 的最高位不用
+pub fn scalar_mult(k: [u8], u: [u8]) -> [u8] {
+    if len(k) != 32 || len(u) != 32 { panic("x25519.scalar_mult：私钥和点都要 32 字节") }
+    z: [int] = []
+    for b in k { z.push(b.to_int()) }
+    z[31] = (z[31] & 127) | 64
+    z[0] = z[0] & 248
+    x = unpack(u)
+    a = fe(1)
+    b = x.copy()
+    c = fe(0)
+    d = fe(1)
+    i = 254
+    for i >= 0 {
+        r = (z[i >>> 3] >>> (i & 7)) & 1
+        cswap(&a, &b, r)
+        cswap(&c, &d, r)
+        e = fe_add(a, c)
+        a = fe_sub(a, c)
+        c = fe_add(b, d)
+        b = fe_sub(b, d)
+        d = fe_sq(e)
+        f = fe_sq(a)
+        a = fe_mul(c, a)
+        c = fe_mul(b, e)
+        e = fe_add(a, c)
+        a = fe_sub(a, c)
+        b = fe_sq(a)
+        c = fe_sub(d, f)
+        a = fe_mul(c, a121665())
+        a = fe_add(a, d)
+        c = fe_mul(c, a)
+        a = fe_mul(d, f)
+        d = fe_mul(b, x)
+        b = fe_sq(e)
+        cswap(&a, &b, r)
+        cswap(&c, &d, r)
+        i -= 1
+    }
+    pack(fe_mul(a, inv(c)))
+}
+
+// ---------- 模 2^255 - 19 的运算（16 段，每段 16 位；tls/ed25519 也用） ----------
+
+pub fn fe(v: int) -> [int] {
+    out: [int] = [v]
+    for _i in 1..16 { out.push(0) }
+    out
+}
+
+// 121665 = (486662 - 2) / 4，蒙哥马利阶梯里的常数
+fn a121665() -> [int] {
+    out = fe(0xDB41)
+    out[1] = 1
+    out
+}
+
+pub fn fe_add(a: [int], b: [int]) -> [int] {
+    out: [int] = []
+    for i in 0..16 { out.push(a[i] + b[i]) }
+    out
+}
+
+pub fn fe_sub(a: [int], b: [int]) -> [int] {
+    out: [int] = []
+    for i in 0..16 { out.push(a[i] - b[i]) }
+    out
+}
+
+// 每段留低 16 位，进位加到下一段；最高段的进位乘 38 加回第 0 段
+pub fn carry(inout o: [int]) {
+    for i in 0..16 {
+        c = o[i] >> 16
+        o[i] = o[i] & 0xffff
+        if i < 15 { o[i + 1] += c } else { o[0] += 38 * c }
+    }
+}
+
+pub fn fe_mul(a: [int], b: [int]) -> [int] {
+    t: [int] = []
+    for _i in 0..31 { t.push(0) }
+    for i in 0..16 {
+        for j in 0..16 { t[i + j] += a[i] * b[j] }
+    }
+    for i in 0..15 { t[i] += 38 * t[i + 16] }
+    out: [int] = []
+    for i in 0..16 { out.push(t[i]) }
+    carry(&out)
+    carry(&out)
+    out
+}
+
+pub fn fe_sq(a: [int]) -> [int] { fe_mul(a, a) }
+
+// a^(p-2) = a 的逆（费马小定理）：p - 2 = 2^255 - 21，二进制是 250 个 1 后面跟 01011
+pub fn inv(a: [int]) -> [int] {
+    c = a.copy()
+    k = 253
+    for k >= 0 {
+        c = fe_sq(c)
+        if k != 2 && k != 4 { c = fe_mul(c, a) }
+        k -= 1
+    }
+    c
+}
+
+// b 是 1 时交换 p、q，是 0 时不动；用掩码，不分支
+pub fn cswap(inout p: [int], inout q: [int], b: int) {
+    m = -b
+    for i in 0..16 {
+        t = m & (p[i] ^ q[i])
+        p[i] = p[i] ^ t
+        q[i] = q[i] ^ t
+    }
+}
+
+// 32 字节小端读成 16 段，最高位不用
+pub fn unpack(s: [u8]) -> [int] {
+    out: [int] = []
+    for i in 0..16 { out.push(s[2 * i].to_int() | (s[2 * i + 1].to_int() << 8)) }
+    out[15] = out[15] & 0x7fff
+    out
+}
+
+// 化到 0..p-1 再写成 32 字节小端：做两次“减 p，没借位就用减过的”
+pub fn pack(n: [int]) -> [u8] {
+    t = n.copy()
+    carry(&t)
+    carry(&t)
+    carry(&t)
+    for _j in 0..2 {
+        m = fe(0)
+        m[0] = t[0] - 0xffed
+        for i in 1..15 {
+            m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1)
+            m[i - 1] = m[i - 1] & 0xffff
+        }
+        m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1)
+        borrow = (m[15] >> 16) & 1
+        m[14] = m[14] & 0xffff
+        cswap(&t, &m, 1 - borrow)
+    }
+    out: [u8] = []
+    for i in 0..16 {
+        out.push((t[i] & 0xff).wrap_u8())
+        out.push(((t[i] >> 8) & 0xff).wrap_u8())
+    }
+    out
+}

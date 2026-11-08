@@ -1,0 +1,8 @@
+# make apicov 的允许名单：没法在自动测试里调用的公开函数，每行 “模块.函数  原因”。
+# 测试的输出写进文件、标准输入可能是终端，所以要真终端或者会读标准输入的函数只能手动试（apps/ledit）。
+term.enable_raw         进入原始模式要标准输入是终端，测试时不一定是
+term.read               读标准输入，标准输入是终端时会一直等
+term.enter_alt_screen   直接往文件描述符 1 写转义序列，会混进测试的输出
+term.leave_alt_screen   同上
+http.serve              一直接受连接、不返回，单元测试停不下来；lhttp、lcache 的端到端测试在用
+http.serve_until        和 serve 一样一直接受连接，要另一个任务取消才停；lproxy 的端到端测试在用（SIGTERM 时优雅退出）

@@ -1,0 +1,3 @@
+tests/err/use_after_move.lark:9:11: 错误：u 的值已经被移走，不能再使用
+ 9 |     print(u.name)
+   |           ^

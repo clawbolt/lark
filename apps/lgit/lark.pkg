@@ -1,0 +1,3 @@
+# lgit：用 Lark 写的简单 git，仓库格式和真 git 兼容
+name = lgit
+version = 0.1.0

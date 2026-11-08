@@ -1,0 +1,159 @@
+// lgit · 暂存区（.git/index，第 2 版）
+// 格式：“DIRC”、版本 2、项数，每项 62 个字节的定长部分 + 路径 + 1 到 8 个 0（补到 8 的倍数），
+// 后面可能有扩展（TREE 等，读的时候跳过、写的时候不写），最后 20 个字节是前面所有内容的 SHA-1。
+// 没有读文件的修改时间、inode 这些信息的办法，所以写成 0：真 git 读到时会重新算一遍文件的哈希，结果仍然对。
+import "std/os"
+import "std/bytes"
+import "std/digest"
+
+pub type IEntry {
+    pub path: str       // 相对于工作区根目录，用 / 分隔
+    pub mode: int       // 0o100644（普通文件）、0o100755（可执行）、0o120000（符号链接）
+    pub id: str
+    pub size: int
+    pub stage: int      // 0：正常；合并冲突时 1 是共同祖先、2 是 ours、3 是 theirs 的版本（同一路径可以有几项）
+}
+
+pub fn path_of(g: str) -> str { os.join_path(g, "index") }
+
+// 还没有 index 文件时是空的
+pub fn read(g: str) -> [IEntry]! {
+    out: [IEntry] = []
+    p = path_of(g)
+    if !os.is_file(p) { return Ok(out) }
+    raw = os.read(p)?
+    d = raw.to_bytes()
+    n = len(d)
+    if n < 32 || from_bytes(sub(d, 0, 4)) != "DIRC" { return Err("index 文件的格式不对") }
+    ver = bytes.u32_be(d, 4)
+    if ver != 2 { return Err("只支持第 2 版的 index，这个是第 #{ver} 版") }
+    // 先校验末尾的 SHA-1
+    if digest.to_hex(digest.sha1(sub(d, 0, n - 20))) != digest.to_hex(sub(d, n - 20, n)) { return Err("index 文件坏了（校验和不对）") }
+    count = bytes.u32_be(d, 8)
+    off = 12
+    for _k in 0..count {
+        if off + 62 > n - 20 { return Err("index 文件提前结束") }
+        mode = bytes.u32_be(d, off + 24)
+        size = bytes.u32_be(d, off + 36)
+        id = digest.to_hex(sub(d, off + 40, off + 60))
+        // 标志的高 4 位：最高位 assume-valid、下一位 extended（第 2 版里是 0）、再两位是 stage；低 12 位是路径长度
+        stage = (bytes.u16_be(d, off + 60) >>> 12) & 3
+        e = off + 62
+        for e < n && d[e] != 0 { e += 1 }
+        path = from_bytes(sub(d, off + 62, e))
+        out.push(IEntry(path: path, mode: mode, id: id, size: size, stage: stage))
+        off += (62 + len(path) + 8) / 8 * 8
+    }
+    Ok(out)
+}
+
+pub fn write(g: str, entries: [IEntry]) -> ()! {
+    es = sorted(entries)
+    out: [u8] = []
+    for b in "DIRC".to_bytes() { out.push(b) }
+    bytes.push_u32_be(&out, 2)
+    bytes.push_u32_be(&out, len(es))
+    for e in es {
+        start = len(out)
+        // ctime、mtime（秒和纳秒）、dev、ino：都写 0
+        for _k in 0..6 { bytes.push_u32_be(&out, 0) }
+        bytes.push_u32_be(&out, e.mode)
+        bytes.push_u32_be(&out, 0)          // uid
+        bytes.push_u32_be(&out, 0)          // gid
+        bytes.push_u32_be(&out, e.size)
+        match digest.from_hex(e.id) {
+            Ok(raw) => {
+                for b in raw { out.push(b) }
+            }
+            Err(_) => return Err("index：编号不对 #{e.id}")
+        }
+        nl = if len(e.path) < 0xFFF { len(e.path) } else { 0xFFF }
+        bytes.push_u16_be(&out, (e.stage << 12) | nl)
+        for b in e.path.to_bytes() { out.push(b) }
+        // 补 0 到 8 的倍数，至少一个
+        out.push(0)
+        for (len(out) - start) % 8 != 0 { out.push(0) }
+    }
+    for b in digest.sha1(out) { out.push(b) }
+    tmp = path_of(g) + ".lock"
+    os.write(tmp, from_bytes(out))?
+    os.rename(tmp, path_of(g))
+}
+
+fn sub(d: [u8], a: int, b: int) -> [u8] {
+    out: [u8] = []
+    out.reserve(b - a)
+    for i in a..b { out.push(d[i]) }
+    out
+}
+
+// 按路径的字节序排好，同一路径按 stage（git 要求的顺序；插入排序，稳定）
+pub fn sorted(entries: [IEntry]) -> [IEntry] {
+    idx: [int] = []
+    for i in 0..len(entries) {
+        j = len(idx)
+        idx.push(i)
+        for j > 0 && entry_after(entries[idx[j - 1]], entries[i]) {
+            idx[j] = idx[j - 1]
+            j -= 1
+        }
+        idx[j] = i
+    }
+    out: [IEntry] = []
+    for k in idx { out.push(entries[k].copy()) }
+    out
+}
+
+fn entry_after(a: IEntry, b: IEntry) -> bool { a.path > b.path || (a.path == b.path && a.stage > b.stage) }
+
+// 下标按 xs 的值排序（插入排序，稳定）
+pub fn order_of(xs: [str]) -> [int] {
+    idx: [int] = []
+    for i in 0..len(xs) {
+        j = len(idx)
+        idx.push(i)
+        for j > 0 && xs[idx[j - 1]] > xs[i] {
+            idx[j] = idx[j - 1]
+            j -= 1
+        }
+        idx[j] = i
+    }
+    idx
+}
+
+pub fn find(entries: [IEntry], path: str) -> int {
+    for i in 0..len(entries) {
+        if entries[i].path == path { return i }
+    }
+    -1
+}
+
+// 有冲突（stage 不是 0）的路径，每个一次
+pub fn conflicted(entries: [IEntry]) -> [str] {
+    out: [str] = []
+    for e in entries {
+        if e.stage != 0 {
+            dup = false
+            for p in out {
+                if p == e.path { dup = true }
+            }
+            if !dup { out.push(e.path.copy()) }
+        }
+    }
+    out
+}
+
+// 去掉路径 path 的所有项（包括冲突的各个 stage）
+pub fn remove_path(inout entries: [IEntry], path: str) {
+    kept: [IEntry] = []
+    for e in entries {
+        if e.path != path { kept.push(e.copy()) }
+    }
+    entries = kept
+}
+
+// 把 path 设成正常的一项（stage 0），去掉它原来的项和冲突的各个 stage
+pub fn put(inout entries: [IEntry], path: str, mode: int, id: str, size: int) {
+    remove_path(&entries, path)
+    entries.push(IEntry(path: path.copy(), mode: mode, id: id.copy(), size: size, stage: 0))
+}

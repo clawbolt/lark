@@ -1,0 +1,6 @@
+// 期望错误：int 和 float 不会自动转换，要写 to_float(n) * 2.5
+fn main() {
+    n = 3
+    x = n * 2.5
+    print("#{x}")
+}

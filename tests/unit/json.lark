@@ -1,0 +1,94 @@
+// std/json 的边界：空白、空的数组和对象、int 的两头、转义和代理对、重复的键、每种错误的原文和位置、很深的嵌套
+import "std/json"
+import "std/str"
+
+fn parsed(s: str) -> json.Json {
+    match take json.parse(s) {
+        Ok(j) => j
+        Err(e) => panic(e)
+    }
+}
+
+fn err_of(s: str) -> str {
+    match take json.parse(s) {
+        Ok(j) => "<成功：#{j}>"
+        Err(e) => e
+    }
+}
+
+// 读进来再紧凑地写出去
+fn again(s: str) -> str { json.format(parsed(s)) }
+
+test "能读的值" {
+    assert_eq(again(" \t\r\n[ 1 , 2 ] \n"), "[1,2]")
+    assert_eq(again("{}"), "{}")
+    assert_eq(again("[]"), "[]")
+    assert_eq(again("[[],{},[[]]]"), "[[],{},[[]]]")
+    assert_eq(again("{\"a\":{\"b\":[null,true,false]}}"), "{\"a\":{\"b\":[null,true,false]}}")
+    assert_eq(again("-0"), "0")
+    assert_eq(again("9223372036854775807"), "9223372036854775807")
+    assert_eq(again("-9223372036854775808"), "-9223372036854775808")
+    // 超出 int 范围的整数读成 Float
+    assert_eq(json.as_int(parsed("9223372036854775808")) ?? -1, -1)
+    assert((json.as_float(parsed("9223372036854775808")) ?? 0.0) > 9000000000000000000.0)
+    assert((json.as_float(parsed("1e3")) ?? 0.0) == 1000.0)
+    assert((json.as_float(parsed("-1.5E-1")) ?? 0.0) == -0.15)
+    assert_eq(json.as_int(parsed("1.0")) ?? -1, -1)
+    assert_eq(json.as_str(parsed("\"\\u4e91\\u96c0\"")) ?? "", "云雀")
+    assert_eq(json.as_str(parsed("\"\\ud83d\\ude00\"")) ?? "", "😀")
+    assert_eq(json.as_str(parsed("\"\\\"\\\\\\/\\b\\f\\n\\r\\t\"")) ?? "", "\"\\/" + from_byte(8) + from_byte(12) + "\n\r\t")
+    // 非 ASCII 的字符原样保留
+    assert_eq(again("\"云雀 é\""), "\"云雀 é\"")
+    // 重复的键：都保留，get 取最后一个
+    d = parsed("{\"k\":1,\"k\":2}")
+    assert_eq(json.path_int(d, "k") ?? -1, 2)
+    assert_eq(json.format(d), "{\"k\":1,\"k\":2}")
+    assert_eq(json.count(d), 2)
+    assert(json.keys(d) == ["k", "k"])
+}
+
+test "错误和位置" {
+    assert_eq(err_of(""), "JSON 第 1 行第 1 列：意外的结尾，需要一个值")
+    assert_eq(err_of("   "), "JSON 第 1 行第 4 列：意外的结尾，需要一个值")
+    assert_eq(err_of("[1,]"), "JSON 第 1 行第 4 列：无法识别的字符 ]")
+    assert_eq(err_of("[1 2]"), "JSON 第 1 行第 4 列：数组里需要 , 或 ]")
+    assert_eq(err_of("[1"), "JSON 第 1 行第 3 列：数组里需要 , 或 ]")
+    assert_eq(err_of("{\"a\":1,}"), "JSON 第 1 行第 8 列：对象的键必须是字符串")
+    assert_eq(err_of("{\n\"a\" 1}"), "JSON 第 2 行第 5 列：键后面需要 :")
+    assert_eq(err_of("{\"a\":1 \"b\":2}"), "JSON 第 1 行第 8 列：对象里需要 , 或 }")
+    assert_eq(err_of("1 2"), "JSON 第 1 行第 3 列：值后面还有多余的内容")
+    assert_eq(err_of("nul"), "JSON 第 1 行第 1 列：无法识别的字符 n")
+    assert_eq(err_of("01"), "JSON 第 1 行第 3 列：数不能以 0 开头")
+    assert_eq(err_of("-"), "JSON 第 1 行第 2 列：- 后面需要数字")
+    assert_eq(err_of("1."), "JSON 第 1 行第 3 列：小数点后面需要数字")
+    assert_eq(err_of("1e+"), "JSON 第 1 行第 4 列：指数需要数字")
+    assert_eq(err_of("1e999"), "JSON 第 1 行第 1 列：数超出 float 的范围")
+    assert_eq(err_of("\"abc"), "JSON 第 1 行第 5 列：字符串没有结束")
+    assert_eq(err_of("\"a\tb\""), "JSON 第 1 行第 3 列：字符串里不能直接出现控制字符")
+    assert_eq(err_of("\"\\x\""), "JSON 第 1 行第 4 列：无效的转义 \\x")
+    assert_eq(err_of("\"\\u12\""), "JSON 第 1 行第 4 列：\\u 后面需要 4 个十六进制数字")
+    assert_eq(err_of("\"\\ud83d\\u0041\""), "JSON 第 1 行第 14 列：代理对的后一半无效")
+    assert_eq(err_of("\"\\ud83d\""), "JSON 第 1 行第 8 列：代理对缺少后一半")
+    assert_eq(err_of("\"\\ude00x\""), "JSON 第 1 行第 8 列：代理对缺少前一半")
+}
+
+test "很深的嵌套不会栈溢出" {
+    ok = str.repeat("[", 512) + str.repeat("]", 512)
+    assert_eq(json.count(parsed(ok)), 1)
+    assert_eq(err_of(str.repeat("[", 100000)), "JSON 第 1 行第 513 列：嵌套太深（最多 512 层）")
+    objs = str.repeat("{\"a\":", 600) + "1" + str.repeat("}", 600)
+    assert_eq(err_of(objs), "JSON 第 1 行第 2561 列：嵌套太深（最多 512 层）")
+}
+
+test "输出" {
+    j = parsed("{\"a\":[1,2],\"b\":{},\"c\":[],\"d\":{\"e\":null}}")
+    assert_eq(json.format_pretty(j), "{\n  \"a\": [\n    1,\n    2\n  ],\n  \"b\": {},\n  \"c\": [],\n  \"d\": {\n    \"e\": null\n  }\n}")
+    assert_eq(json.format_pretty(json.Num(1)), "1")
+    assert_eq(json.format(json.Float(0.0 / 0.0)), "null")
+    assert_eq(json.quote(""), "\"\"")
+    assert_eq(json.quote(from_byte(0x1f) + from_byte(0x7f)), "\"\\u001f" + from_byte(0x7f) + "\"")
+    // 写出去再读回来不变
+    s = json.format(json.object([("文", json.Str("a\"b\n")), ("n", json.Num(-3)), ("x", json.Arr([json.Bool(false), json.Null]))]))
+    assert_eq(again(s), s)
+    assert_eq(json.path_str(parsed(s), "文") ?? "", "a\"b\n")
+}

@@ -1,0 +1,11 @@
+// 期望错误：只定义了 index 的类型不能给下标赋值
+type Poly {
+    cs: [int]
+}
+
+fn index(p: Poly, i: int) -> int { p.cs[i] }
+
+fn main() {
+    p = Poly(cs: [1, 2])
+    p[0] = 5
+}

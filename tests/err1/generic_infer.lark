@@ -1,0 +1,9 @@
+// 期望错误：返回类型里的 T 无法从参数推断
+fn make[T](n: int) -> [T] {
+    xs: [T] = []
+    xs
+}
+
+fn main() {
+    xs = make(3)
+}

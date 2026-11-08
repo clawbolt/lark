@@ -1,0 +1,8 @@
+// 期望错误：len 只能用于 str、列表和定义了 iter_len 的类型
+type Point {
+    x: int
+}
+
+fn main() {
+    n = len(Point(x: 1))
+}

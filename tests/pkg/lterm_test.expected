@@ -1,0 +1,44 @@
+通过  解析：转义序列（和 VtParse.lean 的 #guard 一样）
+通过  解析：常见的序列
+通过  解析：随机的字节流（step_cancel、step_escape、run_len、分两段读）
+通过  解析：普通文字原样输出、OSC 里的文字不输出（run_text、run_osc）
+通过  解码：和 VtUtf8.lean 的 #guard 一样
+通过  解码：随机的字节流分段喂（feed_join、feed_pend、feed_ne，和 std/utf8 一样）
+通过  宽度：表排好了、常见的字符（width_le、width_ascii）
+通过  屏幕：和 VtScreen.lean 的 #guard 一样
+通过  屏幕：随机的操作，每一步以后都是好的（step_ok），滚动只动区域里的行（up_outside、down_outside）
+通过  终端：字节流经过解析、解码、屏幕
+通过  样式：和 VtSgr.lean 的 #guard 一样
+通过  样式：随机的参数，颜色总在范围里（step_ok），分两段一样（run_append），pack 和 sgr 来回一样
+通过  样式：屏幕上的样式跟着字走（写、滚动、插入、删除、擦除）
+通过  终端：SGR 改之后写的字的样式
+通过  模式：和 VtMode.lean 的 #guard 一样
+通过  模式：随机的操作都是好的（step_ok），备用屏幕出来主屏幕原样回来（alt_restore），不换行（nowrap_y）
+通过  终端：模式、备用屏幕、保存光标的序列
+通过  滚动缓冲、改大小：和 VtSb.lean 的 #guard 一样
+通过  滚动缓冲、改大小：随机的屏幕（up_keep、resize_ok、resize_cur、resize_lost）
+通过  滚动缓冲、改大小：随机的终端操作，缓冲不超过 cap，屏幕都是好的（keep_len、resizeT_ok）
+通过  终端：滚动缓冲和改大小
+通过  画屏幕：和 VtDraw.lean 的 #guard 一样
+通过  画屏幕：随机的两帧，执行 diff 出来的命令得到新的一帧（draw_ok），没变时不画（diff_same），画出去的不比一行多（cost_le）
+通过  画屏幕：画出去的转义序列喂给我们自己的终端，得到同样的画面和光标
+通过  翻看：和 VtView.lean 的 #guard 一样
+通过  翻看：随机的缓冲和翻的行数（view_len、view_zero、view_sub、up_down）
+通过  翻看：按键和右上角的标记
+通过  回答：和 VtReply.lean 的 #guard 一样
+通过  回答：随机的光标位置，回答解析回来是同一个位置（dsr_parse）
+通过  终端：回答查询、方向键和小键盘的模式
+通过  字符集：和 VtCharset.lean 的 #guard 一样
+通过  字符集：随机的切换，每个字符的性质（map_out、map_ascii、map_width、gfx_inj、reset_ascii）
+通过  终端：画框线
+通过  屏幕：快的版本（直接改格子）和照着证明写的版本，每一步结果都一样
+通过  滚动缓冲：满了以后一直滚，留下的总是最新的 cap 行（keep_suffix）
+通过  窗口：颜色表、样式变成前景色背景色、宽字符
+通过  滚动区域：和 VtRegion.lean 的 #guard 一样，像 codex 那样下面留一块界面
+通过  滚动区域：随机的屏幕和区域，滚出去的行接上区域正好是原来的区域加空行（region_keep、region_below、up_clamp）
+通过  选中：和 VtSel.lean 的 #guard 一样
+通过  选中：随机的格子，性质和 VtSel.lean 的定理一样（mk_symm、mk_in、copy_lines、trim_end、left_*、right_*）
+通过  选中：绝对行号（pushed）、反显、窗口标题（OSC 0 / 2）
+通过  鼠标：和 VtMouse.lean 的 #guard 一样
+通过  鼠标：随机的事件，报告解析回来是同一个事件（sgr_parse、code_*、wants、x10_len）
+43 项测试：43 项通过，0 项失败

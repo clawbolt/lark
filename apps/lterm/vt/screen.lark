@@ -1,0 +1,658 @@
+// 屏幕：R 行 × C 列的格子、光标、自动换行（pend）、滚动区域 [top, bot]。
+// 先证明再写：对应 formal/Lark/VtScreen.lean，函数和定义一一对应：
+//   fit ↔ fit、heal ↔ heal / heal'（p 是前一格还没配上右半的宽字符左半）、row_fix ↔ rowFix、wf ↔ wf、
+//   set_at ↔ setAt、fill ↔ fillR、ins ↔ insR、dch_row ↔ dchR、write_row ↔ writeRow、
+//   scroll_up / scroll_down ↔ scrollUp / scrollDown（upRows / downRows）、lf ↔ lf、ri ↔ ri、
+//   wrap_if ↔ wrapIf、wide_wrap ↔ wideWrap、put ↔ put、write_char ↔ print、el / ed ↔ elRows / edRows、
+//   stbm ↔ stbm、Op ↔ Op、step ↔ step。模型里的 Nat 减法到 0 为止，这里是 sub。
+// 证明了：任何操作以后屏幕都是好的（step_ok）：正好 R 行、每行 C 格、宽字符不会只剩一半、光标在屏幕里、
+// top ≤ bot < R（tests.lark 里的 ok 逐条检查）；滚动只动区域里的行（up_outside、down_outside）。
+// 格子是一个整数：普通字符是码点（≥ 0）；宽字符的左半是 -(码点 + 2)；右半是 SPACER（-1）。
+// 整个屏幕存成一个列表（第 i 行是 cells[i * C .. (i + 1) * C]），模型里是行的列表。
+// 阶段 4 加了样式（没有证明，模型里没有）：每一格还有一个样式（sty，vt/style 的 pack，0 是默认样式），
+// 和字符放在同样的位置一起移动：写字用当前的样式（pen，Pen 改它），滚动、插入、删除时跟着字走，擦掉的格子变回 0。
+// 宽字符拆散时剩下的那一半变成空格，样式不变。擦除用默认背景（不是 xterm 的“用当前背景色擦”）。
+// 阶段 6：整个屏幕往上滚时滚出去的行记在 out / outs（save_top），改大小（resize）挪走的顶上的行也记在那里，见 VtSb.lean。
+// 阶段 11（formal/Lark/VtRegion.lean）：滚动区域从顶上开始（[0, bot]，codex 这类下面留一块界面的程序）时滚出去的行也记（region_keep），最多 bot + 1 行（up_clamp）。
+// 没做：改列数时重新折行（reflow）；组合字符（宽度 0）丢掉。
+
+pub const BLANK = 32
+pub const SPACER = -1
+
+pub fn wide(c: int) -> int { 0 - c - 2 }
+pub fn is_wide(v: int) -> bool { v <= -2 }
+pub fn wide_ch(v: int) -> int { 0 - v - 2 }
+
+// 格子里的字符（cellCh）：宽字符的右半是 0
+pub fn cell_ch(v: int) -> int {
+    if v == SPACER { return 0 }
+    if is_wide(v) { return wide_ch(v) }
+    v
+}
+
+// ---------- 一行 ----------
+
+fn ints() -> [int] {
+    out: [int] = []
+    out
+}
+
+// 正好 n 格：多的截掉，少的补空格（fit）
+pub fn fit(n: int, l: [int]) -> [int] {
+    out = ints()
+    for i in 0..n { out.push(if i < len(l) { l[i] } else { BLANK }) }
+    out
+}
+
+// 拆散了的宽字符：剩下的那一半换成空格（heal'，p 是 none 时为 -1）
+pub fn heal(l: [int]) -> [int] {
+    out = ints()
+    p = -1
+    for v in l {
+        if p < 0 {
+            if v == SPACER {
+                out.push(BLANK)
+            } else if is_wide(v) {
+                p = wide_ch(v)
+            } else {
+                out.push(v)
+            }
+        } else if v == SPACER {
+            out.push(wide(p))
+            out.push(SPACER)
+            p = -1
+        } else if is_wide(v) {
+            out.push(BLANK)
+            p = wide_ch(v)
+        } else {
+            out.push(BLANK)
+            out.push(v)
+            p = -1
+        }
+    }
+    if p >= 0 { out.push(BLANK) }
+    out
+}
+
+pub fn row_fix(c: int, l: [int]) -> [int] { heal(fit(c, l)) }
+
+// 宽字符都是完整的：左半后面紧跟右半，右半前面紧挨左半（wf）
+pub fn wf(l: [int]) -> bool {
+    i = 0
+    for i < len(l) {
+        v = l[i]
+        if v == SPACER { return false }
+        if is_wide(v) {
+            if i + 1 < len(l) && l[i + 1] == SPACER { i += 2 } else { return false }
+        } else {
+            i += 1
+        }
+    }
+    true
+}
+
+// 第 i 格换成 v（超出时不变）（setAt）
+fn set_at(l: [int], i: int, v: int) -> [int] {
+    out = l.copy()
+    if i >= 0 && i < len(out) { out[i] = v }
+    out
+}
+
+// [a, b) 里的格子换成空格（fillR）
+fn fill(l: [int], a: int, b: int) -> [int] {
+    out = l.copy()
+    for i in 0..len(out) {
+        if a <= i && i < b { out[i] = BLANK }
+    }
+    out
+}
+
+fn first_n(l: [int], n: int) -> [int] {
+    out = ints()
+    for i in 0..len(l) {
+        if i < n { out.push(l[i]) }
+    }
+    out
+}
+
+fn skip_n(l: [int], n: int) -> [int] {
+    out = ints()
+    for i in 0..len(l) {
+        if i >= n { out.push(l[i]) }
+    }
+    out
+}
+
+// 在 x 插入 n 个空格（insR）
+fn ins(l: [int], x: int, n: int) -> [int] {
+    out = first_n(l, x)
+    for _i in 0..n { out.push(BLANK) }
+    for v in skip_n(l, x) { out.push(v) }
+    out
+}
+
+// 删掉 x 开始的 n 格（dchR）
+fn dch_row(l: [int], x: int, n: int) -> [int] {
+    out = first_n(l, x)
+    for v in skip_n(l, x + n) { out.push(v) }
+    out
+}
+
+fn write_row(l: [int], x: int, c: int, w: int) -> [int] {
+    if w == 2 { return set_at(set_at(l, x, wide(c)), x + 1, SPACER) }
+    set_at(l, x, c)
+}
+
+// ---------- 整个屏幕 ----------
+
+pub type S {
+    pub cells: [int]    // R * C 格，一行一行接起来
+    pub rows: int       // R
+    pub cols: int       // C
+    pub x: int
+    pub y: int
+    pub pend: bool      // 写满了最后一列，下一个字先换行
+    pub top: int        // 滚动区域 [top, bot]
+    pub bot: int
+    pub sty: [int]      // 每一格的样式，位置和 cells 一样
+    pub pen: int        // 现在写字用的样式
+    pub out: [[int]]    // 整个屏幕往上滚时滚出顶上的行（VtSb 的 topRows），等着放进滚动缓冲
+    pub outs: [[int]]   // 这些行的样式
+    pub slow: bool      // true：用照着证明写的慢版本（put_ref、scroll_up_ref、scroll_down_ref），测试里拿来对照
+}
+
+// init：都是空格，光标在左上角，滚动区域是整个屏幕
+fn no_rows() -> [[int]] {
+    out: [[int]] = []
+    out
+}
+
+pub fn new(r: int, c: int) -> S {
+    cs = ints()
+    for _i in 0..r * c { cs.push(BLANK) }
+    S(cells: cs, rows: r, cols: c, x: 0, y: 0, pend: false, top: 0, bot: r - 1, sty: zeros(r * c), pen: 0, out: no_rows(), outs: no_rows(), slow: false)
+}
+
+pub fn row(s: S, i: int) -> [int] {
+    out = ints()
+    for j in 0..s.cols { out.push(s.cells[i * s.cols + j]) }
+    out
+}
+
+fn set_row(inout s: S, i: int, r: [int]) {
+    c = s.cols
+    for j in 0..c { s.cells[i * c + j] = r[j] }
+}
+
+fn blank_row(c: int) -> [int] { row_fix(c, ints()) }
+
+// ---------- 样式（和格子放在同样的位置） ----------
+
+fn zeros(n: int) -> [int] {
+    out = ints()
+    for _i in 0..n { out.push(0) }
+    out
+}
+
+// 正好 n 格，少的补默认样式
+fn zfit(n: int, l: [int]) -> [int] {
+    out = ints()
+    for i in 0..n { out.push(if i < len(l) { l[i] } else { 0 }) }
+    out
+}
+
+fn zfill(l: [int], a: int, b: int) -> [int] {
+    out = l.copy()
+    for i in 0..len(out) {
+        if a <= i && i < b { out[i] = 0 }
+    }
+    out
+}
+
+fn zins(l: [int], x: int, n: int) -> [int] {
+    out = first_n(l, x)
+    for _i in 0..n { out.push(0) }
+    for v in skip_n(l, x) { out.push(v) }
+    out
+}
+
+// 第 i 行每一格的样式
+pub fn srow(s: S, i: int) -> [int] {
+    out = ints()
+    for j in 0..s.cols { out.push(s.sty[i * s.cols + j]) }
+    out
+}
+
+fn set_srow(inout s: S, i: int, r: [int]) {
+    c = s.cols
+    z = zfit(c, r)
+    for j in 0..c { s.sty[i * c + j] = z[j] }
+}
+
+fn set_cur_srow(inout s: S, r: [int]) {
+    y = s.y
+    set_srow(&s, y, r)
+}
+
+// 第 i 行的字符（line）
+pub fn line(s: S, i: int) -> [int] {
+    out = ints()
+    for v in row(s, i) { out.push(cell_ch(v)) }
+    out
+}
+
+fn lim(n: int, v: int) -> int { if v < n { v } else { n - 1 } }
+fn one(n: int) -> int { if n == 0 { 1 } else { n } }
+fn sub(a: int, b: int) -> int { if a > b { a - b } else { 0 } }
+
+// 区间 [a, b] 里的行往上移 n 行，下面空出来的是空行（upRows）
+// 滚动区域从屏幕顶上开始时，往上滚 n 行之前先记下顶上的 n 行（最多整个区域，VtRegion 的 up_clamp）：LF / IND 和 SU 才记，DL 不记
+fn save_top(inout s: S, n: int) {
+    if s.top != 0 { return }
+    k = if n < s.bot + 1 { n } else { s.bot + 1 }
+    for i in 0..k {
+        r = row(s, i)
+        z = srow(s, i)
+        s.out.push(r)
+        s.outs.push(z)
+    }
+}
+
+// 快的版本：直接在格子里挪，不复制整个屏幕；结果和 scroll_up_ref 一样（tests.lark 对照）
+fn scroll_up(inout s: S, a: int, b: int, n: int) {
+    if s.slow {
+        scroll_up_ref(&s, a, b, n)
+        return
+    }
+    c = s.cols
+    for i in a..b + 1 {
+        d = i * c
+        if i + n <= b {
+            src = (i + n) * c
+            for j in 0..c {
+                v = s.cells[src + j]
+                z = s.sty[src + j]
+                s.cells[d + j] = v
+                s.sty[d + j] = z
+            }
+        } else {
+            for j in 0..c {
+                s.cells[d + j] = BLANK
+                s.sty[d + j] = 0
+            }
+        }
+    }
+}
+
+// 照着证明写的版本（upRows）
+fn scroll_up_ref(inout s: S, a: int, b: int, n: int) {
+    old: [[int]] = []
+    for i in 0..s.rows { old.push(row(s, i)) }
+    olds: [[int]] = []
+    for i in 0..s.rows { olds.push(srow(s, i)) }
+    c = s.cols
+    for i in a..b + 1 {
+        r = if i + n <= b { old[i + n].copy() } else { blank_row(c) }
+        set_row(&s, i, r)
+        z = if i + n <= b { olds[i + n].copy() } else { zeros(c) }
+        set_srow(&s, i, z)
+    }
+}
+
+// 区间 [a, b] 里的行往下移 n 行，上面空出来的是空行（downRows）
+fn scroll_down(inout s: S, a: int, b: int, n: int) {
+    if s.slow {
+        scroll_down_ref(&s, a, b, n)
+        return
+    }
+    c = s.cols
+    i = b
+    for i >= a {
+        d = i * c
+        if a + n <= i {
+            src = (i - n) * c
+            for j in 0..c {
+                v = s.cells[src + j]
+                z = s.sty[src + j]
+                s.cells[d + j] = v
+                s.sty[d + j] = z
+            }
+        } else {
+            for j in 0..c {
+                s.cells[d + j] = BLANK
+                s.sty[d + j] = 0
+            }
+        }
+        i -= 1
+    }
+}
+
+// 照着证明写的版本（downRows）
+fn scroll_down_ref(inout s: S, a: int, b: int, n: int) {
+    old: [[int]] = []
+    for i in 0..s.rows { old.push(row(s, i)) }
+    olds: [[int]] = []
+    for i in 0..s.rows { olds.push(srow(s, i)) }
+    c = s.cols
+    for i in a..b + 1 {
+        r = if a + n <= i { old[i - n].copy() } else { blank_row(c) }
+        set_row(&s, i, r)
+        z = if a + n <= i { olds[i - n].copy() } else { zeros(c) }
+        set_srow(&s, i, z)
+    }
+}
+
+// 换行（LF / IND）
+fn lf(inout s: S) {
+    if s.y == s.bot {
+        t = s.top
+        b = s.bot
+        save_top(&s, 1)
+        scroll_up(&s, t, b, 1)
+    } else {
+        s.y = lim(s.rows, s.y + 1)
+    }
+    s.pend = false
+}
+
+// 反向换行（RI）
+fn ri(inout s: S) {
+    if s.y == s.top {
+        t = s.top
+        b = s.bot
+        scroll_down(&s, t, b, 1)
+    } else {
+        s.y = sub(s.y, 1)
+    }
+    s.pend = false
+}
+
+// 改光标所在的一行（modRow）
+fn set_cur_row(inout s: S, r: [int]) {
+    y = s.y
+    c = s.cols
+    set_row(&s, y, row_fix(c, r))
+}
+
+fn wrap_if(inout s: S) {
+    if s.pend {
+        s.x = 0
+        s.pend = false
+        lf(&s)
+    }
+}
+
+fn wide_wrap(inout s: S, w: int) {
+    if w == 2 && s.cols <= s.x + 1 && 2 <= s.cols {
+        s.x = 0
+        s.pend = false
+        lf(&s)
+    }
+}
+
+// 快的版本：只改写到的格子和被拆散的宽字符的另一半（row_fix 的 heal 只会改这几格），不复制整行；结果和 put_ref 一样
+fn put(inout s: S, c: int, w: int) {
+    x = s.x
+    nc = s.cols
+    if s.slow || w < 1 || w > 2 || x + w > nc {
+        put_ref(&s, c, w)
+        return
+    }
+    base = s.y * nc
+    // 盖掉了宽字符的右半：左半变成空格
+    if s.cells[base + x] == SPACER && x > 0 { s.cells[base + x - 1] = BLANK }
+    // 盖掉了宽字符的左半：右半变成空格
+    last = x + w - 1
+    if is_wide(s.cells[base + last]) && last + 1 < nc { s.cells[base + last + 1] = BLANK }
+    pen = s.pen
+    if w == 2 {
+        s.cells[base + x] = wide(c)
+        s.cells[base + x + 1] = SPACER
+        s.sty[base + x + 1] = pen
+    } else {
+        s.cells[base + x] = c
+    }
+    s.sty[base + x] = pen
+    if x + w < nc {
+        s.x = x + w
+        s.pend = false
+    } else {
+        s.x = nc - 1
+        s.pend = true
+    }
+}
+
+// 照着证明写的版本（put）
+fn put_ref(inout s: S, c: int, w: int) {
+    x = s.x
+    r = write_row(row(s, s.y), x, c, w)
+    set_cur_row(&s, r)
+    pen = s.pen
+    z = set_at(srow(s, s.y), x, pen)
+    if w == 2 { z = set_at(z, x + 1, pen) }
+    set_cur_srow(&s, z)
+    if x + w < s.cols {
+        s.x = x + w
+        s.pend = false
+    } else {
+        s.x = s.cols - 1
+        s.pend = true
+    }
+}
+
+// 写一个字符，w 是它的宽度（print）
+pub fn write_char(inout s: S, c: int, w: int) {
+    if w == 0 || (w == 2 && s.cols < 2) { return }
+    wrap_if(&s)
+    wide_wrap(&s, w)
+    put(&s, c, w)
+}
+
+// 自动换行关掉时写一个字（VtMode 的 noWrap）：不先换行，也不留 pend，写到最后一列就停在那里
+pub fn write_nowrap(inout s: S, c: int, w: int) {
+    if w == 0 || (w == 2 && s.cols < 2) { return }
+    put(&s, c, w)
+    s.pend = false
+}
+
+// EL：0 光标到行尾、1 行首到光标、2 整行（elRows）
+fn el(inout s: S, m: int) {
+    r = row(s, s.y)
+    z = srow(s, s.y)
+    x = s.x
+    nc = s.cols
+    if m == 0 {
+        set_cur_row(&s, fill(r, x, nc))
+        set_cur_srow(&s, zfill(z, x, nc))
+    } else if m == 1 {
+        set_cur_row(&s, fill(r, 0, x + 1))
+        set_cur_srow(&s, zfill(z, 0, x + 1))
+    } else if m == 2 {
+        set_cur_row(&s, ints())
+        set_cur_srow(&s, ints())
+    }
+}
+
+// ED：0 光标到屏幕末尾、1 屏幕开头到光标、2 整个屏幕（edRows）
+fn ed(inout s: S, m: int) {
+    y = s.y
+    if m == 0 {
+        el(&s, 0)
+        for i in y + 1..s.rows { clear_row(&s, i) }
+    } else if m == 1 {
+        el(&s, 1)
+        for i in 0..y { clear_row(&s, i) }
+    } else if m == 2 {
+        for i in 0..s.rows { clear_row(&s, i) }
+    }
+}
+
+fn clear_row(inout s: S, i: int) {
+    c = s.cols
+    set_row(&s, i, blank_row(c))
+    set_srow(&s, i, zeros(c))
+}
+
+// DECSTBM（stbm）
+fn stbm(inout s: S, t: int, b: int) {
+    t1 = one(t) - 1
+    b1 = if b == 0 { s.rows - 1 } else { lim(s.rows, b - 1) }
+    if t1 < b1 {
+        s.x = 0
+        s.y = 0
+        s.pend = false
+        s.top = t1
+        s.bot = b1
+    }
+}
+
+pub enum Op {
+    Write(c: int, w: int)
+    Cr
+    Lf
+    Ri
+    Bs
+    Tab
+    Cup(r: int, c: int)
+    Up(n: int)
+    Down(n: int)
+    Fwd(n: int)
+    Back(n: int)
+    Ed(m: int)
+    El(m: int)
+    Ech(n: int)
+    Ich(n: int)
+    Dch(n: int)
+    Il(n: int)
+    Dl(n: int)
+    Su(n: int)
+    Sd(n: int)
+    Stbm(t: int, b: int)
+    Pen(v: int)          // 之后写的字用样式 v（阶段 4，模型里没有）
+}
+
+fn move_to(inout s: S, x: int, y: int) {
+    s.x = x
+    s.y = y
+    s.pend = false
+}
+
+pub fn step(inout s: S, op: Op) {
+    nr = s.rows
+    nc = s.cols
+    x = s.x
+    y = s.y
+    match op {
+        Write(c, w) => write_char(&s, c, w)
+        Cr => move_to(&s, 0, y)
+        Lf => lf(&s)
+        Ri => ri(&s)
+        Bs => move_to(&s, sub(x, 1), y)
+        Tab => move_to(&s, lim(nc, (x / 8 + 1) * 8), y)
+        Cup(r, c) => move_to(&s, lim(nc, one(c) - 1), lim(nr, one(r) - 1))
+        Up(n) => move_to(&s, x, sub(y, one(n)))
+        Down(n) => move_to(&s, x, lim(nr, y + one(n)))
+        Fwd(n) => move_to(&s, lim(nc, x + one(n)), y)
+        Back(n) => move_to(&s, sub(x, one(n)), y)
+        Ed(m) => ed(&s, m)
+        El(m) => el(&s, m)
+        Ech(n) => {
+            cur = row(s, s.y)
+            scur = srow(s, s.y)
+            set_cur_row(&s, fill(cur, x, x + one(n)))
+            set_cur_srow(&s, zfill(scur, x, x + one(n)))
+        }
+        Ich(n) => {
+            cur = row(s, s.y)
+            scur = srow(s, s.y)
+            set_cur_row(&s, ins(cur, x, one(n)))
+            set_cur_srow(&s, zins(scur, x, one(n)))
+        }
+        Dch(n) => {
+            cur = row(s, s.y)
+            scur = srow(s, s.y)
+            set_cur_row(&s, dch_row(cur, x, one(n)))
+            set_cur_srow(&s, dch_row(scur, x, one(n)))
+        }
+        Il(n) => {
+            if s.top <= y && y <= s.bot {
+                b = s.bot
+                scroll_down(&s, y, b, one(n))
+                move_to(&s, 0, y)
+            }
+        }
+        Dl(n) => {
+            if s.top <= y && y <= s.bot {
+                b = s.bot
+                scroll_up(&s, y, b, one(n))
+                move_to(&s, 0, y)
+            }
+        }
+        Su(n) => {
+            t = s.top
+            b = s.bot
+            save_top(&s, one(n))
+            scroll_up(&s, t, b, one(n))
+        }
+        Sd(n) => {
+            t = s.top
+            b = s.bot
+            scroll_down(&s, t, b, one(n))
+        }
+        Stbm(t, b) => stbm(&s, t, b)
+        Pen(v) => { s.pen = v }
+    }
+}
+
+// 屏幕是好的（Ok）：tests.lark 里每一步之后检查
+pub fn ok(s: S) -> bool {
+    if s.rows <= 0 || s.cols <= 0 || len(s.cells) != s.rows * s.cols || len(s.sty) != s.rows * s.cols { return false }
+    for i in 0..s.rows {
+        if !wf(row(s, i)) { return false }
+    }
+    s.x >= 0 && s.x < s.cols && s.y >= 0 && s.y < s.rows && s.top >= 0 && s.top <= s.bot && s.bot < s.rows
+}
+
+// ---------- 改大小（formal/Lark/VtSb.lean 的 resize） ----------
+
+// 行数改成 r 时顶上要挪走几行：让光标那一行留在屏幕里（cut）
+pub fn cut(s: S, r: int) -> int { sub(s.y + 1, r) }
+
+// 改成 r 行 × c 列：每一行补齐或截断（row_fix），挪走顶上的 cut 行（放进 out / outs，和滚出去的行一样等着放进滚动缓冲），
+// 光标限制在屏幕里，滚动区域变回整个屏幕
+pub fn resize(inout s: S, r: int, c: int) {
+    k = cut(s, r)
+    for i in 0..k {
+        lr = row(s, i)
+        lz = srow(s, i)
+        s.out.push(lr)
+        s.outs.push(lz)
+    }
+    cs = ints()
+    zs = ints()
+    for i in 0..r {
+        src = i + k
+        rr = if src < s.rows { row(s, src) } else { ints() }
+        rz = if src < s.rows { srow(s, src) } else { ints() }
+        for v in row_fix(c, rr) { cs.push(v) }
+        for v in zfit(c, rz) { zs.push(v) }
+    }
+    s.cells = cs
+    s.sty = zs
+    s.rows = r
+    s.cols = c
+    s.x = lim(c, s.x)
+    s.y = s.y - k
+    s.pend = false
+    s.top = 0
+    s.bot = r - 1
+}
+
+// 拿走等着放进滚动缓冲的行（行，样式）
+pub fn take_out(inout s: S) -> ([[int]], [[int]]) {
+    a = s.out.copy()
+    b = s.outs.copy()
+    s.out = no_rows()
+    s.outs = no_rows()
+    (a, b)
+}

@@ -1,0 +1,11 @@
+// 期望错误：有 inout 参数的函数不能直接当值用
+fn bump(inout n: int) -> int {
+    n += 1
+    n
+}
+
+fn ap(f: fn(int) -> int) -> int { f(1) }
+
+fn main() {
+    print("#{ap(bump)}")
+}

@@ -1,0 +1,23 @@
+// len(x)：x 是自己的类型时调用它的 fn iter_len(x: T) -> int（需要 lark1 及以后的版本）
+import "std/map"
+import "std/set"
+import "std/deque"
+import "std/heap"
+
+// 只有 iter_len：能 len，不能 for in
+type Bag {
+    n: int
+}
+
+fn iter_len(b: Bag) -> int { b.n }
+
+fn main() {
+    m: map.Map[str, int] = map.new()
+    m["a"] = 1
+    m["b"] = 2
+    s = set.of([1, 2, 2, 3])
+    d = deque.of(["x"])
+    h = heap.of([5, 1, 4, 1])
+    print("map #{len(m)}，set #{len(s)}，deque #{len(d)}，heap #{len(h)}")
+    print("自己的类型：#{len(Bag(n: 7))}，str #{len("云雀")}，列表 #{len([1, 2])}")
+}

@@ -1,0 +1,134 @@
+// lark-bench：基准测试，make bench 构建并运行
+//
+// bench/*.lark 的每个程序用 lark1 编译成 C 一次，再按几组 C 编译选项各编译一份，每份运行几次取最短的时间（毫秒）。
+// 另外量“lark1 编译自己”：先用 lark1 把 compiler/*.lark 编译成 C，按同样几组选项编译，各自去编译一遍 compiler/*.lark。
+// 选项组：默认；-DLK_NOLINE（只记函数、不记行号）；-DLK_NOTRACE（调用栈整个关掉）；-DLK_UNCHECKED（不查整数溢出）；
+// NOTRACE 和 UNCHECKED 都关。NOTRACE 减去 NOLINE 的那部分就是每次调用记帧的开销。
+// 括号里是和默认那一列相比快了或慢了多少，也就是那一项开销的大小。
+// 程序的输出写到 build/b/，只是为了不让计算被优化掉，不比较。
+//
+// 环境变量 LARK、CC、CFLAGS 同 tools/test.lark；BENCH_RUNS 是每份运行的次数（默认 5）。
+import "std/fmt"
+import "std/os"
+import "std/time"
+import "std/str"
+
+const B = "build/b"
+
+type Cfg {
+    lark: str
+    cc: str
+    cflags: str
+    runs: int
+}
+
+fn q(s: str) -> str { "'" + str.replace_all(s, "'", "'\\''") + "'" }
+
+// (表头, 额外的 C 编译选项)
+fn variants() -> [(str, str)] {
+    [("默认", ""), ("NOLINE", "-DLK_NOLINE"), ("NOTRACE", "-DLK_NOTRACE"), ("UNCHECKED", "-DLK_UNCHECKED"),
+        ("两项都关", "-DLK_NOTRACE -DLK_UNCHECKED")]
+}
+
+// 和 Makefile 的 SRC1 一样
+fn compiler_srcs() -> [str] {
+    ["compiler/ast.lark", "compiler/lex.lark", "compiler/parse.lark", "compiler/types.lark", "compiler/check.lark",
+        "compiler/own.lark", "compiler/cg_types.lark", "compiler/cg_expr.lark", "compiler/cg_stmt.lark",
+        "compiler/main.lark"]
+}
+
+// 运行 runs 次，返回最短的毫秒数；有一次退出码不为 0 就返回 -1
+fn best_ms(cmd: str, runs: int) -> int {
+    best = -1
+    for _ in 0..runs {
+        t0 = time.now()      // 单调时钟：墙钟可能被系统调整
+        code = os.shell(cmd)
+        dt = time.elapsed_ms(t0)
+        if code != 0 { return -1 }
+        if best < 0 || dt < best { best = dt }
+    }
+    best
+}
+
+fn cell(ms: int, base: int) -> str {
+    if ms < 0 { return "失败" }
+    if base <= 0 || ms == base { return "#{ms}" }
+    d = (ms - base) * 100 / base
+    sign = if d > 0 { "+" } else { "" }
+    "#{ms}（#{sign}#{d}%）"
+}
+
+// 把 c 按每组选项编译、运行（参数是 args），返回表格的一行
+fn bench_row(cfg: Cfg, name: str, c: str, args: str) -> [str] {
+    print("… #{name}")
+    times: [int] = []
+    for i, (_, flags) in variants() {
+        exe = "#{B}/#{name}_#{i}"
+        cerr = exe + ".cerr"
+        out = exe + ".out"
+        ms = -1
+        if os.shell("#{cfg.cc} #{cfg.cflags} #{flags} -Iruntime #{q(c)} -o #{q(exe)} -lm 2> #{q(cerr)}") != 0 {
+            print("  C 编译失败（#{flags}），见 #{cerr}")
+        } else {
+            ms = best_ms("./#{q(exe)} #{args} > #{q(out)} 2>&1", cfg.runs)
+            if ms < 0 { print("  运行失败（#{flags}），见 #{out}") }
+        }
+        times.push(ms)
+    }
+    row: [str] = [name]
+    for t in times { row.push(cell(t, times[0])) }
+    row
+}
+
+// 用 lark1 把 files 编译成 c；失败时打印报错
+fn to_c(cfg: Cfg, files: [str], c: str) -> bool {
+    lerr = c + ".lerr"
+    parts: [str] = []
+    for f in files { parts.push(q(f)) }
+    fl = join(parts, " ")
+    if os.shell("#{cfg.lark} -w #{fl} -o #{q(c)} 2> #{q(lerr)}") == 0 { return true }
+    print("lark1 编译失败：#{c}")
+    print(os.read(lerr) ?? "")
+    false
+}
+
+fn main() {
+    cfg = Cfg(lark: os.env("LARK") ?? "./build/lark1", cc: os.env("CC") ?? "cc",
+        cflags: os.env("CFLAGS") ?? "-std=gnu11 -O2 -pthread", runs: parse_int(os.env("BENCH_RUNS") ?? "5"))
+    match os.mkdir_all(B) {
+        Ok => {}
+        Err(e) => {
+            print(e)
+            exit(1)
+        }
+    }
+    header: [str] = ["程序（毫秒）"]
+    for (label, _) in variants() { header.push(label) }
+    rows: [[str]] = [header]
+    names: [str] = []
+    listed = os.read_dir("bench")
+    match take listed {
+        Ok(ns) => { names = ns }
+        Err(e) => {
+            print(e)
+            exit(1)
+        }
+    }
+    for n in names {
+        if str.ends_with(n, ".lark") {
+            name = os.stem(n)
+            c = "#{B}/#{name}.c"
+            if to_c(cfg, [os.join_path("bench", n)], c) { rows.push(bench_row(cfg, name, c, "")) }
+        }
+    }
+    srcs = compiler_srcs()
+    self_c = "#{B}/self.c"
+    if to_c(cfg, srcs, self_c) {
+        sargs: [str] = []
+        for f in srcs { sargs.push(q(f)) }
+        sl = join(sargs, " ")
+        rows.push(bench_row(cfg, "lark1 编译自己", self_c, "-w #{sl} -o #{B}/self_out.c"))
+    }
+    print("")
+    print(fmt.table(rows))
+}

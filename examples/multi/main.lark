@@ -1,0 +1,9 @@
+// 多文件示例：lark1 examples/multi/main.lark examples/multi/shape.lark -o out.c
+fn main() {
+    shapes = [Circle(2), Rect(3, 4)]
+    total = 0
+    for s in shapes {
+        total += area(s)
+    }
+    print("总面积：#{total}")
+}

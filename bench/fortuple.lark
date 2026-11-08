@@ -1,0 +1,10 @@
+// 基准：for 里拆元组（拆出的名字借用元素，不复制）；和 forfield.lark 做的事一样，两者应该一样快
+fn main() {
+    xs: [(str, int)] = []
+    for i in 0..100000 { xs.push(("键#{i % 100}", i)) }
+    a = 0
+    for _ in 0..1000 {
+        for (k, v) in xs { a += len(k) + v % 3 }
+    }
+    print("#{a}")
+}

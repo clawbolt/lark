@@ -1,0 +1,74 @@
+// std/math、std/fmt、std/json（需要 lark1 及以后的版本）
+// 编译：lark1 examples/stdlib2.lark -o out.c
+import "std/math"
+import "std/fmt"
+import "std/json"
+
+// 取对象的字段；没有时为 null
+fn field(j: json.Json, k: str) -> json.Json {
+    match json.get(j, k) {
+        Some(v) => v.copy()
+        None => json.Null
+    }
+}
+
+// 质数判断：示例自己写（标准库不收这种教学用的函数）
+fn is_prime(n: int) -> bool {
+    if n < 2 { return false }
+    d = 2
+    for d * d <= n {
+        if n % d == 0 { return false }
+        d += 1
+    }
+    true
+}
+
+fn main() {
+    // ---------- math ----------
+    print("abs -5 = #{math.abs(-5)}，clamp(15, 0, 10) = #{math.clamp(15, 0, 10)}")
+    print("2^10 = #{math.pow(2, 10)}，3^13 = #{math.pow(3, 13)}")
+    print("gcd(84, 36) = #{math.gcd(84, 36)}，lcm(4, 6) = #{math.lcm(4, 6)}")
+    print("isqrt(99) = #{math.isqrt(99)}，isqrt(MAX) = #{math.isqrt(math.MAX)}")
+    ps: [int] = []
+    for n in 0..30 {
+        if is_prime(n) { ps.push(n) }
+    }
+    print("30 以内的质数：#{ps}")
+    print("-7 / 2：#{-7 / 2} 和 #{math.floor_div(-7, 2)}，-7 % 3：#{-7 % 3} 和 #{math.floor_mod(-7, 3)}")
+    print("和：#{math.sum([1, 2, 3, 4])}")
+
+    // ---------- fmt ----------
+    print("255 = 0x#{fmt.hex(255)} = 0b#{fmt.bin(255)}，-35 的 36 进制：#{fmt.radix(-35, 36)}")
+    print("MIN 的十六进制：#{fmt.hex(math.MIN)}")
+    print("#{fmt.thousands(1234567)} #{fmt.thousands(-1000)} #{fmt.thousands(999)}")
+    print("#{fmt.fixed(31416, 4)} #{fmt.fixed(5, 2)} #{fmt.fixed(-5, 2)}")
+    print("[" + fmt.align_left("中文", 6) + "|" + fmt.align_right("ab", 4) + "|" + fmt.align_center("x", 5) + "]")
+    rows = [["水果", "数量", "单价"], ["苹果", "3", "5"], ["哈密瓜", "12", "30"]]
+    print(fmt.table(rows))
+
+    // ---------- json ----------
+    text = "{\"name\": \"云雀\", \"tags\": [\"鸟\", \"会唱歌\"], \"age\": 3, \"ok\": true, \"none\": null, \"esc\": \"a\\\"b\\u00e9\\ud83d\\ude00\"}"
+    match json.parse(text) {
+        Ok(j) => {
+            print(json.format(j))
+            nm = field(j, "name")
+            tags = field(j, "tags")
+            age = json.as_int(field(j, "age")) ?? 0
+            second = json.at(tags, 1)
+            print("name = #{nm}，tags 有 #{json.count(tags)} 个，第二个是 #{second}")
+            ks = json.keys(j)
+            print("age + 1 = #{age + 1}，键：#{ks}")
+            print(json.format_pretty(j))
+        }
+        Err(e) => print("解析失败：#{e}")
+    }
+    bad = ["[1, 2,]", "{\"a\" 1}", "\"abc", "1.", "[1] x"]
+    for b in bad {
+        match json.parse(b) {
+            Ok(v) => print("意外成功：#{v}")
+            Err(e) => print("#{b} → #{e}")
+        }
+    }
+    built = json.Obj(["城市", "人口"], [json.Str("杭州"), json.Num(12200000)])
+    print(json.format(built))
+}

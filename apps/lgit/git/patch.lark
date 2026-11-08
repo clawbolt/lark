@@ -1,0 +1,40 @@
+// lgit · git 格式的补丁：diff --git 头、新建 / 删除 / 改权限、二进制文件。行的差异用 std/diff 求
+import "std/diff"
+
+// 和 git 一样只看前 8000 个字节里有没有 0
+pub fn is_binary(text: str) -> bool {
+    n = if len(text) < 8000 { len(text) } else { 8000 }
+    for i in 0..n {
+        if byte_at(text, i) == 0 { return true }
+    }
+    false
+}
+
+// 统一格式的正文（从 @@ 开始），和 git 一样上下文 3 行、@@ 后面带上所在的函数；两边一样时是 ""
+pub fn hunks(old_text: str, new_text: str) -> str { diff.hunks_with(old_text, new_text, diff.Opts(context: 3, func: true)) }
+
+fn short(id: str) -> str { if id == "" { "0000000" } else { slice(id, 0, 7) } }
+
+// 一个文件的完整差异。old_id 为 "" 表示新文件，new_id 为 "" 表示删掉了；两边一样时是 ""
+pub fn file_patch(path: str, old_mode: str, old_id: str, old_text: str, new_mode: str, new_id: str, new_text: str) -> str {
+    if old_id == new_id && old_mode == new_mode { return "" }
+    s = "diff --git a/#{path} b/#{path}\n"
+    if old_id == "" {
+        s += "new file mode #{new_mode}\nindex 0000000..#{short(new_id)}\n"
+    } else if new_id == "" {
+        s += "deleted file mode #{old_mode}\nindex #{short(old_id)}..0000000\n"
+    } else if old_mode != new_mode {
+        s += "old mode #{old_mode}\nnew mode #{new_mode}\n"
+        if old_id != new_id { s += "index #{short(old_id)}..#{short(new_id)}\n" }
+    } else {
+        s += "index #{short(old_id)}..#{short(new_id)} #{new_mode}\n"
+    }
+    if old_id == new_id { return s }
+    src = if old_id == "" { "/dev/null" } else { "a/" + path }
+    dst = if new_id == "" { "/dev/null" } else { "b/" + path }
+    if is_binary(old_text) || is_binary(new_text) { return s + "Binary files #{src} and #{dst} differ\n" }
+    h = hunks(old_text, new_text)
+    // 空文件新建或删掉时没有 @@，git 也不写 --- 和 +++
+    if h == "" { return s }
+    s + "--- #{src}\n+++ #{dst}\n" + h
+}

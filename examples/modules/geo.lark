@@ -1,0 +1,33 @@
+// 一个模块：只有 pub 的项能被 import 它的文件使用；结构体的字段也要写 pub 才能在外面读。
+// 字段全是 pub 的结构体（比如 Vec2）在外面也能直接构造、修改；有私有字段的，外面只能读 pub 的字段
+pub type Vec2 {
+    pub x: int
+    pub y: int
+}
+
+pub fn add(a: Vec2, b: Vec2) -> Vec2 { Vec2(x: a.x + b.x, y: a.y + b.y) }
+
+pub fn dist2(a: Vec2, b: Vec2) -> int { sq(a.x - b.x) + sq(a.y - b.y) }
+
+// 私有的辅助函数：模块外看不见
+fn sq(n: int) -> int { n * n }
+
+pub enum Where {
+    Origin
+    OnAxis(n: int)
+    Other
+}
+
+pub fn classify(v: Vec2) -> Where {
+    if v.x == 0 && v.y == 0 {
+        Origin
+    } else if v.x == 0 || v.y == 0 {
+        OnAxis(v.x + v.y)
+    } else {
+        Other
+    }
+}
+
+// 常量也按 pub 控制可见性：外面写 geo.UNIT
+pub const ORIGIN_NAME = "原点"
+pub const UNIT = 1

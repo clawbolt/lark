@@ -1,0 +1,7 @@
+// 期望错误：? 两边的错误类型不同（int 与 str），并且没有 fn from(take e: str) -> int
+fn f() -> int!int {
+    n = try_parse_int("1")?
+    n
+}
+
+fn main() {}

@@ -1,0 +1,3 @@
+tests/err1/spawn_outside.lark:5:5: 错误：spawn 只能直接写在 scope { … } 里：scope 结束前会等所有 spawn 的任务完成
+ 5 |     spawn(work, 1)
+   |     ^

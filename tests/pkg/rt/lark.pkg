@@ -1,0 +1,3 @@
+# 运行时的测试项目：栈溢出的报告、任务读管道时不占着工作线程（见 tools/test.lark 的 pkg_cases）
+name = rt
+version = 0.1.0

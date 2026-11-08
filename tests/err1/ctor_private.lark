@@ -1,0 +1,7 @@
+// 期望错误：有没写 pub 的字段的结构体，在模块外不能直接构造（要用模块提供的函数）
+import "std/iter"
+
+fn main() {
+    r = iter.Range(cur: 0, end: 3)
+    print("#{iter.collect(r)}")
+}

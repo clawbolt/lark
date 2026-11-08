@@ -1,0 +1,20 @@
+打开 a.txt
+读取 a.txt
+打开 b.txt
+内层作用域结束
+关闭 b.txt
+打开 c.txt
+接管 c.txt
+关闭 c.txt
+打开 a2.txt
+关闭 a.txt
+打开 x
+打开 y
+打开 out.csv
+main 结束
+关闭 out.csv
+（已关闭的连接）
+断开连接 7
+关闭 x
+关闭 y
+关闭 a2.txt

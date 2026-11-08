@@ -1,0 +1,8 @@
+// 期望错误：float 不能 match（浮点数的相等比较不可靠），请用 if 和 < 比较
+fn main() {
+    x = 0.5
+    s = match x {
+        _ => "?"
+    }
+    print(s)
+}

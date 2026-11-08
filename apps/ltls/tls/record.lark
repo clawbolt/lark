@@ -1,0 +1,167 @@
+// TLS 1.3 的记录层（RFC 8446 第 5 节）和握手消息的格式（第 4 节）。只有 TLS_CHACHA20_POLY1305_SHA256。
+// 先证明再写：对应 formal/Lark/Tls13.lean。函数和定义一一对应：
+//   frame / unframe（unframe_frame、unframe_some：写出来再读回来不变；读成功时输入正好是 写出来的 + 剩下的）
+//   write / parse ↔ recWrite / recParse（rec_parse_write、rec_parse_some；长度超过 MAX_FRAG 拒绝）
+//   hs_msg / hs_parse ↔ hsMsg / hsParse（hs_parse、hs_parse_some）
+//   inner / unpad（unpad_inner、unpad_zeros：全是 0 的拒绝）
+//   nonce（nonce_inj：序号小于 2^64 时不同的序号给出不同的 nonce）
+//   protect / unprotect（unprotect_protect、protect_rec）
+// 模型里用 “剩下的” 列表，这里用下标 at / next，不复制剩下的字节。实验性：没有经过审计
+import "tls/aead"
+
+// 加密的记录最长 2^14 + 256 字节（第 5.2 节）
+pub const MAX_FRAG = 16640
+
+pub const CHANGE_CIPHER_SPEC = 20
+pub const ALERT = 21
+pub const HANDSHAKE = 22
+pub const APPLICATION_DATA = 23
+
+// x 的低 k 字节，大端（be）
+pub fn push_be(inout out: [u8], k: int, x: int) {
+    i = k - 1
+    for i >= 0 {
+        if i >= 8 { out.push(0) } else { out.push(((x >>> (8 * i)) & 255).wrap_u8()) }
+        i -= 1
+    }
+}
+
+// d[at..at+k) 按大端读（unbe）
+pub fn read_be(d: [u8], at: int, k: int) -> int {
+    x = 0
+    for i in 0..k { x = (x << 8) | d[at + i].to_int() }
+    x
+}
+
+fn sub(d: [u8], a: int, b: int) -> [u8] {
+    out: [u8] = []
+    out.reserve(b - a)
+    for i in a..b { out.push(d[i]) }
+    out
+}
+
+// ---------- 带长度前缀的格式 ----------
+
+// k 字节大端长度 + 内容。长度放不进 k 字节时 panic（调用的人写错了；unframe_frame 要 len(b) < 256^k）
+pub fn frame(k: int, b: [u8]) -> [u8] {
+    if k < 8 && len(b) >= (1 << (8 * k)) { panic("frame：#{len(b)} 字节放不进 #{k} 字节的长度") }
+    out: [u8] = []
+    push_be(&out, k, len(b))
+    for x in b { out.push(x) }
+    out
+}
+
+pub type Piece {
+    pub body: [u8]
+    pub next: int    // 后面的数据从这里开始
+}
+
+// 从 d[at] 读一段：不够 k 字节、或者说的长度比剩下的多，是错误（unframe 是 none）
+pub fn unframe(k: int, d: [u8], at: int) -> Piece! {
+    if len(d) - at < k { return Err("长度前缀要 #{k} 字节，只剩 #{len(d) - at} 字节") }
+    n = read_be(d, at, k)
+    if len(d) - at - k < n { return Err("长度是 #{n}，只剩 #{len(d) - at - k} 字节") }
+    Ok(Piece(body: sub(d, at + k, at + k + n), next: at + k + n))
+}
+
+// ---------- 记录（第 5.1 节） ----------
+
+// 类型、两个字节的版本（一般是 3 3，第一个 ClientHello 是 3 1）、2 字节长度、内容
+pub fn write(kind: int, v1: int, v2: int, f: [u8]) -> [u8] {
+    if len(f) > MAX_FRAG { panic("记录：内容 #{len(f)} 字节，超过 #{MAX_FRAG}") }
+    out: [u8] = [kind.wrap_u8(), v1.wrap_u8(), v2.wrap_u8()]
+    for x in frame(2, f) { out.push(x) }
+    out
+}
+
+pub type Record {
+    pub kind: int
+    pub body: [u8]
+    pub next: int
+}
+
+// 版本不看（第 5.1 节：MUST be ignored）；长度超过 MAX_FRAG 时拒绝
+pub fn parse(d: [u8], at: int) -> Record! {
+    if len(d) - at < 3 { return Err("记录：头不完整") }
+    p = match take unframe(2, d, at + 3) {
+        Ok(p) => p
+        Err(e) => { return Err("记录：#{e}") }
+    }
+    if len(p.body) > MAX_FRAG { return Err("记录：长度 #{len(p.body)} 超过 #{MAX_FRAG}") }
+    Ok(Record(kind: d[at].to_int(), body: p.body.copy(), next: p.next))
+}
+
+// ---------- 握手消息（第 4 节）：类型 + 3 字节长度 + 内容 ----------
+
+pub fn hs_msg(kind: int, body: [u8]) -> [u8] {
+    out: [u8] = [kind.wrap_u8()]
+    for x in frame(3, body) { out.push(x) }
+    out
+}
+
+pub fn hs_parse(d: [u8], at: int) -> Record! {
+    if len(d) - at < 1 { return Err("握手消息：没有数据") }
+    p = match take unframe(3, d, at + 1) {
+        Ok(p) => p
+        Err(e) => { return Err("握手消息：#{e}") }
+    }
+    Ok(Record(kind: d[at].to_int(), body: p.body.copy(), next: p.next))
+}
+
+// ---------- 内层明文（第 5.2、5.4 节）：内容 + 真正的类型 + z 个 0 ----------
+
+pub fn inner(content: [u8], kind: int, z: int) -> [u8] {
+    if kind == 0 { panic("内层明文：类型不能是 0") }
+    out = content.copy()
+    out.push(kind.wrap_u8())
+    for _i in 0..z { out.push(0) }
+    out
+}
+
+pub type Inner {
+    pub kind: int
+    pub content: [u8]
+}
+
+// 从后往前跳过 0，第一个不是 0 的是类型；全是 0 时是错误（第 5.4 节要求发 unexpected_message）
+pub fn unpad(d: [u8]) -> Inner! {
+    i = len(d) - 1
+    for i >= 0 && d[i].to_int() == 0 { i -= 1 }
+    if i < 0 { return Err("记录：内层明文全是 0，找不到类型") }
+    Ok(Inner(kind: d[i].to_int(), content: sub(d, 0, i)))
+}
+
+// ---------- 加密的记录（第 5.2、5.3 节） ----------
+
+// 每条记录的 nonce：iv 异或 序号（补成 12 字节大端）
+pub fn nonce(iv: [u8], seq: int) -> [u8] {
+    if len(iv) != 12 { panic("nonce：iv 要 12 字节") }
+    if seq < 0 { panic("nonce：序号不能是负数") }
+    s: [u8] = []
+    push_be(&s, 12, seq)
+    out: [u8] = []
+    for i in 0..12 { out.push((iv[i].to_int() ^ s[i].to_int()).wrap_u8()) }
+    out
+}
+
+// 记录头：类型 23、版本 3 3、长度；它也是 AEAD 的 aad
+fn aad_of(n: int) -> [u8] {
+    out: [u8] = [23, 3, 3]
+    push_be(&out, 2, n)
+    out
+}
+
+// 加密一条内层明文（先用 inner 拼好），返回整条记录
+pub fn protect(key: [u8], iv: [u8], seq: int, inr: [u8]) -> [u8] {
+    if len(inr) + 16 > MAX_FRAG { panic("protect：内层明文 #{len(inr)} 字节，加上标签超过 #{MAX_FRAG}") }
+    aad = aad_of(len(inr) + 16)
+    out = aad.copy()
+    for x in aead.seal(key, nonce(iv, seq), inr, aad) { out.push(x) }
+    out
+}
+
+// 整条记录（头 + 密文 + 标签）解密，返回内层明文；认证不过是错误
+pub fn unprotect(key: [u8], iv: [u8], seq: int, rec: [u8]) -> [u8]! {
+    if len(rec) < 5 { return Err("记录：头不完整") }
+    aead.open(key, nonce(iv, seq), sub(rec, 5, len(rec)), sub(rec, 0, 5))
+}

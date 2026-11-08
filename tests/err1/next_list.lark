@@ -1,0 +1,7 @@
+// 期望错误：zip、chain 只按第一个参数重载，第二个来源要是迭代器，列表要先用 each 包一下
+import "std/iter"
+
+fn main() {
+    ys = iter.zip([1, 2, 3], [4, 5, 6]).collect()
+    print("#{ys}")
+}

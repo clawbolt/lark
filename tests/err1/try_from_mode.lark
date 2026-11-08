@@ -1,0 +1,13 @@
+// 期望错误：用于 ? 的转换函数要写成 fn from(take e: …) -> …
+enum AppErr {
+    Parse(msg: str)
+}
+
+fn from(e: str) -> AppErr { Parse(e.copy()) }
+
+fn f() -> int!AppErr {
+    n = try_parse_int("1")?
+    n
+}
+
+fn main() {}

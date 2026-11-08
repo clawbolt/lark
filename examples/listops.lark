@@ -1,0 +1,29 @@
+// 列表中间的插入和删除、空列表上不 panic 的 pop，以及字符串的 \e 和 \xHH 转义（需要 lark1 及以后的版本）
+// 编译：lark1 examples/listops.lark -o out.c
+
+fn main() {
+    // insert_at(i, x)：放在第 i 个位置（可以等于长度，也就是放在最后），后面的往后挪；remove_at(i) 拿走并返回第 i 个
+    xs = [10, 20, 30]
+    xs.insert_at(1, 15)
+    xs.insert_at(0, 5)
+    xs.insert_at(len(xs), 99)
+    print("#{xs}")
+    gone = xs.remove_at(2)
+    print("拿走 #{gone}，剩下 #{xs}")
+    names = ["b"]
+    names.insert_at(0, "a")
+    last = names.remove_at(1)
+    print("#{names} #{last}")
+    // try_pop：空列表时是 None；pop 在空列表上 panic
+    stack = [1, 2]
+    a = stack.try_pop()
+    b = stack.try_pop()
+    c = stack.try_pop()
+    print("#{a} #{b} #{c}，空了：#{len(stack)}")
+    // \e 是 ESC（终端的控制序列），\xHH 是任意一个字节
+    s = "\e[1m\x41\x42\e[0m"
+    print("#{len(s)} 个字节，第一个 #{byte_at(s, 0)}，中间是 #{slice(s, 4, 6)}")
+    zh = "\xe4\xb8\xad"
+    same = zh == "中"
+    print("三个字节拼出 #{zh}：#{same}")
+}

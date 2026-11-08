@@ -1,0 +1,7 @@
+// 期望错误：xs 正被 for 或 match 借用，不能修改
+fn main() {
+    xs = [1, 2]
+    for x in xs {
+        xs.push(x)
+    }
+}

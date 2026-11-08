@@ -1,0 +1,176 @@
+// std/net 的 UDP、Unix 域套接字和 lookup（TCP 见 examples/net.lark）。只用本机地址，不连外网
+import "std/net"
+import "std/os"
+import "std/str"
+import "std/time"
+
+fn sock_path(tag: str) -> str { os.join_path(os.temp_dir(), "lark_net_#{tag}_#{time.unix_ns() % 1_000_000_000}.sock") }
+
+fn must(r: ()!) {
+    match r {
+        Ok => {}
+        Err(e) => panic(e)
+    }
+}
+
+// ---------- Unix 域套接字 ----------
+
+type UnixServer {
+    l: net.Listener
+}
+
+type UnixClient {
+    path: str
+    out: Chan[str]
+}
+
+// 接一个连接，读一行，加个前缀写回去
+fn unix_echo_once(inout s: UnixServer) -> ()! {
+    c = s.l.accept()?
+    line = c.read_line() ?? "?"
+    c.write_line("回声：" + line)?
+}
+
+fn unix_server(take s: UnixServer) { must(unix_echo_once(&s)) }
+
+fn unix_talk(cl: UnixClient) -> ()! {
+    c = net.connect_unix(cl.path)?
+    c.write_line("云雀")?
+    cl.out.send(c.read_line() ?? "?")
+}
+
+fn unix_client(take cl: UnixClient) { must(unix_talk(cl)) }
+
+test "Unix 域套接字" {
+    p = sock_path("u")
+    l = match take net.listen_unix(p) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    // 路径已经被占着：报错，不替你删
+    match net.listen_unix(p) {
+        Ok(_) => panic("不应该成功")
+        Err(e) => assert(str.starts_with(e, "无法监听 #{p}："))
+    }
+    out: Chan[str] = chan()
+    scope {
+        spawn(unix_server, UnixServer(l: l))
+        spawn(unix_client, UnixClient(path: p.copy(), out: out.copy()))
+    }
+    assert_eq(out.recv() ?? "", "回声：云雀")
+    must(os.remove(p))
+    match net.connect_unix(p) {
+        Ok(_) => panic("不应该连上")
+        Err(e) => assert(str.starts_with(e, "无法连接 #{p}："))
+    }
+    match net.connect_unix(str.repeat("x", 200)) {
+        Ok(_) => panic("不应该连上")
+        Err(e) => assert(str.contains(e, "路径太长"))
+    }
+}
+
+// ---------- UDP ----------
+
+fn udp(host: str) -> net.UdpSocket {
+    match take net.listen_udp(host, 0) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+}
+
+fn recv_one(inout u: net.UdpSocket, max: int) -> net.Datagram {
+    match take u.recv_from(max) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+}
+
+type Echo {
+    u: net.UdpSocket
+}
+
+// 收一个数据报，加个前缀发回给发送方
+fn udp_echo_once(inout e: Echo) -> ()! {
+    d = e.u.recv_from(1500)?
+    e.u.send_to(d.host, d.port, "回：" + d.data)?
+}
+
+fn udp_echo(take e: Echo) { must(udp_echo_once(&e)) }
+
+type Asker {
+    u: net.UdpSocket
+    to: int
+    out: Chan[str]
+}
+
+// 等对面的任务开始收以后再发；对面回信之前，这个任务在 recv_from 里挂起
+fn udp_ask_once(inout a: Asker) -> ()! {
+    sleep_ms(5)
+    a.u.send_to("127.0.0.1", a.to, "你好")?
+    a.u.set_timeout_ms(5000)?
+    r = a.u.recv_from(1500)?
+    a.out.send(r.data)
+}
+
+fn udp_ask(take a: Asker) { must(udp_ask_once(&a)) }
+
+test "UDP" {
+    a = udp("127.0.0.1")
+    b = udp("127.0.0.1")
+    pa = a.local_port() ?? 0
+    pb = b.local_port() ?? 0
+    assert(pa > 0 && pb > 0 && pa != pb)
+    // 不用并发：直接发、直接收（数据报里可以有 0 字节）
+    msg = "ping" + from_byte(0) + "云雀"
+    must(a.send_to("127.0.0.1", pb, msg))
+    d = recv_one(&b, 1500)
+    assert_eq(d.data, msg)
+    assert_eq(d.host, "127.0.0.1")
+    assert_eq(d.port, pa)
+    assert_eq("#{d}", "Datagram(#{len(msg)} 字节，来自 127.0.0.1:#{pa})")
+    // 比 max 长的部分丢掉
+    must(a.send_to("127.0.0.1", pb, "abcdef"))
+    assert_eq(recv_one(&b, 3).data, "abc")
+    // 在任务里收：没有数据时任务挂起，收到以后醒来回信
+    out: Chan[str] = chan()
+    scope {
+        spawn(udp_echo, Echo(u: b))
+        spawn(udp_ask, Asker(u: a, to: pb, out: out.copy()))
+    }
+    assert_eq(out.recv() ?? "", "回：你好")
+    // 超时
+    c = udp("127.0.0.1")
+    must(c.set_timeout_ms(20))
+    match c.recv_from(10) {
+        Ok(_) => panic("不应该收到")
+        Err(e) => assert(str.ends_with(e, "：超时"))
+    }
+    assert(str.starts_with("#{c}", "UdpSocket(fd "))
+    match net.listen_udp("127.0.0.1", 70000) {
+        Ok(_) => panic("不应该成功")
+        Err(e) => assert_eq(e, "无法监听 UDP 127.0.0.1:70000：端口要在 0..65535 里")
+    }
+    match c.send_to("", 1, "x") {
+        Ok => panic("不应该成功")
+        Err(e) => assert_eq(e, "无法发送到 :1：没有给地址")
+    }
+    must(c.close())
+    match c.send_to("127.0.0.1", pb, "x") {
+        Ok => panic("不应该成功")
+        Err(e) => assert_eq(e, "net：UdpSocket 已经关闭")
+    }
+}
+
+test "lookup" {
+    ips = net.lookup("127.0.0.1") ?? []
+    assert(ips == ["127.0.0.1"])
+    // localhost 至少有一个本机地址（有的系统只有 IPv4，有的两个都有）
+    ls = net.lookup("localhost") ?? []
+    assert(len(ls) >= 1)
+    for x in ls { assert(x == "127.0.0.1" || x == "::1") }
+    // .invalid 这个后缀保证不存在（RFC 6761）；出错信息带着主机名，原因各个系统写得不一样，不比较
+    match net.lookup("no-such-host.invalid") {
+        Ok(_) => panic("不应该解析出来")
+        Err(e) => assert(str.starts_with(e, "无法解析 no-such-host.invalid："))
+    }
+}

@@ -1,0 +1,12 @@
+// 期望错误：extern "c" 的参数只能是能对应到 C 的类型
+type Point {
+    x: int
+}
+
+extern "c" {
+    fn draw(p: Point)
+}
+
+fn main() {
+    draw(Point(x: 1))
+}

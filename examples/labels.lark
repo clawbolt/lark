@@ -1,0 +1,83 @@
+// 带标签的循环：名字: for …，里面的 break 名字 / continue 名字 跳出或者继续外层的循环。
+// 没写标签的 break / continue 照旧只管最里层。跳出去时沿途的值照常释放、defer 照常执行
+type Res {
+    name: str
+}
+
+fn drop(inout r: Res) { print("  释放 #{r.name}") }
+
+// 在二维表里找第一个负数：找到就跳出两层
+fn find_neg(rows: [[int]]) -> (int, int)? {
+    hit: (int, int)? = None
+    outer: for i, row in rows {
+        for j, x in row {
+            if x < 0 {
+                hit = Some((i, j))
+                break outer
+            }
+        }
+    }
+    hit
+}
+
+fn main() {
+    print("找负数：#{find_neg([[1, 2], [3, -4, 5], [-6]])} #{find_neg([[1]])}")
+    // continue outer：跳过这一行剩下的
+    print("每行到 0 为止：")
+    rows: for row in [[1, 2, 0, 3], [0, 9], [4, 5]] {
+        line = ""
+        for x in row {
+            if x == 0 {
+                print("  #{line}（遇到 0）")
+                continue rows
+            }
+            line += "#{x} "
+        }
+        print("  #{line}")
+    }
+    // 三层，从最里层跳出最外层；沿途的值和 defer 都处理掉
+    print("跳出三层：")
+    a: for i in 0..3 {
+        ra = Res(name: "a#{i}")
+        defer { print("  a 的 defer（#{ra.name}）") }
+        for j in 0..3 {
+            rb = Res(name: "b#{i}#{j}")
+            for k in 0..3 {
+                if i == 1 && j == 1 && k == 1 { break a }
+                if k == 1 && rb.name != "" { break }
+            }
+            if j == 1 { continue a }
+        }
+    }
+    // 条件循环也能带标签
+    n = 0
+    top: for n < 100 {
+        n += 1
+        for {
+            if n % 7 == 0 { break top }
+            break
+        }
+    }
+    print("第一个 7 的倍数：#{n}")
+    // 条件循环的条件每轮都算，属于这个循环：条件里不带标签的 break 结束它自己，break 外层的标签跳出外层
+    found = 0
+    rounds = 0
+    grid: for r in 0..5 {
+        rounds += 1
+        k = 0
+        for (if r * 10 + k == 23 {
+            found = r * 10 + k
+            break grid
+        } else {
+            k < 4
+        }) {
+            k += 1
+        }
+    }
+    print("条件里跳出外层：#{found}（外层走了 #{rounds} 轮）")
+    m = 0
+    for (if m == 3 { break } else { true }) {
+        m += 1
+    }
+    print("条件里结束自己：#{m}")
+}

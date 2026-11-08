@@ -1,0 +1,63 @@
+// lcache · 处理一个请求，得到回复（std/http 的 serve 负责发出去）。不碰网络，单元测试直接调用
+//
+//   GET    /k/名字              200 和值；没有或过期了是 404
+//   PUT    /k/名字[?ttl=秒]      请求体就是值；204
+//   DELETE /k/名字              204；本来就没有是 404
+//   GET    /stats               {"keys":…,"hits":…,"misses":…}
+//
+// 名字是解码以后的路径（可以有 /）。值按字节原样存取，最大 8MB（lhttp 的请求体上限）
+import "std/str"
+import "std/http"
+import "std/url"
+import "kv/store"
+
+pub fn handle(s: store.Store, req: http.Request, now: int) -> http.Response {
+    p = req.path
+    if p == "/stats" {
+        if req.method != "GET" { return not_allowed("GET") }
+        st = store.stats(s)
+        body = "{\"keys\":#{st.keys},\"hits\":#{st.hits},\"misses\":#{st.misses}}\n"
+        return http.reply(200, [("Content-Type", "application/json")], body)
+    }
+    if !str.starts_with(p, "/k/") || len(p) == 3 { return http.reply_error(404) }
+    k = slice(p, 3, len(p))
+    if req.method == "GET" {
+        return match store.get(s, k, now) {
+            Some(v) => http.reply(200, [("Content-Type", "application/octet-stream")], v)
+            None => http.reply_error(404)
+        }
+    }
+    if req.method == "PUT" {
+        ttl = ttl_ms(req.query)
+        if ttl < 0 { return http.reply_error(400) }
+        store.set(s, k, req.body, ttl, now)
+        return http.reply(204, [], "")
+    }
+    if req.method == "DELETE" {
+        if store.del(s, k, now) { return http.reply(204, [], "") }
+        return http.reply_error(404)
+    }
+    not_allowed("GET, PUT, DELETE")
+}
+
+// 查询串里的 ttl=秒（按 std/url 解码，ttl=%36%30 也行），换成毫秒；没有是 0（不过期），不是正整数或查询串坏了时是 -1
+pub fn ttl_ms(query: str) -> int {
+    match take url.parse_query(query) {
+        Ok(ps) => {
+            for (k, v) in ps {
+                if k == "ttl" {
+                    n = try_parse_int(v) ?? -1
+                    return if n > 0 { n * 1000 } else { -1 }
+                }
+            }
+            0
+        }
+        Err(_) => -1
+    }
+}
+
+fn not_allowed(allow: str) -> http.Response {
+    body, hs = http.error_page(405)
+    hs.push(("Allow", allow))
+    http.reply(405, hs, body)
+}

@@ -1,0 +1,65 @@
+// std/base64 的测试：RFC 4648 第 10 节的测试向量，URL 安全的写法，以及各种不合法的输入
+import "std/base64"
+import "std/digest"
+
+fn ds(s: str) -> str { base64.decode_str(s) ?? "<无效>" }
+
+fn du(s: str) -> str {
+    match take base64.decode_url(s) {
+        Ok(b) => digest.to_hex(b)
+        Err(_) => "<无效>"
+    }
+}
+
+test "RFC 4648 的向量" {
+    plain = ["", "f", "fo", "foo", "foob", "fooba", "foobar"]
+    coded = ["", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy"]
+    for i in 0..len(plain) {
+        assert_eq(base64.encode_str(plain[i]), coded[i])
+        assert_eq(ds(coded[i]), plain[i])
+    }
+    assert_eq(ds(base64.encode_str("云雀")), "云雀")
+}
+
+test "URL 安全的写法" {
+    b: [u8] = [0xfb, 0xff]
+    assert_eq(base64.encode(b), "+/8=")
+    assert_eq(base64.encode_url(b), "-_8")
+    assert_eq(du("-_8"), "fbff")
+    assert_eq(du("-_8="), "fbff")
+    assert_eq(du("+/8="), "<无效>")
+    // 所有 256 个字节来回一次
+    all: [u8] = []
+    for i in 0..256 { all.push(i.wrap_u8()) }
+    assert_eq(du(base64.encode_url(all)), digest.to_hex(all))
+    match take base64.decode(base64.encode(all)) {
+        Ok(x) => assert_eq(digest.to_hex(x), digest.to_hex(all))
+        Err(e) => panic(e)
+    }
+}
+
+test "不合法的输入" {
+    // 缺 =、= 太多、长度不对、字母表以外的字符、多出来的位不是 0
+    bad = ["Zg", "Zg=", "Zg===", "Z", "Zm9v\n", "Zm 9v", "Zm9-", "Zh==", "Zm9=", "Zm8"]
+    for s in bad {
+        assert_eq(ds(s), "<无效>")
+    }
+    assert_eq(du("Zg"), "66")
+    assert_eq(du("Zg="), "<无效>")
+    assert_eq(du("Z"), "<无效>")
+
+    // 出错信息带位置：第几个字符
+    assert_eq(err_of("Zm 9"), "base64 第 3 个字符：不在字母表里（字节 32）")
+    assert_eq(err_of("Zm9-"), "base64 第 4 个字符：不在字母表里（字节 45）")
+    assert_eq(err_of("Zh=="), "base64 第 2 个字符：多出来的位不是 0")
+    assert_eq(err_of("Zg==="), "base64 第 3 个字符：末尾的 = 太多（最多两个）")
+    assert_eq(err_of("Zg"), "base64：长度 2 不是 4 的倍数（要用 = 补齐）")
+    assert_eq(err_of("Z"), "base64：去掉末尾的 = 以后有 1 个字符，除以 4 余 1，不可能是合法的编码")
+}
+
+fn err_of(s: str) -> str {
+    match base64.decode(s) {
+        Ok(_) => "<成功>"
+        Err(e) => e.copy()
+    }
+}

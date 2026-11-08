@@ -1,0 +1,10 @@
+// 期望错误：借用遍历时不能修改被遍历的值
+import "std/map"
+
+fn main() {
+    m: map.Map[str, int] = map.new()
+    m.insert("a", 1)
+    for (k, v) in m {
+        m.insert(k, v + 1)
+    }
+}

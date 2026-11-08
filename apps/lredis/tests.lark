@@ -1,0 +1,202 @@
+// lredis 的单元测试：lark test（在 apps/lredis 里运行）。直接调用数据库的 exec，时间是固定的，不用网络
+import "db/resp"
+import "db/store"
+
+fn words(line: str) -> [str] {
+    none: [str] = []
+    resp.split_args(line) ?? none
+}
+
+// 执行一行命令（空格分开，引号的写法同 redis-cli），得到 RESP 编码的回复
+fn run(inout db: store.Db, line: str, now: int) -> str {
+    args = words(line)
+    store.exec(&db, args, now)
+}
+
+test "RESP：解析多条批量字符串" {
+    args, at, err = resp.parse("*2\r\n$3\r\nGET\r\n$1\r\na\r\n", 0)
+    assert_eq(args, ["GET", "a"])
+    assert_eq(at, 20)
+    assert_eq(err, "")
+    // 值里可以有 \r\n 和空格（按长度读，不按分隔符）
+    args2, _a2, _e2 = resp.parse("*2\r\n$4\r\nECHO\r\n$4\r\na\r\nb\r\n", 0)
+    assert_eq(args2, ["ECHO", "a\r\nb"])
+    // 空的批量字符串
+    args3, _a3, _e3 = resp.parse("*2\r\n$3\r\nSET\r\n$0\r\n\r\n", 0)
+    assert_eq(args3, ["SET", ""])
+}
+
+test "RESP：数据不完整、流水线、格式错误" {
+    full = "*1\r\n$4\r\nPING\r\n"
+    for cut in 1..len(full) {
+        _args, at, _err = resp.parse(slice(full, 0, cut), 0)
+        assert_eq(at, -1)
+    }
+    // 两条命令连在一起：第一条解析完，位置指向第二条的开头
+    two = full + "*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n"
+    a1, p1, _e1 = resp.parse(two, 0)
+    assert_eq(a1, ["PING"])
+    a2, p2, _e2 = resp.parse(two, p1)
+    assert_eq(a2, ["ECHO", "hi"])
+    assert_eq(p2, len(two))
+    _a3, p3, e3 = resp.parse("*1\r\n+PING\r\n", 0)
+    assert_eq(p3, -2)
+    assert_eq(e3, "Protocol error: expected '$', got '+'")
+    _a4, p4, _e4 = resp.parse("*x\r\n", 0)
+    assert_eq(p4, -2)
+}
+
+test "RESP：内联命令和引号" {
+    args, at, _err = resp.parse("SET k \"a b\"\r\nGET k\n", 0)
+    assert_eq(args, ["SET", "k", "a b"])
+    args2, at2, _e2 = resp.parse("SET k \"a b\"\r\nGET k\n", at)
+    assert_eq(args2, ["GET", "k"])
+    assert_eq(at2, 19)
+    empty, _a3, _e3 = resp.parse("\r\n", 0)
+    assert_eq(len(empty), 0)
+    assert(resp.split_args("\"x") == None)
+    assert_eq(words("a \"q\\\"\\n\" b"), ["a", "q\"\n", "b"])
+}
+
+test "RESP：编码和整数" {
+    assert_eq(resp.bulk("hé"), "$3\r\nhé\r\n")
+    assert_eq(resp.bulks(["a", ""]), "*2\r\n$1\r\na\r\n$0\r\n\r\n")
+    assert_eq(resp.integer(-5), ":-5\r\n")
+    assert_eq(resp.parse_int("123") ?? 0, 123)
+    assert_eq(resp.parse_int("-9223372036854775808") ?? 0, 0 - 9223372036854775807 - 1)
+    for bad in ["", "-", "+1", " 1", "1 ", "007", "-0", "1.5", "9223372036854775808", "abc"] {
+        assert(resp.parse_int(bad) == None)
+    }
+}
+
+test "字符串命令" {
+    db = store.new_db()
+    t = 1000
+    assert_eq(run(&db, "PING", t), "+PONG\r\n")
+    assert_eq(run(&db, "GET a", t), "$-1\r\n")
+    assert_eq(run(&db, "SET a 1", t), "+OK\r\n")
+    assert_eq(run(&db, "get a", t), "$1\r\n1\r\n")
+    assert_eq(run(&db, "INCR a", t), ":2\r\n")
+    assert_eq(run(&db, "INCRBY a -12", t), ":-10\r\n")
+    assert_eq(run(&db, "DECRBY a 5", t), ":-15\r\n")
+    assert_eq(run(&db, "APPEND a x", t), ":4\r\n")
+    assert_eq(run(&db, "INCR a", t), "-ERR value is not an integer or out of range\r\n")
+    assert_eq(run(&db, "SET big 9223372036854775807", t), "+OK\r\n")
+    assert_eq(run(&db, "INCR big", t), "-ERR increment or decrement would overflow\r\n")
+    assert_eq(run(&db, "SET a v NX", t), "$-1\r\n")
+    assert_eq(run(&db, "SET n v XX", t), "$-1\r\n")
+    assert_eq(run(&db, "SET a new GET", t), "$4\r\n-15x\r\n")
+    assert_eq(run(&db, "SET a v NX XX", t), "-ERR syntax error\r\n")
+    assert_eq(run(&db, "MSET x 1 y 2", t), "+OK\r\n")
+    assert_eq(run(&db, "MGET x nope y", t), "*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n2\r\n")
+    assert_eq(run(&db, "MSET x", t), "-ERR wrong number of arguments for 'mset' command\r\n")
+    assert_eq(run(&db, "STRLEN a", t), ":3\r\n")
+    assert_eq(run(&db, "SETNX a z", t), ":0\r\n")
+    assert_eq(run(&db, "GETDEL a", t), "$3\r\nnew\r\n")
+    assert_eq(run(&db, "EXISTS a x x y", t), ":3\r\n")
+    assert_eq(run(&db, "DEL x y nope", t), ":2\r\n")
+    assert_eq(run(&db, "GET", t), "-ERR wrong number of arguments for 'get' command\r\n")
+    assert_eq(run(&db, "NOPE 1 2", t), "-ERR unknown command 'NOPE', with args beginning with: '1' '2' \r\n")
+    assert_eq(store.size(db), 1)
+}
+
+test "过期时间" {
+    db = store.new_db()
+    t = 1000000
+    assert_eq(run(&db, "SET k v EX 10", t), "+OK\r\n")
+    assert_eq(run(&db, "TTL k", t), ":10\r\n")
+    assert_eq(run(&db, "PTTL k", t + 2500), ":7500\r\n")
+    // TTL 四舍五入到秒
+    assert_eq(run(&db, "TTL k", t + 2500), ":8\r\n")
+    assert_eq(run(&db, "GET k", t + 10000), "$-1\r\n")
+    assert_eq(run(&db, "TTL k", t + 10000), ":-2\r\n")
+    assert_eq(run(&db, "SET p v", t), "+OK\r\n")
+    assert_eq(run(&db, "TTL p", t), ":-1\r\n")
+    assert_eq(run(&db, "PEXPIRE p 50", t), ":1\r\n")
+    assert_eq(run(&db, "PERSIST p", t), ":1\r\n")
+    assert_eq(run(&db, "PERSIST p", t), ":0\r\n")
+    assert_eq(run(&db, "EXPIRE nope 5", t), ":0\r\n")
+    assert_eq(run(&db, "EXPIRE p abc", t), "-ERR value is not an integer or out of range\r\n")
+    // KEEPTTL 保留原来的过期时间；普通的 SET 去掉它
+    assert_eq(run(&db, "SET q 1 PX 5000", t), "+OK\r\n")
+    assert_eq(run(&db, "SET q 2 KEEPTTL", t), "+OK\r\n")
+    assert_eq(run(&db, "PTTL q", t), ":5000\r\n")
+    assert_eq(run(&db, "SET q 3", t), "+OK\r\n")
+    assert_eq(run(&db, "PTTL q", t), ":-1\r\n")
+    // 不是正数的过期时间直接删掉
+    assert_eq(run(&db, "EXPIRE q 0", t), ":1\r\n")
+    assert_eq(run(&db, "EXISTS q", t), ":0\r\n")
+    // sweep 删掉过期了但还没被读到的键
+    assert_eq(run(&db, "SET s v PX 10", t), "+OK\r\n")
+    assert_eq(store.size(db), 2)
+    store.sweep(&db, t + 10)
+    assert_eq(store.size(db), 1)
+    assert_eq(run(&db, "SET e v EX 0", t), "-ERR invalid expire time in 'set' command\r\n")
+}
+
+test "列表命令" {
+    db = store.new_db()
+    t = 0
+    assert_eq(run(&db, "RPUSH l a b c", t), ":3\r\n")
+    assert_eq(run(&db, "LPUSH l x y", t), ":5\r\n")
+    assert_eq(run(&db, "LRANGE l 0 -1", t), "*5\r\n$1\r\ny\r\n$1\r\nx\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n")
+    assert_eq(run(&db, "LRANGE l -2 100", t), "*2\r\n$1\r\nb\r\n$1\r\nc\r\n")
+    assert_eq(run(&db, "LRANGE l 3 1", t), "*0\r\n")
+    assert_eq(run(&db, "LINDEX l -1", t), "$1\r\nc\r\n")
+    assert_eq(run(&db, "LINDEX l 9", t), "$-1\r\n")
+    assert_eq(run(&db, "LPOP l", t), "$1\r\ny\r\n")
+    assert_eq(run(&db, "RPOP l 2", t), "*2\r\n$1\r\nc\r\n$1\r\nb\r\n")
+    assert_eq(run(&db, "LLEN l", t), ":2\r\n")
+    assert_eq(run(&db, "TYPE l", t), "+list\r\n")
+    assert_eq(run(&db, "GET l", t), "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+    // 取空了键就没有了
+    assert_eq(run(&db, "RPOP l 5", t), "*2\r\n$1\r\na\r\n$1\r\nx\r\n")
+    assert_eq(run(&db, "EXISTS l", t), ":0\r\n")
+    assert_eq(run(&db, "LPOP l", t), "$-1\r\n")
+    assert_eq(run(&db, "LPOP l 1", t), "*-1\r\n")
+    assert_eq(run(&db, "SET s v", t), "+OK\r\n")
+    assert_eq(run(&db, "LPUSH s x", t), "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+}
+
+test "哈希命令" {
+    db = store.new_db()
+    t = 0
+    assert_eq(run(&db, "HSET h a 1 b 2", t), ":2\r\n")
+    assert_eq(run(&db, "HSET h a 3 c 4", t), ":1\r\n")
+    assert_eq(run(&db, "HGET h a", t), "$1\r\n3\r\n")
+    assert_eq(run(&db, "HGET h z", t), "$-1\r\n")
+    assert_eq(run(&db, "HLEN h", t), ":3\r\n")
+    // 字段保持加入的顺序（和 Redis 的小哈希一样）
+    assert_eq(run(&db, "HGETALL h", t), "*6\r\n$1\r\na\r\n$1\r\n3\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n4\r\n")
+    assert_eq(run(&db, "HKEYS h", t), "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n")
+    assert_eq(run(&db, "HDEL h a z", t), ":1\r\n")
+    assert_eq(run(&db, "HEXISTS h a", t), ":0\r\n")
+    assert_eq(run(&db, "HVALS h", t), "*2\r\n$1\r\n2\r\n$1\r\n4\r\n")
+    assert_eq(run(&db, "HSET h x", t), "-ERR wrong number of arguments for 'hset' command\r\n")
+    assert_eq(run(&db, "HDEL h b c", t), ":2\r\n")
+    assert_eq(run(&db, "TYPE h", t), "+none\r\n")
+}
+
+test "KEYS 的通配符和 FLUSHDB" {
+    assert(store.glob("*", "abc"))
+    assert(store.glob("a*c", "abbbc"))
+    assert(!store.glob("a*c", "abcd"))
+    assert(store.glob("h?llo", "hello"))
+    assert(store.glob("h[ae]llo", "hallo"))
+    assert(!store.glob("h[^e]llo", "hello"))
+    assert(store.glob("h[a-c]llo", "hbllo"))
+    assert(store.glob("a\\*", "a*"))
+    assert(!store.glob("a\\*", "ab"))
+    db = store.new_db()
+    t = 0
+    _r = run(&db, "MSET user:1 a user:2 b other c", t)
+    assert_eq(run(&db, "KEYS user:*", t), "*2\r\n$6\r\nuser:1\r\n$6\r\nuser:2\r\n")
+    assert_eq(run(&db, "DBSIZE", t), ":3\r\n")
+    assert_eq(run(&db, "FLUSHDB", t), "+OK\r\n")
+    assert_eq(run(&db, "DBSIZE", t), ":0\r\n")
+    // 删掉的槽位会被重新用上
+    _r2 = run(&db, "SET a 1", t)
+    _r3 = run(&db, "DEL a", t)
+    _r4 = run(&db, "SET b 2", t)
+    assert_eq(run(&db, "KEYS *", t), "*1\r\n$1\r\nb\r\n")
+}

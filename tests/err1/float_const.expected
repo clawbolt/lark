@@ -1,0 +1,3 @@
+tests/err1/float_const.lark:3:18: 错误：float 常量只支持 + - * / %，不能比较
+ 3 | const BIG = HALF > 0.25
+   |                  ^

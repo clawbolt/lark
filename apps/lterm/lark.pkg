@@ -1,0 +1,5 @@
+# lterm：从零写的终端仿真（类似 libghostty-vt），先证明再写。阶段 1 是转义序列的解析器，阶段 2 是 UTF-8 的流式解码和字符宽度，阶段 3 是屏幕，阶段 4 是颜色和样式，阶段 5 是模式和备用屏幕，阶段 6 是滚动缓冲和改大小，阶段 7 是 lterm run（伪终端里跑 shell，只画变了的地方），阶段 8 是翻看滚动缓冲，阶段 9 是回答终端查询，阶段 10 是画框线的字符集，之后是 lterm app（自己开窗口，macOS），阶段 11 是滚动区域从顶上开始时滚出去的行也进滚动缓冲（codex 这类程序），阶段 12 是 lterm app 里用鼠标选中和复制，阶段 13 是把鼠标交给里面的程序（vim、htop、codex）
+name = lterm
+version = 0.1.0
+c_src = native/pty.c
+c_src = native/gui.c

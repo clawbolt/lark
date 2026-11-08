@@ -1,0 +1,8 @@
+// 期望错误：模块里定义的结构体，字段在别的模块里只读（读可以，m.keys.push 会破坏 Map 的内部状态）
+import "std/map"
+
+fn main() {
+    m: map.Map[str, int] = map.new()
+    print("#{m.keys}")
+    m.keys.push("x")
+}

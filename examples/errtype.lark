@@ -1,0 +1,74 @@
+// 自定义错误类型 T!E（需要 lark1 及以后的版本）
+// T! 是 T!str 的简写；E 可以是任意类型（结构体、枚举……），match 里的 Err(e) 拿到的就是 E。
+
+type ParseErr {
+    pos: int
+    msg: str
+}
+
+enum CalcErr {
+    DivZero
+    Bad(e: ParseErr)
+}
+
+fn digit(s: str, i: int) -> int!ParseErr {
+    b = byte_at(s, i)
+    if b < '0' || b > '9' { return Err(ParseErr(pos: i, msg: "不是数字")) }
+    b - '0'
+}
+
+// digit 和 parse_num 的错误类型相同，? 直接把错误交给调用者
+fn parse_num(s: str) -> int!ParseErr {
+    if len(s) == 0 { return Err(ParseErr(pos: 0, msg: "空字符串")) }
+    n = 0
+    for i in 0..len(s) {
+        n = n * 10 + digit(s, i)?
+    }
+    n
+}
+
+// 错误类型不同时，? 会调用 fn from(take e: 这里的错误类型) -> 当前函数的错误类型 来转换
+fn from(take e: ParseErr) -> CalcErr { Bad(e) }
+
+fn from(take e: str) -> CalcErr { Bad(ParseErr(pos: -1, msg: e)) }
+
+fn div(a: str, b: str) -> int!CalcErr {
+    x = parse_num(a)?
+    y = parse_num(b)?
+    if y == 0 { return Err(DivZero) }
+    x / y
+}
+
+// try_parse_int 的错误是 str，同样经过 from 转成 CalcErr
+fn half(s: str) -> int!CalcErr {
+    n = try_parse_int(s)?
+    n / 2
+}
+
+fn describe(r: int!CalcErr) -> str {
+    match r {
+        Ok(v) => "结果 #{v}"
+        Err(e) => match e {
+            DivZero => "错误：除以零"
+            Bad(pe) => if pe.pos < 0 { "错误：#{pe.msg}" } else { "错误：第 #{pe.pos} 个字符#{pe.msg}" }
+        }
+    }
+}
+
+fn main() {
+    print(describe(div("84", "2")))
+    print(describe(div("8a", "2")))
+    print(describe(div("1", "0")))
+    print(describe(div("", "3")))
+    print(describe(half("42")))
+    print(describe(half("abc")))
+    // T! 仍然是 T!str
+    m = try_parse_int("x")
+    match m {
+        Ok(v) => print("#{v}")
+        Err(s) => print("str 错误：#{s}")
+    }
+    // 结果之间也可以比较
+    same = div("4", "2") == div("6", "3")
+    print("4/2 == 6/3：#{same}")
+}

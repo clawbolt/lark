@@ -1,0 +1,354 @@
+// lark：项目的构建工具（用 Lark 自己写；底下调用 lark1、cc 和 git）
+// 构建：make lark-tool，得到 build/lark
+//
+//   lark new hello              新建项目目录 hello（lark.pkg、main.lark、.gitignore）
+//   lark build [--release]      编译当前目录的项目，得到 build/名字
+//   lark run [--release] [-- 参数…]   编译并运行
+//   lark test [名字里的一段]     编译并运行项目里的 test 块
+//   lark fetch                  只下载依赖，并列出每个依赖在哪里
+//   lark -h、lark build -h      用法说明（参数由 std/flag 解析）
+//
+// 项目的根目录有 lark.pkg，根目录下的 .lark 文件一起构成根模块（main 在其中某个文件里）。lark.pkg 一行一项：
+//
+//   name = hello                                 名字：小写字母开头，只含小写字母、数字和 _
+//   version = 0.1.0
+//   dep util = ../util                           本地目录（相对于这个 lark.pkg 所在的目录）
+//   dep json5 = github.com/someone/json5 v1.2.0  git 仓库和标签（或分支）。host/路径 会补成 https://host/路径，
+//                                                github、gitee、gitlab、自己的服务器都一样；也可以写完整的 https:// 或 git@ 地址
+//   c_src = native/fast.c                        一起编译的 C 文件（每个一行）
+//   link = m                                     链接时加 -lm（每个一行）
+//   # 注释
+//
+// 依赖的根目录也要有 lark.pkg，name 和 dep 写的名字一致；import "json5" 载入它的 json5.lark（没有这个文件也行，只是不能这样 import），
+// import "json5/sub" 载入它的 sub.lark。依赖包里自己的 import 相对于依赖的根目录（不是当前目录）。
+// 应用也能当依赖：只用它的模块，不用它的 main（例如 lcache 用 lhttp 的 http/request）。
+// 依赖的依赖也会载入；同一个名字只能指向同一个来源和版本。
+// git 依赖下载到 $LARK_CACHE（默认 ~/.lark/pkg），提交号记在项目的 lark.lock 里：之后标签指向的提交变了会报错。
+// Lark 的安装目录（里面有 build/lark1、runtime/、std/）：$LARK_HOME，默认是 lark 程序所在目录的上一级。
+// C 编译器和选项：$CC（默认 cc）、$CFLAGS（默认 -std=gnu11 -O2）。
+import "std/os"
+import "std/str"
+import "std/flag"
+
+type Dep {
+    name: str
+    src: str        // lark.pkg 里写的：本地路径或 git 地址
+    ver: str        // git 的标签或分支；本地依赖为 ""
+    base: str       // 写这个依赖的 lark.pkg 所在的目录
+}
+
+type Pkg {
+    name: str
+    version: str
+    deps: [Dep]
+    c_srcs: [str]
+    links: [str]
+}
+
+// 解析好的整个项目：每个依赖的名字和目录，以及所有要一起编译的 C 文件和要链接的库
+type Plan {
+    names: [str]
+    dirs: [str]
+    srcs: [str]     // 每个依赖的来源（用来发现冲突）
+    c_srcs: [str]
+    links: [str]
+    lock: [str]     // lark.lock 的内容：每行 名字 来源 版本 提交号
+    lock_changed: bool
+}
+
+fn q(s: str) -> str { "'" + str.replace_all(s, "'", "'\\''") + "'" }
+
+fn fail(msg: str) {
+    eprint("lark：#{msg}")
+    exit(1)
+}
+
+// ---------- lark.pkg ----------
+
+fn valid_name(s: str) -> bool {
+    if len(s) == 0 || byte_at(s, 0) < 'a' || byte_at(s, 0) > 'z' { return false }
+    for i in 0..len(s) {
+        b = byte_at(s, i)
+        if !((b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_') { return false }
+    }
+    true
+}
+
+fn is_local(src: str) -> bool { str.starts_with(src, ".") || str.starts_with(src, "/") }
+
+fn parse_pkg(path: str, base: str) -> Pkg! {
+    text = os.read(path)?
+    p = Pkg(name: "", version: "", deps: [], c_srcs: [], links: [])
+    ls = str.lines(text)
+    for i in 0..len(ls) {
+        ln = str.trim(ls[i])
+        if ln == "" || str.starts_with(ln, "#") { continue }
+        at = "#{path} 第 #{i + 1} 行"
+        k = str.find(ln, "=") ?? -1
+        if k < 0 { return Err("#{at}：应该写成 名字 = 值") }
+        key = str.trim(slice(ln, 0, k))
+        val = str.trim(slice(ln, k + 1, len(ln)))
+        if str.starts_with(key, "dep ") {
+            dn = str.trim(slice(key, 4, len(key)))
+            ws = str.words(val)
+            if !valid_name(dn) || len(ws) == 0 || len(ws) > 2 {
+                return Err("#{at}：依赖写成 dep 名字 = 路径，或者 dep 名字 = 地址 版本")
+            }
+            src = ws[0].copy()
+            ver = if len(ws) == 2 { ws[1].copy() } else { "" }
+            if !is_local(src) && ver == "" { return Err("#{at}：git 依赖 #{dn} 要写版本（标签或分支），例如 #{src} v1.0.0") }
+            if is_local(src) && ver != "" { return Err("#{at}：本地依赖 #{dn} 不写版本") }
+            p.deps.push(Dep(name: dn, src: src, ver: ver, base: base.copy()))
+        } else if key == "name" {
+            if !valid_name(val) { return Err("#{at}：名字 #{val} 不合法（小写字母开头，只含小写字母、数字和 _）") }
+            p.name = val
+        } else if key == "version" {
+            p.version = val
+        } else if key == "c_src" {
+            p.c_srcs.push(os.join_path(base, val))
+        } else if key == "link" {
+            p.links.push(val)
+        } else {
+            return Err("#{at}：不认识的项 #{key}（可以写 name、version、dep、c_src、link）")
+        }
+    }
+    if p.name == "" { return Err("#{path}：缺少 name = …") }
+    Ok(p)
+}
+
+// ---------- 依赖 ----------
+
+fn git_url(src: str) -> str {
+    if str.contains(src, "://") || str.starts_with(src, "git@") { src.copy() } else { "https://" + src }
+}
+
+fn cache_root() -> str {
+    c = os.env("LARK_CACHE") ?? ""
+    if c != "" { return c }
+    os.join_path(os.env("HOME") ?? ".", ".lark/pkg")
+}
+
+// 缓存里的目录：去掉协议和用户名，: 换成 /，后面加 @版本
+fn cache_dir(src: str, ver: str) -> str {
+    s = src.copy()
+    k = str.find(s, "://") ?? -1
+    if k >= 0 { s = slice(s, k + 3, len(s)) }
+    if str.starts_with(s, "git@") { s = slice(s, 4, len(s)) }
+    s = str.replace_all(s, ":", "/")
+    s = str.replace_all(s, "..", "_")
+    if str.ends_with(s, ".git") { s = slice(s, 0, len(s) - 4) }
+    os.join_path(cache_root(), s + "@" + ver)
+}
+
+fn lock_find(lock: [str], name: str) -> int {
+    for i in 0..len(lock) {
+        ws = str.words(lock[i])
+        if len(ws) == 4 && ws[0] == name { return i }
+    }
+    -1
+}
+
+// 下载（或找到）一个依赖，得到它的目录
+fn fetch(d: Dep, inout plan: Plan) -> str! {
+    if is_local(d.src) {
+        dir = if str.starts_with(d.src, "/") { d.src.copy() } else { os.join_path(d.base, d.src) }
+        if !os.is_dir(dir) { return Err("依赖 #{d.name} 的目录 #{dir} 不存在") }
+        return Ok(dir)
+    }
+    dir = cache_dir(d.src, d.ver)
+    if !os.is_dir(dir) {
+        os.mkdir_all(os.dir(dir))?
+        eprint("下载 #{d.name}：#{git_url(d.src)} #{d.ver}")
+        cmd = "git -c advice.detachedHead=false clone --quiet --depth 1 --branch #{q(d.ver)} #{q(git_url(d.src))} #{q(dir)}"
+        if os.shell(cmd) != 0 {
+            _r = os.remove_all(dir)
+            return Err("下载依赖 #{d.name} 失败（#{git_url(d.src)} 的 #{d.ver}）")
+        }
+    }
+    commit = str.trim(os.shell_output("git -C #{q(dir)} rev-parse HEAD")?)
+    li = lock_find(plan.lock, d.name)
+    line = "#{d.name} #{d.src} #{d.ver} #{commit}"
+    if li < 0 {
+        plan.lock.push(line)
+        plan.lock_changed = true
+    } else {
+        ws = str.words(plan.lock[li])
+        if ws[1] == d.src && ws[2] == d.ver && ws[3] != commit {
+            return Err("依赖 #{d.name} 的 #{d.ver} 现在是提交 #{commit}，lark.lock 里记的是 #{ws[3]}：标签被改过了？确认没问题后删掉 lark.lock 里的这一行")
+        }
+        if ws[1] != d.src || ws[2] != d.ver {
+            plan.lock[li] = line
+            plan.lock_changed = true
+        }
+    }
+    Ok(dir)
+}
+
+// 从根项目开始，一层层载入依赖
+fn resolve(root: Pkg) -> Plan! {
+    lock: [str] = []
+    if os.is_file("lark.lock") {
+        old = os.read("lark.lock")?
+        for ln in str.lines(old) {
+            if str.trim(ln) != "" { lock.push(ln.copy()) }
+        }
+    }
+    plan = Plan(names: [], dirs: [], srcs: [], c_srcs: root.c_srcs.copy(), links: root.links.copy(), lock: lock, lock_changed: false)
+    queue = root.deps.copy()
+    k = 0
+    for k < len(queue) {
+        d = queue[k].copy()
+        k += 1
+        where_from = if is_local(d.src) { os.join_path(d.base, d.src) } else { d.src + " " + d.ver }
+        seen = false
+        for i in 0..len(plan.names) {
+            if plan.names[i] == d.name {
+                if plan.srcs[i] != where_from { return Err("依赖冲突：#{d.name} 既是 #{plan.srcs[i]}，又是 #{where_from}") }
+                seen = true
+            }
+        }
+        if seen { continue }
+        if d.name == root.name { return Err("依赖 #{d.name} 和项目本身同名") }
+        dir = fetch(d, &plan)?
+        sub = parse_pkg(os.join_path(dir, "lark.pkg"), dir)?
+        if sub.name != d.name { return Err("依赖 #{d.name} 的 lark.pkg 里写的名字是 #{sub.name}") }
+        plan.names.push(d.name.copy())
+        plan.dirs.push(dir)
+        plan.srcs.push(where_from)
+        for c in sub.c_srcs { plan.c_srcs.push(c.copy()) }
+        for l in sub.links {
+            if !str.contains(" " + join(plan.links, " ") + " ", " #{l} ") { plan.links.push(l.copy()) }
+        }
+        for nd in sub.deps { queue.push(nd.copy()) }
+    }
+    if plan.lock_changed { os.write("lark.lock", join(plan.lock, "\n") + "\n")? }
+    Ok(plan)
+}
+
+// ---------- 编译 ----------
+
+fn lark_home() -> str! {
+    h = os.env("LARK_HOME") ?? ""
+    if h == "" {
+        av = args()
+        a0 = av[0].copy()
+        if !str.contains(a0, "/") { return Err("找不到 Lark 的安装目录：请设置 LARK_HOME（里面有 build/lark1、runtime/、std/）") }
+        h = os.dir(os.dir(a0))
+    }
+    if !os.is_file(os.join_path(h, "build/lark1")) { return Err("#{h} 下没有 build/lark1：请先在 Lark 的目录里 make stage1，或者设置 LARK_HOME") }
+    Ok(h)
+}
+
+fn root_files() -> [str]! {
+    out: [str] = []
+    for n in os.read_dir(".")? {
+        if str.ends_with(n, ".lark") { out.push(n.copy()) }
+    }
+    if len(out) == 0 { return Err("当前目录里没有 .lark 文件") }
+    Ok(out)
+}
+
+// 编译成可执行文件，得到它的路径；testing 时编译 test 块
+fn build(release: bool, testing: bool) -> str! {
+    if !os.is_file("lark.pkg") { return Err("当前目录里没有 lark.pkg（新项目用 lark new 名字）") }
+    pkg = parse_pkg("lark.pkg", ".")?
+    plan = resolve(pkg)?
+    home = lark_home()?
+    files = root_files()?
+    os.mkdir_all("build")?
+    stem = if testing { pkg.name + "_test" } else { pkg.name.copy() }
+    c_out = "build/#{stem}.c"
+    exe = "build/#{stem}"
+    flags = if release { " --release" } else { "" }
+    tflag = if testing { " --test" } else { "" }
+    ps = " -p " + q("std=" + os.join_path(home, "std"))
+    for i in 0..len(plan.names) { ps = ps + " -p " + q(plan.names[i] + "=" + plan.dirs[i]) }
+    fs = ""
+    for f in files { fs = fs + " " + q(f) }
+    lark1 = q(os.join_path(home, "build/lark1"))
+    if os.shell("#{lark1}#{flags}#{tflag}#{fs}#{ps} -o #{q(c_out)}") != 0 { return Err("编译失败") }
+    cc = os.env("CC") ?? "cc"
+    cflags = os.env("CFLAGS") ?? "-std=gnu11 -O2"
+    cs = ""
+    for c in plan.c_srcs { cs = cs + " " + q(c) }
+    ls = ""
+    // -lm 总是会加；lark.pkg 里再写 link = m 时跳过，否则 macOS 的链接器会警告重复的库
+    for l in plan.links {
+        if l != "m" { ls = ls + " -l" + q(l) }
+    }
+    rt = q(os.join_path(home, "runtime"))
+    if os.shell("#{cc} #{cflags} -pthread -I#{rt} #{q(c_out)}#{cs} -o #{q(exe)} -lm#{ls}") != 0 { return Err("C 编译失败") }
+    Ok(exe)
+}
+
+// ---------- 命令 ----------
+
+fn cmd_new(name: str) -> ()! {
+    if !valid_name(name) { return Err("项目名 #{name} 不合法（小写字母开头，只含小写字母、数字和 _）") }
+    if os.exists(name) { return Err("#{name} 已经存在") }
+    os.mkdir_all(name)?
+    os.write(os.join_path(name, "lark.pkg"), "name = #{name}\nversion = 0.1.0\n")?
+    os.write(os.join_path(name, "main.lark"), "fn main() {\n    print(\"你好，#{name}\")\n}\n")?
+    os.write(os.join_path(name, ".gitignore"), "build/\n")?
+    print("新建了 #{name}/：cd #{name} && lark run")
+}
+
+fn cmd_fetch() -> ()! {
+    if !os.is_file("lark.pkg") { return Err("当前目录里没有 lark.pkg") }
+    pkg = parse_pkg("lark.pkg", ".")?
+    plan = resolve(pkg)?
+    print("#{pkg.name} #{pkg.version}")
+    if len(plan.names) == 0 { print("没有依赖") }
+    for i in 0..len(plan.names) { print("#{plan.names[i]}  #{plan.dirs[i]}") }
+}
+
+fn main() {
+    p = flag.new("lark", "Lark 的构建工具")
+    c = flag.new("new", "新建项目目录（lark.pkg、main.lark、.gitignore）：lark new 名字")
+    p.add_command(c)
+    c = flag.new("build", "编译当前目录的项目，得到 build/名字")
+    c.add_bool("release", "", "发布版：panic 时不记调用栈，跑得更快")
+    p.add_command(c)
+    c = flag.new("run", "编译并运行：lark run [-- 参数…]")
+    c.add_bool("release", "", "发布版：panic 时不记调用栈，跑得更快")
+    p.add_command(c)
+    c = flag.new("test", "编译并运行项目里的 test 块：lark test [名字里的一段]")
+    c.add_bool("release", "", "发布版：panic 时不记调用栈，跑得更快")
+    p.add_command(c)
+    c = flag.new("fetch", "只下载依赖，并列出每个依赖在哪里")
+    p.add_command(c)
+    a = p.parse_or_exit()
+    cmd = a.command.copy()
+    if cmd == "new" {
+        if len(a.rest) != 1 {
+            eprint("lark：new 要一个项目名")
+            exit(2)
+        }
+        match cmd_new(a.rest[0]) {
+            Ok => {}
+            Err(e) => fail(e)
+        }
+    } else if cmd == "build" {
+        match build(a.get_bool("release"), false) {
+            Ok(exe) => print("生成了 #{exe}")
+            Err(e) => fail(e)
+        }
+    } else if cmd == "run" || cmd == "test" {
+        exe = match build(a.get_bool("release"), cmd == "test") {
+            Ok(x) => x
+            Err(e) => {
+                fail(e)
+                ""
+            }
+        }
+        line = "./" + q(exe)
+        for x in a.rest { line = line + " " + q(x) }
+        code = os.shell(line)
+        if code != 0 { exit(code) }
+    } else {
+        match cmd_fetch() {
+            Ok => {}
+            Err(e) => fail(e)
+        }
+    }
+}

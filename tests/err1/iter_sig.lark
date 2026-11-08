@@ -1,0 +1,12 @@
+// 期望错误：迭代器的 next 要用 inout 参数
+type Count {
+    n: int
+}
+
+fn next(c: Count) -> int? { None }
+
+fn main() {
+    for x in Count(n: 3) {
+        print("#{x}")
+    }
+}

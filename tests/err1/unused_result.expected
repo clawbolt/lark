@@ -1,0 +1,6 @@
+tests/err1/unused_result.lark:5:5: 错误：()! 的结果没有处理，出错时会被悄悄忽略：在后面加 ? 交给调用者，用 match 处理，或者写 _ = … 表示确实不需要
+ 5 |     os.write(p, "x")
+   |     ^
+tests/err1/unused_result.lark:10:27: 错误：()! 的结果没有处理，出错时会被悄悄忽略：在后面加 ? 交给调用者，用 match 处理，或者写 _ = … 表示确实不需要
+ 10 |     for n in ["a", "b"] { os.remove(n) }
+    |                           ^

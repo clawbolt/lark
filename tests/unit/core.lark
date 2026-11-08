@@ -1,0 +1,151 @@
+// 核心模块里以前没有测试调用过的函数（make apicov 找出来的），以及它们旁边容易出错的情况
+import "std/deque"
+import "std/set"
+import "std/flag"
+import "std/fmt"
+import "std/io"
+import "std/json"
+import "std/math"
+import "std/os"
+import "std/rand"
+import "std/sort"
+import "std/str"
+import "std/term"
+import "std/time"
+import "std/utf8"
+
+test "容器：迭代协议和空集合" {
+    d: deque.Deque[int] = deque.new()
+    d.push_back(1)
+    d.push_back(2)
+    d.push_front(0)
+    assert_eq(deque.iter_len(d), 3)
+    assert_eq(deque.iter_at(d, 0), 0)
+    assert_eq(deque.iter_at(d, 2), 2)
+    s = set.of(["a", "b"])
+    assert(!set.is_empty(s))
+    e: set.Set[str] = set.new()
+    assert(set.is_empty(e))
+    assert_eq(set.iter_len(s), 2)
+    it = utf8.each("云a")
+    assert_eq(next(&it) ?? "-", "云")
+    assert_eq(next(&it) ?? "-", "a")
+    assert_eq(next(&it) ?? "-", "-")
+}
+
+test "排序、数学、字符串、日期" {
+    xs = [3, 1, 2]
+    sort.sort_by(&xs, |a, b| b - a)
+    assert(xs == [3, 2, 1])
+    // 稳定：比较结果相等的保持原来的顺序
+    ws = ["bb", "a", "cc", "d"]
+    sort.sort_by(&ws, |x, y| len(x) - len(y))
+    assert(ws == ["a", "d", "bb", "cc"])
+    assert_eq(math.sign(-7), -1)
+    assert_eq(math.sign(0), 0)
+    assert(math.sign(2.5) == 1.0)
+    assert_eq(str.to_lower("ABC 云 xY"), "abc 云 xy")
+    assert(time.is_leap(2000))
+    assert(!time.is_leap(1900))
+    assert(time.is_leap(2024))
+    assert_eq(fmt.char_width(0x4E91), 2)
+    assert_eq(fmt.char_width('a'), 1)
+    assert_eq(fmt.char_width(0x301), 0)
+}
+
+test "json 读值和转义" {
+    assert(json.as_bool(json.Bool(true)) ?? false)
+    assert_eq(json.as_str(json.Str("云")) ?? "-", "云")
+    assert_eq(json.as_str(json.Num(1)) ?? "-", "-")
+    assert_eq(json.quote("a\"b\\c\n\x01"), "\"a\\\"b\\\\c\\n\\u0001\"")
+}
+
+test "随机数、命令行、文件描述符、目录" {
+    r = rand.from_time()
+    a = r.next_int()
+    b = r.next_int()
+    assert(a != b)
+    // 测试程序运行时没有参数：parse 什么都不设
+    p = flag.new("t", "测试")
+    p.add_bool("v", "v", "啰嗦")
+    parsed = match take p.parse() {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    assert(!parsed.get_bool("v"))
+    assert_eq(len(parsed.rest), 0)
+    // parse_or_exit 只在出错、-h 时退出，这里直接返回
+    again = p.parse_or_exit()
+    assert(!again.get_bool("v"))
+    // 标准输入、标准错误：只建出来，不读不写（测试的输出要和预期逐字一样）
+    _i = io.stdin()
+    _e = io.stderr()
+    _f = io.from_fd(0)
+    // read_buffered：读一行以后，缓冲区里还剩下后面的内容
+    path = os.join_path(os.temp_dir(), "lark_core_test_#{time.unix_ms()}.txt")
+    match os.write(path, "一\n二\n三\n") {
+        Ok(_) => {}
+        Err(e) => panic(e)
+    }
+    rd = match take io.open(path) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    assert_eq(rd.read_line() ?? "-", "一")
+    assert_eq(rd.read_buffered(4), "二\n")
+    assert_eq(rd.read_buffered(100), "三\n")
+    assert_eq(rd.read_buffered(100), "")
+    _c = rd.close()
+    _r = os.remove(path)
+    cwd = match take os.cwd() {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    assert(os.is_abs(cwd))
+    assert(os.is_dir(cwd))
+    // 窗口大小：测试时输出写进文件，但标准输入可能还是终端，所以只检查查到时的范围
+    match term.size() {
+        Some(rc) => {
+            assert(rc.0 > 0 && rc.1 > 0)
+        }
+        None => {}
+    }
+}
+
+type Pair {
+    a: str
+    b: str
+}
+
+enum Shape {
+    Rect(w: str, h: str)
+}
+
+// 记一笔（用 Mutex：同一个调用里好几个实参都要写它，inout 会违反排他性）
+fn note(log: Mutex[[str]], s: str) -> str {
+    lock log as xs { xs.push(s.copy()) }
+    s
+}
+
+// 取出记下的、清空
+fn taken(log: Mutex[[str]]) -> [str] {
+    empty: [str] = []
+    lock log as xs { replace(&xs, empty) }
+}
+
+// 构造的实参和普通调用一样按书写顺序求值，跟字段的声明顺序无关
+test "构造按书写顺序求值" {
+    empty: [str] = []
+    log = mutex(empty)
+    p = Pair(b: note(log, "b"), a: note(log, "a"))
+    assert(taken(log) == ["b", "a"])
+    assert_eq(p.a + p.b, "ab")
+    q = Pair(a: note(log, "1"), b: note(log, "2"))
+    assert(taken(log) == ["1", "2"])
+    assert_eq(q.b, "2")
+    r = Rect(h: note(log, "h"), w: note(log, "w"))
+    assert(taken(log) == ["h", "w"])
+    match r {
+        Rect(w, h) => assert_eq(w + h, "wh")
+    }
+}

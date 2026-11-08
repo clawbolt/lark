@@ -1,0 +1,299 @@
+// llua · 词法分析：Lua 源码切成记号
+import "std/str"
+import "std/utf8"
+
+pub const K_EOF = 0
+pub const K_NAME = 1
+pub const K_STR = 2
+pub const K_INT = 3
+pub const K_FLT = 4
+pub const K_SYM = 5    // 关键字和标点，text 就是它的写法
+
+pub type Tok {
+    pub kind: int
+    pub text: str      // 名字、字符串的内容（转义已经处理）、数字的原文
+    pub line: int
+    pub n: int         // K_INT 的值
+    pub f: float       // K_FLT 的值
+}
+
+const KEYWORDS = " and break do else elseif end false for function goto if in local nil not or repeat return then true until while "
+const TWO = " .. == ~= <= >= << >> // :: "
+const ONE = "+-*/%^#&~|<>=(){}[];:,."
+
+type Lx {
+    src: str
+    pos: int
+    line: int
+    chunk: str
+    toks: [Tok]
+}
+
+fn peek_at(lx: Lx, k: int) -> int {
+    i = lx.pos + k
+    if i < len(lx.src) { byte_at(lx.src, i) } else { 0 }
+}
+
+pub fn is_digit(c: int) -> bool { c >= '0' && c <= '9' }
+
+pub fn is_alpha(c: int) -> bool { (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' }
+
+pub fn hex_val(c: int) -> int {
+    if is_digit(c) {
+        c - '0'
+    } else if c >= 'a' && c <= 'f' {
+        c - 'a' + 10
+    } else if c >= 'A' && c <= 'F' {
+        c - 'A' + 10
+    } else {
+        -1
+    }
+}
+
+fn err_at(lx: Lx, msg: str) -> str { "#{lx.chunk}:#{lx.line}: #{msg}" }
+
+fn add(inout lx: Lx, kind: int, text: str, line: int) {
+    lx.toks.push(Tok(kind: kind, text: text, line: line, n: 0, f: 0.0))
+}
+
+// 长括号 [[ … ]]、[==[ … ]==]：pos 指着第一个 [，返回等号的个数；不是长括号时返回 -1
+fn long_level(lx: Lx) -> int {
+    k = 1
+    for peek_at(lx, k) == '=' { k += 1 }
+    if peek_at(lx, k) == '[' { k - 1 } else { -1 }
+}
+
+// 长括号里的内容（pos 指着第一个 [）。紧跟在开头的换行不算
+fn long_body(inout lx: Lx, level: int, what: str) -> str! {
+    lx.pos += level + 2
+    if peek_at(lx, 0) == '\r' { lx.pos += 1 }
+    if peek_at(lx, 0) == '\n' {
+        lx.line += 1
+        lx.pos += 1
+    }
+    start = lx.pos
+    for lx.pos < len(lx.src) {
+        c = byte_at(lx.src, lx.pos)
+        if c == ']' {
+            k = 1
+            for peek_at(lx, k) == '=' { k += 1 }
+            if k - 1 == level && peek_at(lx, k) == ']' {
+                s = slice(lx.src, start, lx.pos)
+                lx.pos += k + 1
+                return Ok(s)
+            }
+        } else if c == '\n' {
+            lx.line += 1
+        }
+        lx.pos += 1
+    }
+    Err(err_at(lx, "unfinished long #{what} near '<eof>'"))
+}
+
+fn malformed(lx: Lx, start: int) -> str {
+    end_at = if lx.pos < len(lx.src) { lx.pos + 1 } else { lx.pos }
+    err_at(lx, "malformed number near '#{slice(lx.src, start, end_at)}'")
+}
+
+fn number(inout lx: Lx) -> ()! {
+    start = lx.pos
+    if peek_at(lx, 0) == '0' && (peek_at(lx, 1) == 'x' || peek_at(lx, 1) == 'X') {
+        // 十六进制整数按 64 位回绕（和 Lua 一样）
+        lx.pos += 2
+        n = 0
+        any = false
+        for hex_val(peek_at(lx, 0)) >= 0 {
+            n = n *% 16 +% hex_val(peek_at(lx, 0))
+            lx.pos += 1
+            any = true
+        }
+        if !any || is_alpha(peek_at(lx, 0)) || peek_at(lx, 0) == '.' { return Err(malformed(lx, start)) }
+        lx.toks.push(Tok(kind: K_INT, text: slice(lx.src, start, lx.pos), line: lx.line, n: n, f: 0.0))
+        return Ok()
+    }
+    is_float = false
+    for is_digit(peek_at(lx, 0)) { lx.pos += 1 }
+    if peek_at(lx, 0) == '.' {
+        is_float = true
+        lx.pos += 1
+        for is_digit(peek_at(lx, 0)) { lx.pos += 1 }
+    }
+    if peek_at(lx, 0) == 'e' || peek_at(lx, 0) == 'E' {
+        is_float = true
+        lx.pos += 1
+        if peek_at(lx, 0) == '+' || peek_at(lx, 0) == '-' { lx.pos += 1 }
+        if !is_digit(peek_at(lx, 0)) { return Err(malformed(lx, start)) }
+        for is_digit(peek_at(lx, 0)) { lx.pos += 1 }
+    }
+    if is_alpha(peek_at(lx, 0)) || peek_at(lx, 0) == '.' { return Err(malformed(lx, start)) }
+    text = slice(lx.src, start, lx.pos)
+    if !is_float {
+        match try_parse_int(text) {
+            Ok(v) => {
+                lx.toks.push(Tok(kind: K_INT, text: text, line: lx.line, n: v, f: 0.0))
+                return Ok()
+            }
+            Err(_) => {}    // 超出 int 范围的十进制整数按浮点数读（和 Lua 一样）
+        }
+    }
+    lx.toks.push(Tok(kind: K_FLT, text: text, line: lx.line, n: 0, f: parse_float(text)))
+}
+
+// 引号括起来的字符串，处理转义。pos 指着开头的引号
+fn quoted(inout lx: Lx, q: int) -> str! {
+    lx.pos += 1
+    s = ""
+    run = lx.pos
+    for lx.pos < len(lx.src) {
+        c = byte_at(lx.src, lx.pos)
+        if c == q {
+            s += slice(lx.src, run, lx.pos)
+            lx.pos += 1
+            return Ok(s)
+        }
+        if c == '\n' { return Err(err_at(lx, "unfinished string near '#{slice(lx.src, run - 1, lx.pos)}'")) }
+        if c != '\\' {
+            lx.pos += 1
+            continue
+        }
+        s += slice(lx.src, run, lx.pos)
+        lx.pos += 1
+        e = peek_at(lx, 0)
+        lx.pos += 1
+        if e == 'n' {
+            s += "\n"
+        } else if e == 't' {
+            s += "\t"
+        } else if e == 'r' {
+            s += "\r"
+        } else if e == 'a' {
+            s += from_byte(7)
+        } else if e == 'b' {
+            s += from_byte(8)
+        } else if e == 'f' {
+            s += from_byte(12)
+        } else if e == 'v' {
+            s += from_byte(11)
+        } else if e == '\\' || e == '"' || e == '\'' {
+            s += from_byte(e)
+        } else if e == '\n' {
+            s += "\n"
+            lx.line += 1
+        } else if e == 'x' {
+            h1 = hex_val(peek_at(lx, 0))
+            h2 = hex_val(peek_at(lx, 1))
+            if h1 < 0 || h2 < 0 { return Err(err_at(lx, "hexadecimal digit expected")) }
+            s += from_byte(h1 * 16 + h2)
+            lx.pos += 2
+        } else if e == 'z' {
+            for lx.pos < len(lx.src) && str.contains(" \t\r\n", from_byte(byte_at(lx.src, lx.pos))) {
+                if byte_at(lx.src, lx.pos) == '\n' { lx.line += 1 }
+                lx.pos += 1
+            }
+        } else if is_digit(e) {
+            v = e - '0'
+            k = 0
+            for k < 2 && is_digit(peek_at(lx, 0)) {
+                v = v * 10 + peek_at(lx, 0) - '0'
+                lx.pos += 1
+                k += 1
+            }
+            if v > 255 { return Err(err_at(lx, "decimal escape too large")) }
+            s += from_byte(v)
+        } else if e == 'u' && peek_at(lx, 0) == '{' {
+            lx.pos += 1
+            v = 0
+            for hex_val(peek_at(lx, 0)) >= 0 {
+                v = v * 16 + hex_val(peek_at(lx, 0))
+                if v > 0x7FFFFFFF { return Err(err_at(lx, "UTF-8 value too large")) }
+                lx.pos += 1
+            }
+            if peek_at(lx, 0) != '}' { return Err(err_at(lx, "missing '}' in \\u{xxxx}")) }
+            lx.pos += 1
+            if v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF) { return Err(err_at(lx, "UTF-8 value not supported")) }
+            s += utf8.from_code_point(v)
+        } else {
+            return Err(err_at(lx, "invalid escape sequence '\\#{from_byte(e)}'"))
+        }
+        run = lx.pos
+    }
+    Err(err_at(lx, "unfinished string near '<eof>'"))
+}
+
+pub fn lex(src: str, chunk: str) -> [Tok]! {
+    lx = Lx(src: src, pos: 0, line: 1, chunk: chunk, toks: [])
+    // 第一行是 #! 时跳过
+    if peek_at(lx, 0) == '#' {
+        for lx.pos < len(lx.src) && byte_at(lx.src, lx.pos) != '\n' { lx.pos += 1 }
+    }
+    for lx.pos < len(lx.src) {
+        c = byte_at(lx.src, lx.pos)
+        if c == '\n' {
+            lx.line += 1
+            lx.pos += 1
+            continue
+        }
+        if c == ' ' || c == '\t' || c == '\r' || c == 11 || c == 12 {
+            lx.pos += 1
+            continue
+        }
+        if c == '-' && peek_at(lx, 1) == '-' {
+            lx.pos += 2
+            if peek_at(lx, 0) == '[' {
+                lv = long_level(lx)
+                if lv >= 0 {
+                    _ = long_body(&lx, lv, "comment")?
+                    continue
+                }
+            }
+            for lx.pos < len(lx.src) && byte_at(lx.src, lx.pos) != '\n' { lx.pos += 1 }
+            continue
+        }
+        if is_alpha(c) {
+            start = lx.pos
+            for is_alpha(peek_at(lx, 0)) || is_digit(peek_at(lx, 0)) { lx.pos += 1 }
+            w = slice(lx.src, start, lx.pos)
+            kind = if str.contains(KEYWORDS, " #{w} ") { K_SYM } else { K_NAME }
+            add(&lx, kind, w, lx.line)
+            continue
+        }
+        if is_digit(c) || (c == '.' && is_digit(peek_at(lx, 1))) {
+            number(&lx)?
+            continue
+        }
+        if c == '"' || c == '\'' {
+            at = lx.line
+            s = quoted(&lx, c)?
+            add(&lx, K_STR, s, at)
+            continue
+        }
+        if c == '[' {
+            lv = long_level(lx)
+            if lv >= 0 {
+                at = lx.line
+                s = long_body(&lx, lv, "string")?
+                add(&lx, K_STR, s, at)
+                continue
+            }
+        }
+        if c == '.' && peek_at(lx, 1) == '.' && peek_at(lx, 2) == '.' {
+            add(&lx, K_SYM, "...", lx.line)
+            lx.pos += 3
+            continue
+        }
+        if lx.pos + 1 < len(lx.src) {
+            two = slice(lx.src, lx.pos, lx.pos + 2)
+            if str.contains(TWO, " #{two} ") {
+                add(&lx, K_SYM, two, lx.line)
+                lx.pos += 2
+                continue
+            }
+        }
+        one = from_byte(c)
+        if !str.contains(ONE, one) { return Err(err_at(lx, "unexpected symbol near '#{one}'")) }
+        add(&lx, K_SYM, one, lx.line)
+        lx.pos += 1
+    }
+    add(&lx, K_EOF, "<eof>", lx.line)
+    Ok(replace(&lx.toks, []))
+}

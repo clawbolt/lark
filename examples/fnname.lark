@@ -1,0 +1,90 @@
+// 函数名当值用：在需要函数类型的地方直接写函数名，等于写 |x| f(x)
+// 要求函数不是泛型、参数都是只读的，参数和返回类型与需要的一样；重载的函数按第一个参数的类型选。
+// 传给泛型函数时（sort.sort_by、iter.map）也可以直接写：等别的参数把类型参数确定以后再对函数名，返回类型可以从函数的签名推出来。
+// 另外两个写法：()! 函数末尾的 if，没有值的分支就是 Ok()；()! 的结果可以匹配 Ok 或 Ok(_)。
+import "std/iter"
+import "std/sort"
+
+fn double(x: int) -> int { x * 2 }
+
+fn square(x: int) -> int { x * x }
+
+fn is_even(n: int) -> bool { n % 2 == 0 }
+
+fn shout(s: str) -> str { s + "！" }
+
+fn by_len(a: str, b: str) -> int { len(a) - len(b) }
+
+fn label(n: int) -> str { "整数 #{n}" }
+
+fn label(s: str) -> str { "字符串 #{s}" }
+
+fn apply_all(xs: [int], f: fn(int) -> int) -> [int] {
+    out: [int] = []
+    for x in xs { out.push(f(x)) }
+    out
+}
+
+fn count_if(xs: [int], p: fn(int) -> bool) -> int {
+    n = 0
+    for x in xs {
+        if p(x) { n += 1 }
+    }
+    n
+}
+
+fn twice(s: str, f: fn(str) -> str) -> str { f(f(s)) }
+
+fn labels(xs: [int], f: fn(int) -> str) -> [str] {
+    out: [str] = []
+    for x in xs { out.push(f(x)) }
+    out
+}
+
+type Rule {
+    name: str
+    test: Fn(int) -> bool
+}
+
+fn record(n: int, inout total: int) -> ()! {
+    if n >= 0 {
+        total += n
+    } else {
+        Err("#{n} 是负数，没有记")
+    }
+}
+
+fn main() {
+    ys = apply_all([1, 2, 3], double)
+    print("double：#{ys[0]} #{ys[1]} #{ys[2]}")
+    print("偶数有 #{count_if([1, 2, 3, 4, 6], is_even)} 个")
+    print(twice("好", shout))
+    for s in labels([7, 8], label) { print(s) }
+
+    // 存成 Fn 值：放进列表、字段
+    fs: [Fn(int) -> int] = [double, square, |x| x + 1]
+    for f in fs { print("#{f(5)}") }
+    r = Rule(name: "偶数", test: is_even)
+    t = r.test.copy()
+    print("#{r.name}：4 #{t(4)}，5 #{t(5)}")
+
+    total = 0
+    for n in [5, -1, 10] {
+        match record(n, &total) {
+            Ok(_) => print("记下了 #{n}")
+            Err(e) => print(e)
+        }
+    }
+    match record(1, &total) {
+        Ok => print("合计 #{total}")
+        Err(e) => print(e)
+    }
+
+    // 传给泛型函数
+    words = ["pear", "fig", "banana"]
+    sort.sort_by(&words, by_len)
+    print(join(words, " "))
+    print("#{iter.map([1, 2, 3], double).collect()}")
+    // 重载的 label：T 由列表确定是 int，再按 int 选出 label(n: int)，U 是它的返回类型 str
+    print(join(iter.map([3, 4], label).collect(), "，"))
+}

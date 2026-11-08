@@ -1,0 +1,82 @@
+// Lark 标准库 · 集合 Set[T]（用 Lark 自己写，底下是 Map[T, bool]）
+// 用法：import "std/set"
+//
+//   s: set.Set[str] = set.new()      // 或 set.of(["a", "b"])
+//   s.insert("a")                    // 已经有时什么也不做
+//   s.contains("a")                  // true
+//   s.remove("a")                    // 删掉了返回 true
+//   for x in s { … }                 // 借用 s，按插入顺序，每轮复制一个元素；s.to_list() 是所有元素的副本
+//   set.union(a, b) / set.intersection(a, b) / set.difference(a, b)
+//
+// 元素和 Map 的键一样要满足 Hash + Eq。
+import "map"
+
+pub type Set[T] {
+    m: map.Map[T, bool]
+}
+
+pub fn new[T]() -> Set[T] {
+    Set(m: map.new())
+}
+
+pub fn of[T: Hash + Eq](xs: [T]) -> Set[T] {
+    s: Set[T] = new()
+    for x in xs { insert(&s, x.copy()) }
+    s
+}
+
+// 已经有时什么也不做
+pub fn insert[T: Hash + Eq](inout s: Set[T], take x: T) {
+    s.m.insert(x, true)
+}
+
+pub fn contains[T: Hash + Eq](s: Set[T], x: T) -> bool {
+    s.m.contains_key(x)
+}
+
+pub fn remove[T: Hash + Eq](inout s: Set[T], x: T) -> bool {
+    r = s.m.remove(x)
+    match r {
+        Some(_) => true
+        None => false
+    }
+}
+
+pub fn is_empty[T](s: Set[T]) -> bool { len(s.m.keys) == 0 }
+
+// for x in s：借用 s 遍历，每轮复制一个元素，按插入顺序（借用遍历，见 README）
+pub fn iter_len[T](s: Set[T]) -> int { len(s.m.keys) }
+
+pub fn iter_at[T](s: Set[T], i: int) -> T { s.m.keys[i].copy() }
+
+pub fn to_list[T](s: Set[T]) -> [T] { s.m.keys.copy() }
+
+// 先是 a 的元素，再是 b 里 a 没有的
+pub fn union[T: Hash + Eq](a: Set[T], b: Set[T]) -> Set[T] {
+    out = a.copy()
+    for x in b.m.keys { insert(&out, x.copy()) }
+    out
+}
+
+pub fn intersection[T: Hash + Eq](a: Set[T], b: Set[T]) -> Set[T] {
+    out: Set[T] = new()
+    for x in a.m.keys {
+        if contains(b, x) { insert(&out, x.copy()) }
+    }
+    out
+}
+
+// a 里有、b 里没有的
+pub fn difference[T: Hash + Eq](a: Set[T], b: Set[T]) -> Set[T] {
+    out: Set[T] = new()
+    for x in a.m.keys {
+        if !contains(b, x) { insert(&out, x.copy()) }
+    }
+    out
+}
+
+// "#{s}"：{"a", "b"}，按插入顺序；元素的写法和列表里的一样（字符串加引号）
+pub fn show[T](s: Set[T]) -> str {
+    t = "#{s.m.keys}"
+    "{" + slice(t, 1, len(t) - 1) + "}"
+}

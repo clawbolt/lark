@@ -1,0 +1,3 @@
+tests/err1/ctor_private.lark:5:9: 错误：iter.Range 的字段 cur 没有 pub，所以在模块 iter 外面不能直接构造 Range（请用 iter 提供的函数）
+ 5 |     r = iter.Range(cur: 0, end: 3)
+   |         ^

@@ -1,0 +1,7 @@
+// 期望错误：Lark 没有 while，给出 for 的写法
+fn main() {
+    n = 0
+    while n < 3 {
+        n += 1
+    }
+}

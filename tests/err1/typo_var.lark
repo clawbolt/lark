@@ -1,0 +1,5 @@
+// 期望错误：未定义的变量 totla，提示 total（交换相邻两个字母算一次编辑）
+fn main() {
+    total = 1
+    print("#{totla}")
+}

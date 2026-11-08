@@ -1,0 +1,130 @@
+// lproxy：用 Lark 写的 HTTP 反向代理，按路径前缀把请求转给上游（标准库阶段 2 的验收程序）
+// 构建：在 apps/lproxy 里 lark build，得到 build/lproxy
+//
+//   lproxy [--port 端口] [--bind 地址] [--timeout 毫秒] 前缀=上游…
+//   lproxy --port 8000 /api=http://127.0.0.1:9000 /=http://127.0.0.1:8080
+//
+// 路径原样转过去（不去掉前缀）；几条规则都能匹配时取最长的前缀（/api 包括 /api 和 /api/…，不包括 /apix），都不匹配回 404。
+// 上游连不上、断了回 502，--timeout（默认 10 秒）内读写不完回 504，都记一行日志；上游的 3xx 原样带回，不跟随。
+// 到上游的连接复用（几个 http.Client 放在一个池子里，每个请求借一个）。
+// 收到 SIGINT / SIGTERM 时优雅退出：不再接受新连接，进行中的请求做完，空闲的连接关掉，然后退出码 0（http.serve_until）。
+//
+// 用到的标准库：flag（参数）、http（serve_until、路由、Client）、timer（超时）、signal、sync（Cancel）、log。
+import "std/flag"
+import "std/http"
+import "std/io"
+import "std/log"
+import "std/net"
+import "std/signal"
+import "std/sync"
+import "proxy/proxy"
+
+const MAX_POOL = 16             // 池子里最多留几个 Client（每个最多留 4 条到上游的空闲连接）
+
+// 借一个 Client 转发，用完放回池子
+fn proxy_one(pool: Mutex[[http.Client]], base: str, req: http.Request, timeout_ms: int) -> http.Response {
+    cl = lock pool as ps { ps.try_pop() ?? http.new_client() }
+    err = ""
+    resp = proxy.forward(&cl, base, req, timeout_ms, &err)
+    if err != "" {
+        log.new("lproxy").log(log.WARN, "转发失败", ["method", req.method.copy(), "target", req.target.copy(), "upstream", base.copy(), "status", "#{resp.status}", "err", err])
+    }
+    lock pool as ps {
+        ps.push(cl)
+        if len(ps) > MAX_POOL { _old = ps.remove_at(0) }
+    }
+    resp
+}
+
+type Watch {
+    sigs: signal.Signals
+    stop: sync.Cancel
+}
+
+fn on_signal(take w: Watch) {
+    n = w.sigs.wait() ?? signal.TERM
+    log.new("lproxy").info("收到 #{signal.name(n)}，不再接受新连接，等进行中的请求做完")
+    w.stop.cancel()
+}
+
+type Front {
+    l: net.Listener
+    r: http.Router
+    stop: sync.Cancel
+}
+
+fn serve_front(take f: Front) {
+    router = replace(&f.r, http.new_router())
+    h: Fn(http.Request) -> http.Response = |req| http.route(router, req)
+    match http.serve_until(f.l, h, f.stop) {
+        Ok => log.new("lproxy").info("退出")
+        Err(e) => {
+            // 等信号的任务还在等：直接退出
+            log.new("lproxy").log(log.ERROR, "accept 出错，退出", ["err", e.copy()])
+            exit(1)
+        }
+    }
+}
+
+fn run_server(host: str, port: int, timeout_ms: int, ups: [proxy.Upstream]) -> ()! {
+    idle: [http.Client] = []
+    pool = mutex(idle)
+    r = http.new_router()
+    for u in ups {
+        base = u.base.copy()
+        pl = pool.copy()
+        h: Fn(http.Request) -> http.Response = |req| proxy_one(pl, base, req, timeout_ms)
+        for p in proxy.patterns(u) { r.handle(p, h) }
+    }
+    // 先登记信号再告诉别人准备好了
+    sigs = signal.notify([signal.INT, signal.TERM])?
+    l = net.listen(host, port)?
+    p = l.local_port()?
+    w = io.stdout()
+    for u in ups { w.write_line("  #{u.prefix} → #{u.base}")? }
+    // 测试脚本靠这一行知道端口
+    w.write_line("lproxy 在 http://#{host}:#{p}/ 上")?
+    w.flush()?
+    stop = sync.new_cancel()
+    scope {
+        spawn(on_signal, Watch(sigs: sigs, stop: stop.copy()))
+        spawn(serve_front, Front(l: l, r: r, stop: stop))
+    }
+}
+
+fn main() {
+    fp = flag.new("lproxy", "HTTP 反向代理：按路径前缀把请求转给上游。参数是一条条 前缀=http://主机:端口")
+    fp.add_int("port", "p", 8000, "监听的端口；0 表示由系统挑")
+    fp.add_str("bind", "", "127.0.0.1", "监听的地址")
+    fp.add_int("timeout", "t", 10000, "等上游读写的毫秒数，超过回 504")
+    a = fp.parse_or_exit()
+    if len(a.rest) == 0 {
+        eprint("lproxy：至少要一条规则，比如 /=http://127.0.0.1:8080")
+        eprint(fp.usage())
+        exit(2)
+    }
+    ups: [proxy.Upstream] = []
+    for s in a.rest {
+        u = match take proxy.parse_rule(s) {
+            Ok(x) => x
+            Err(e) => {
+                eprint("lproxy：#{e}")
+                exit(2)
+            }
+        }
+        for o in ups {
+            if o.prefix == u.prefix {
+                eprint("lproxy：前缀 #{u.prefix} 写了两次")
+                exit(2)
+            }
+        }
+        ups.push(u)
+    }
+    match run_server(a.get_str("bind"), a.get_int("port"), a.get_int("timeout"), ups) {
+        Ok => {}
+        Err(e) => {
+            eprint("lproxy：#{e}")
+            exit(1)
+        }
+    }
+}

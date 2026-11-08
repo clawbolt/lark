@@ -1,0 +1,569 @@
+// 语义高亮（LSP 规范的 “textDocument/semanticTokens/full”）：按上下文给标识符标上种类，编辑器据此上色。
+// 先证明再写：对应 formal/Lark/LspSem.lean，函数和定义一一对应：
+//   words ↔ words（scan：只在代码里找词，字符串、注释、字符字面量里面不出词，字符串里的插值 #{…} 是代码）、encode ↔ encode
+// 证明了：找出的每个词在它的偏移上正好是一串标识符的字节、非空、往右到头（scan_word），按位置排好、互不重叠
+// （scan_disjoint）；按 LSP 的规定写成相对前一个的差，解回来正好是原来的位置、长度、种类和修饰（decode_encode）。
+// 没证：每个词是什么种类、带什么修饰（kind_of / mods_of 看上下文猜的，见下面的规则）。
+// 种类（legend 的下标）：namespace 0、type 1、function 2、parameter 3、variable 4、property 5、关键字 6、enumMember 7、self 8。
+// 修饰（位掩码）：declaration 1（fn / type / enum / interface 声明的名字）、defaultLibrary 2（int、str 这些内置类型）。
+// 关键字用 selfTypeKeyword、self 用 selfKeyword：OpenIDEA 的语义层不认 keyword，但把这两个画成关键字色和 self 色；
+// VS Code 不认识这两个名字时退回语法高亮的颜色，关键字本来就是语法高亮上的色。
+import "std/os"
+import "std/json"
+import "lsp/pos"
+import "lsp/docs"
+
+pub const NAMESPACE = 0
+pub const TYPE = 1
+pub const FUNCTION = 2
+pub const PARAMETER = 3
+pub const VARIABLE = 4
+pub const PROPERTY = 5
+pub const KEYWORD = 6     // legend 里叫 selfTypeKeyword
+pub const ENUM_MEMBER = 7
+pub const SELF = 8        // legend 里叫 selfKeyword
+
+pub const DECLARATION = 1
+pub const DEFAULT_LIBRARY = 2
+
+pub fn legend() -> [str] { ["namespace", "type", "function", "parameter", "variable", "property", "selfTypeKeyword", "enumMember", "selfKeyword"] }
+
+pub fn modifiers() -> [str] { ["declaration", "defaultLibrary"] }
+
+fn is_id(c: int) -> bool { (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || (c >= 48 && c <= 57) }
+
+fn is_digit(c: int) -> bool { c >= 48 && c <= 57 }
+
+fn id_len(d: str, at: int) -> int {
+    k = at
+    for k < len(d) && is_id(byte_at(d, k)) { k += 1 }
+    k - at
+}
+
+pub type Word {
+    pub at: int
+    pub n: int
+}
+
+// ---------- 找词（scan） ----------
+
+// 模式：0 代码，1 字符串，2 字符串里 \ 之后，3 注释，4 字符字面量，5 字符字面量里 \ 之后，6 字符串里 # 之后（下一个是 {，进插值）
+// st：现在在几层插值 #{…} 里，每层记着里面还没配对的 { 有几个（和 compiler/lex.lark 一样数花括号）
+pub fn words(d: str) -> [Word] {
+    out: [Word] = []
+    m = 0
+    p = false       // 上一个字节是不是标识符的字节
+    st: [int] = []
+    for i in 0..len(d) {
+        c = byte_at(d, i)
+        if m == 0 {
+            n = len(st)
+            if c == 47 && i + 1 < len(d) && byte_at(d, i + 1) == 47 {
+                m = 3
+                p = false
+            } else if c == 34 {
+                m = 1
+                p = false
+            } else if c == 39 {
+                m = 4
+                p = false
+            } else if c == 123 {
+                if n > 0 { st[n - 1] = st[n - 1] + 1 }      // depthUp
+                p = false
+            } else if c == 125 && n > 0 && st[n - 1] == 0 {
+                st.pop()                                     // 插值结束，回到字符串
+                m = 1
+                p = false
+            } else if c == 125 {
+                if n > 0 { st[n - 1] = st[n - 1] - 1 }      // depthDown
+                p = false
+            } else if is_id(c) {
+                if !p && !is_digit(c) { out.push(Word(at: i, n: id_len(d, i))) }
+                p = true
+            } else {
+                p = false
+            }
+        } else if m == 1 {
+            if c == 92 {
+                m = 2
+            } else if c == 34 {
+                m = 0
+            } else if c == 35 && i + 1 < len(d) && byte_at(d, i + 1) == 123 {
+                m = 6
+            }
+        } else if m == 6 {
+            st.push(0)
+            m = 0
+            p = false
+        } else if m == 2 {
+            m = 1
+        } else if m == 3 {
+            if c == 10 { m = 0 }
+        } else if m == 4 {
+            if c == 92 { m = 5 } else if c == 39 { m = 0 }
+        } else {
+            m = 4
+        }
+    }
+    out
+}
+
+// ---------- 编码（encode） ----------
+
+pub type Tok {
+    pub line: int
+    pub ch: int
+    pub n: int
+    pub kind: int
+    pub md: int     // 修饰的位掩码
+}
+
+// 相对前一个的差：行差、列差（同一行时；换了行时是列本身）、长度、种类、修饰
+pub fn encode(ts: [Tok]) -> [int] {
+    out: [int] = []
+    l0 = 0
+    c0 = 0
+    for t in ts {
+        out.push(t.line - l0)
+        out.push(if t.line == l0 { t.ch - c0 } else { t.ch })
+        out.push(t.n)
+        out.push(t.kind)
+        out.push(t.md)
+        l0 = t.line
+        c0 = t.ch
+    }
+    out
+}
+
+// ---------- 种类（没证：看上下文） ----------
+
+fn has(xs: [str], x: str) -> bool {
+    for y in xs { if y == x { return true } }
+    false
+}
+
+fn is_kw(t: str) -> bool {
+    has(["fn", "type", "enum", "interface", "const", "pub", "import", "if", "else", "match", "for", "in", "return",
+        "break", "continue", "take", "inout", "scope", "select"], t)
+}
+
+fn is_builtin(t: str) -> bool { has(["int", "float", "u8", "bool", "str", "Self", "Fn"], t) }
+
+fn is_upper(c: int) -> bool { c >= 65 && c <= 90 }
+
+fn is_lower(c: int) -> bool { c >= 97 && c <= 122 }
+
+// 全大写（MAX_LEN）：常量
+fn all_caps(t: str) -> bool {
+    if len(t) < 2 { return false }
+    for i in 0..len(t) { if is_lower(byte_at(t, i)) { return false } }
+    true
+}
+
+// e 之后第一个不是空格、制表符的字节；没有是 -1
+fn next_ns(d: str, e: int) -> int {
+    k = e
+    for k < len(d) && (byte_at(d, k) == 32 || byte_at(d, k) == 9) { k += 1 }
+    if k < len(d) { byte_at(d, k) } else { -1 }
+}
+
+fn next_ns_at(d: str, e: int) -> int {
+    k = e
+    for k < len(d) && (byte_at(d, k) == 32 || byte_at(d, k) == 9) { k += 1 }
+    k
+}
+
+// a 之前第一个不是空格、制表符的字节；行首时是 10，文件开头是 -1
+fn prev_ns(d: str, a: int) -> int {
+    k = a - 1
+    for k >= 0 && (byte_at(d, k) == 32 || byte_at(d, k) == 9) { k -= 1 }
+    if k >= 0 { byte_at(d, k) } else { -1 }
+}
+
+fn line_start(d: str, a: int) -> bool {
+    b = prev_ns(d, a)
+    b == 10 || b == -1
+}
+
+// 每个字节是不是代码：和 words 同一个状态机（插值里是代码）；结束插值的那个 } 不算
+fn code_mask(d: str) -> [bool] {
+    out: [bool] = []
+    m = 0
+    st: [int] = []
+    for i in 0..len(d) {
+        c = byte_at(d, i)
+        code = m == 0
+        if m == 0 {
+            n = len(st)
+            if c == 47 && i + 1 < len(d) && byte_at(d, i + 1) == 47 {
+                m = 3
+            } else if c == 34 {
+                m = 1
+            } else if c == 39 {
+                m = 4
+            } else if c == 123 {
+                if n > 0 { st[n - 1] = st[n - 1] + 1 }
+            } else if c == 125 && n > 0 && st[n - 1] == 0 {
+                st.pop()
+                m = 1
+                code = false
+            } else if c == 125 {
+                if n > 0 { st[n - 1] = st[n - 1] - 1 }
+            }
+        } else if m == 1 {
+            if c == 92 {
+                m = 2
+            } else if c == 34 {
+                m = 0
+            } else if c == 35 && i + 1 < len(d) && byte_at(d, i + 1) == 123 {
+                m = 6
+            }
+        } else if m == 6 {
+            st.push(0)
+            m = 0
+        } else if m == 2 {
+            m = 1
+        } else if m == 3 {
+            if c == 10 { m = 0 }
+        } else if m == 4 {
+            if c == 92 { m = 5 } else if c == 39 { m = 0 }
+        } else {
+            m = 4
+        }
+        out.push(code)
+    }
+    out
+}
+
+// i 是 ( 或 { 的下标：和它配对的那个的下标（只数代码里的括号）；没有时是文档的长度
+fn match_close(d: str, mask: [bool], i: int) -> int {
+    open = byte_at(d, i)
+    close = if open == 40 { 41 } else { 125 }
+    depth = 0
+    for k in i..len(d) {
+        if mask[k] {
+            c = byte_at(d, k)
+            if c == open {
+                depth += 1
+            } else if c == close {
+                depth -= 1
+                if depth == 0 { return k }
+            }
+        }
+    }
+    len(d)
+}
+
+// 一个函数：签名的括号 (lp, rp)、函数体到 end，参数和局部变量的名字
+type Func {
+    lp: int
+    rp: int
+    end: int
+    params: [str]
+    locals: [str]
+}
+
+// 一个 type / enum 的花括号 (lb, rb)
+type Body {
+    lb: int
+    rb: int
+    is_enum: bool
+}
+
+type Ctx {
+    d: str
+    ws: [Word]
+    texts: [str]
+    funcs: [Func]
+    bodies: [Body]
+    mods: [str]
+    consts: [str]      // const 声明的名字
+    variants: [str]    // 本文件 enum 的变体
+    fn_of: [int]       // 每个词在哪个函数里（funcs 的下标，签名的括号到函数体的结尾）；不在函数里是 -1
+    body_of: [int]     // 每个词在哪个 type / enum 的花括号里（bodies 的下标）；不在是 -1
+}
+
+// 第 i 个词前面紧挨着（只隔着空格）的那个词；没有是 ""
+fn prev_word(c: Ctx, i: int) -> str {
+    if i == 0 { return "" }
+    e = c.ws[i - 1].at + c.ws[i - 1].n
+    for k in e..c.ws[i].at {
+        b = byte_at(c.d, k)
+        if b != 32 && b != 9 { return "" }
+    }
+    c.texts[i - 1].copy()
+}
+
+// 签名后面同一行里代码的 {：函数体的开头；没有（interface 里的方法）是 -1
+fn first_brace(d: str, mask: [bool], from: int) -> int {
+    for k in from..len(d) {
+        b = byte_at(d, k)
+        if b == 123 && mask[k] { return k }
+        if b == 10 { return -1 }
+    }
+    -1
+}
+
+// a 前面是一个 .（不是 .. 的范围）
+fn after_dot(d: str, a: int) -> bool {
+    k = a - 1
+    for k >= 0 && (byte_at(d, k) == 32 || byte_at(d, k) == 9) { k -= 1 }
+    k >= 0 && byte_at(d, k) == 46 && !(k >= 1 && byte_at(d, k - 1) == 46)
+}
+
+// 从 e 到行尾有没有 =>：match 的分支里，=> 前面是模式
+fn arrow_after(d: str, e: int) -> bool {
+    k = e
+    for k + 1 < len(d) && byte_at(d, k) != 10 {
+        if byte_at(d, k) == 61 && byte_at(d, k + 1) == 62 { return true }
+        k += 1
+    }
+    false
+}
+
+// 在 |a, b| 里：往左、往右跳过名字、空格、逗号以后都是一个 |（不是 || ）
+fn in_bars(d: str, at: int, n: int) -> bool {
+    k = at - 1
+    for k >= 0 && (is_id(byte_at(d, k)) || byte_at(d, k) == 32 || byte_at(d, k) == 44) { k -= 1 }
+    if !(k >= 0 && byte_at(d, k) == 124 && !(k >= 1 && byte_at(d, k - 1) == 124)) { return false }
+    j = at + n
+    for j < len(d) && (is_id(byte_at(d, j)) || byte_at(d, j) == 32 || byte_at(d, j) == 44) { j += 1 }
+    j < len(d) && byte_at(d, j) == 124 && !(j + 1 < len(d) && byte_at(d, j + 1) == 124)
+}
+
+// k 是 ( 后面的下标：参数是 名字: 值 的写法（构造一个 type），不是按位置的（enum 的变体）
+fn named_args(d: str, k: int) -> bool {
+    j = next_ns_at(d, k)
+    if !(j < len(d) && is_id(byte_at(d, j))) { return false }
+    j = next_ns_at(d, j + id_len(d, j))
+    j < len(d) && byte_at(d, j) == 58 && !(j + 1 < len(d) && byte_at(d, j + 1) == 58)
+}
+
+// import 进来的模块名（import 路径的最后一段）
+fn modules(d: str) -> [str] {
+    out: [str] = []
+    start = 0
+    for i in 0..len(d) + 1 {
+        if i == len(d) || byte_at(d, i) == 10 {
+            if i - start > 8 && slice(d, start, start + 8) == "import \"" {
+                j = start + 8
+                for j < i && byte_at(d, j) != 34 { j += 1 }
+                out.push(os.base(slice(d, start + 8, j)))
+            }
+            start = i + 1
+        }
+    }
+    out
+}
+
+// 扫一遍：函数（签名、函数体、参数、局部变量）、type / enum 的花括号、常量、变体，以及每个词在哪个函数和花括号里。
+// 函数体只看它范围里的词（词按位置排好），所以整个文件是一遍的量级
+fn context(d: str) -> Ctx {
+    ws = words(d)
+    texts: [str] = []
+    for w in ws { texts.push(slice(d, w.at, w.at + w.n)) }
+    mask = code_mask(d)
+    fo: [int] = []
+    for _w in ws { fo.push(-1) }
+    bo = fo.copy()
+    fs: [Func] = []
+    bs: [Body] = []
+    cs: [str] = []
+    vs: [str] = []
+    e1: [Func] = []
+    e2: [Body] = []
+    e3: [str] = []
+    e4: [str] = []
+    e5: [int] = []
+    e6: [int] = []
+    c = Ctx(d: d.copy(), ws: ws, texts: texts, funcs: e1, bodies: e2, mods: modules(d), consts: e3, variants: e4, fn_of: e5, body_of: e6)
+    n = len(c.ws)
+    for i in 0..n {
+        t = c.texts[i].copy()
+        if t == "const" && i + 1 < n { cs.push(c.texts[i + 1].copy()) }
+        if (t == "fn" || t == "test") && i + 1 < n {
+            // fn 名字(…)：签名的括号和函数体；test "…" { … } 只有函数体
+            lp = -1
+            if t == "fn" && next_ns(d, c.ws[i + 1].at + c.ws[i + 1].n) == 40 { lp = next_ns_at(d, c.ws[i + 1].at + c.ws[i + 1].n) }
+            if lp >= 0 || (t == "test" && next_ns(d, c.ws[i].at + 4) == 34) {
+                rp = if lp >= 0 { match_close(d, mask, lp) } else { c.ws[i].at + 4 }
+                if lp < 0 { lp = rp }
+                lb = first_brace(d, mask, rp)
+                end = if lb >= 0 { match_close(d, mask, lb) } else { rp }
+                fi = len(fs)
+                ps: [str] = []
+                ls: [str] = []
+                j = i + 1
+                for j < n && c.ws[j].at < end {
+                    w = c.ws[j].copy()
+                    tj = c.texts[j].copy()
+                    if w.at > lp { fo[j] = fi }
+                    if w.at > lp && w.at < rp && next_ns(d, w.at + w.n) == 58 && !is_kw(tj) { ps.push(tj.copy()) }
+                    if w.at > rp && !is_kw(tj) {
+                        // 闭包的参数 |a, b|
+                        if tj != "_" && in_bars(d, w.at, w.n) { ps.push(tj.copy()) }
+                        nb = next_ns(d, w.at + w.n)
+                        na = next_ns_at(d, w.at + w.n)
+                        after = if na + 1 < len(d) { byte_at(d, na + 1) } else { -1 }
+                        assign = nb == 61 && after != 61 && after != 62
+                        start = line_start(d, w.at)
+                        // match 的模式里绑定的名字：变体(a, b) => 、(a, b) => 、a =>
+                        bind = tj != "_" && !after_dot(d, w.at) && arrow_after(d, w.at + w.n) && (((nb == 44 || nb == 41) && (prev_ns(d, w.at) == 40 || prev_ns(d, w.at) == 44)) || (start && nb == 61 && after == 62))
+                        if assign || bind || prev_word(c, j) == "for" || (start && (nb == 58 || nb == 44)) || (prev_ns(d, w.at) == 44 && nb == 61) {
+                            ls.push(tj.copy())
+                        }
+                    }
+                    j += 1
+                }
+                fs.push(Func(lp: lp, rp: rp, end: end, params: ps, locals: ls))
+            }
+        }
+        if (t == "type" || t == "enum") && i + 1 < n && next_ns(d, c.ws[i + 1].at + c.ws[i + 1].n) == 123 {
+            lb = next_ns_at(d, c.ws[i + 1].at + c.ws[i + 1].n)
+            rb = match_close(d, mask, lb)
+            bi = len(bs)
+            j = i + 2
+            for j < n && c.ws[j].at < rb {
+                if c.ws[j].at > lb {
+                    bo[j] = bi
+                    if t == "enum" && line_start(d, c.ws[j].at) { vs.push(c.texts[j].copy()) }
+                }
+                j += 1
+            }
+            bs.push(Body(lb: lb, rb: rb, is_enum: t == "enum"))
+        }
+    }
+    c.funcs = fs
+    c.bodies = bs
+    c.consts = cs
+    c.variants = vs
+    c.fn_of = fo
+    c.body_of = bo
+    c
+}
+
+// 大写开头的名字（e 是它的结尾）：全大写的是常量；本文件 enum 的变体、按位置构造 X(a, b) 的、模式里的 X => 是变体；别的是类型
+fn upper_kind(c: Ctx, t: str, e: int) -> int {
+    d = c.d
+    if all_caps(t) || has(c.variants, t) { return ENUM_MEMBER }
+    k = next_ns_at(d, e)
+    if k < len(d) && byte_at(d, k) == 40 { return if named_args(d, k + 1) { TYPE } else { ENUM_MEMBER } }
+    if k + 1 < len(d) && byte_at(d, k) == 61 && byte_at(d, k + 1) == 62 { return ENUM_MEMBER }
+    TYPE
+}
+
+// 第 i 个词的种类；不上色是 -1
+fn kind_of(c: Ctx, i: int) -> int {
+    t = c.texts[i].copy()
+    w = c.ws[i].copy()
+    d = c.d
+    if t == "true" || t == "false" { return -1 }
+    if is_kw(t) { return KEYWORD }
+    nb = next_ns(d, w.at + w.n)
+    if t == "self" { return SELF }
+    // 按后面跟着什么才是关键字（和 compiler/parse.lark 一样）：test "…"、lock 名字、defer {
+    if t == "test" && nb == 34 { return KEYWORD }
+    if t == "lock" && is_id(nb) && !is_digit(nb) { return KEYWORD }
+    if t == "defer" && nb == 123 { return KEYWORD }
+    pb = prev_ns(d, w.at)
+    // .名字：字段和方法是小写开头的；模块.Pos、模块.Str(x) 这种大写开头的是类型、变体
+    if after_dot(d, w.at) {
+        if is_upper(byte_at(t, 0)) { return upper_kind(c, t, w.at + w.n) }
+        return if nb == 40 { FUNCTION } else { PROPERTY }
+    }
+    if nb == 46 && has(c.mods, t) { return NAMESPACE }
+    pw = prev_word(c, i)
+    if pw == "fn" { return FUNCTION }
+    if pw == "type" || pw == "enum" || pw == "interface" { return TYPE }
+    // 常量用 enumMember：OpenIDEA 只给它常量色
+    if pw == "const" || has(c.consts, t) { return ENUM_MEMBER }
+    if t == "Some" || t == "None" || t == "Ok" || t == "Err" { return ENUM_MEMBER }
+    if is_builtin(t) { return TYPE }
+    bi = c.body_of[i]
+    if bi >= 0 {
+        if c.bodies[bi].is_enum && line_start(d, w.at) { return ENUM_MEMBER }
+        if nb == 58 { return PROPERTY }
+    }
+    if is_upper(byte_at(t, 0)) { return upper_kind(c, t, w.at + w.n) }
+    // 签名里的参数；调用时的 名字: 值 是字段
+    fi = c.fn_of[i]
+    if fi >= 0 && w.at < c.funcs[fi].rp && has(c.funcs[fi].params, t) { return PARAMETER }
+    if nb == 58 && (pb == 40 || pb == 44) { return PROPERTY }
+    if fi >= 0 {
+        if has(c.funcs[fi].params, t) { return PARAMETER }
+        if has(c.funcs[fi].locals, t) { return VARIABLE }
+    }
+    if nb == 40 { return FUNCTION }
+    -1
+}
+
+// 第 i 个词（种类是 k）的修饰
+fn mods_of(c: Ctx, i: int, k: int) -> int {
+    pw = prev_word(c, i)
+    if k == FUNCTION && pw == "fn" { return DECLARATION }
+    if k == TYPE && (pw == "type" || pw == "enum" || pw == "interface") { return DECLARATION }
+    if k == TYPE && is_builtin(c.texts[i]) { return DEFAULT_LIBRARY }
+    0
+}
+
+// 文档里所有上色的词：位置按顺序换成 (行, 列)，和 pos.pos_of 一样（词都从字符边界开始，标识符都是 ASCII）
+pub fn tokens(enc: pos.Enc, d: str) -> [Tok] {
+    c = context(d)
+    xs = pos.doc(d)
+    out: [Tok] = []
+    li = 0
+    col = 0
+    off = 0
+    ei = 0
+    for i in 0..len(c.ws) {
+        k = kind_of(c, i)
+        if k >= 0 {
+            at = c.ws[i].at
+            for ei < len(xs) && off < at {
+                if pos.is_eol(xs[ei]) {
+                    li += 1
+                    col = 0
+                } else {
+                    col += pos.units(enc, xs[ei])
+                }
+                off += len(xs[ei])
+                ei += 1
+            }
+            out.push(Tok(line: li, ch: col, n: c.ws[i].n, kind: k, md: mods_of(c, i, k)))
+        }
+    }
+    out
+}
+
+// 第 i 个词的种类的名字，带修饰时后面加 .declaration / .defaultLibrary（测试用）；不上色是 "-"
+pub fn kind_name(d: str, i: int) -> str {
+    c = context(d)
+    k = kind_of(c, i)
+    ns = legend()
+    if k < 0 { return "-" }
+    m = mods_of(c, i, k)
+    out = ns[k].copy()
+    if m == DECLARATION { out += ".declaration" }
+    if m == DEFAULT_LIBRARY { out += ".defaultLibrary" }
+    out
+}
+
+pub fn legend_json() -> json.Json {
+    ts: [json.Json] = []
+    for t in legend() { ts.push(json.Str(t.copy())) }
+    ms: [json.Json] = []
+    for m in modifiers() { ms.push(json.Str(m.copy())) }
+    json.object([("tokenTypes", json.Arr(ts)), ("tokenModifiers", json.Arr(ms))])
+}
+
+// textDocument/semanticTokens/full 的结果：{ data: [...] }；文档没打开时是 null
+pub fn full(enc: pos.Enc, files: [docs.Doc], params: json.Json) -> json.Json {
+    uri = json.path_str(params, "textDocument.uri") ?? ""
+    d = match take docs.get(files, uri) {
+        Some(x) => x.text.copy()
+        None => { return json.Null }
+    }
+    data: [json.Json] = []
+    for n in encode(tokens(enc, d)) { data.push(json.Num(n)) }
+    json.object([("data", json.Arr(data))])
+}

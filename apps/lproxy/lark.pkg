@@ -1,0 +1,3 @@
+# lproxy：用 Lark 写的 HTTP 反向代理，按路径前缀转给上游（标准库阶段 2 的验收程序）
+name = lproxy
+version = 0.1.0

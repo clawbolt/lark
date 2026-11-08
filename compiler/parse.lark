@@ -1,0 +1,1379 @@
+// Lark 编译器 stage1 · 语法分析（递归下降）
+
+type P {
+    toks: [Tok]
+    k: int
+    next_id: int
+    mods: [str]     // 每个文件导入的模块，“模块名@文件序号”：这些文件里 m.x 解析成限定名 "m.x"（见 file_imports）
+    nest: int       // 正在解析的表达式和块套了几层（见 enter）
+    elifs: int      // 正在解析的 else if 连了几个
+}
+
+fn pk(p: P) -> str { p.toks[p.k].kind }
+
+fn pk2(p: P) -> str {
+    if p.k + 1 < len(p.toks) { p.toks[p.k + 1].kind } else { "eof" }
+}
+
+fn ptext(p: P) -> str { p.toks[p.k].text }
+fn pline(p: P) -> int { p.toks[p.k].line }
+fn pcol(p: P) -> int { p.toks[p.k].col }
+
+fn show_tok(p: P) -> str {
+    k = pk(p)
+    if k == "nl" {
+        "换行"
+    } else if k == "eof" {
+        "文件结尾"
+    } else if k == "ident" {
+        ptext(p)
+    } else if k == "int" {
+        int_str(p.toks[p.k].num)
+    } else if k == "float" {
+        ptext(p)
+    } else if k == "str" || k == "istart" {
+        "字符串"
+    } else {
+        k
+    }
+}
+
+fn perr(p: P, msg: str) {
+    fail(pline(p), pcol(p), msg)
+}
+
+fn advance(inout p: P) {
+    if p.k < len(p.toks) - 1 { p.k += 1 }
+}
+
+fn expect(inout p: P, kind: str) {
+    if pk(p) != kind { perr(p, "期望 #{kind}，实际是 #{show_tok(p)}") }
+    advance(&p)
+}
+
+fn accept(inout p: P, kind: str) -> bool {
+    if pk(p) == kind {
+        advance(&p)
+        true
+    } else {
+        false
+    }
+}
+
+fn skip_nl(inout p: P) {
+    for pk(p) == "nl" { advance(&p) }
+}
+
+fn skip_seps(inout p: P) {
+    for pk(p) == "nl" || pk(p) == ";" || pk(p) == "," { advance(&p) }
+}
+
+fn ident(inout p: P) -> str {
+    if pk(p) != "ident" { perr(p, "期望标识符，实际是 #{show_tok(p)}") }
+    s = ptext(p)
+    advance(&p)
+    s
+}
+
+fn new_id(inout p: P) -> int {
+    id = p.next_id
+    p.next_id += 1
+    id
+}
+
+fn mk(inout p: P, line: int, col: int, take kind: ExprKind) -> Expr {
+    Expr(id: new_id(&p), line: line, col: col, kind: kind)
+}
+
+// ---------- 嵌套的上限 ----------
+// 解析器、类型检查、代码生成都是递归的：嵌套太深时与其栈溢出（没有任何提示地退出），不如报一个错。
+// 括号、块每套一层，解析器要递归十几层，所以 max_nest 小一些；
+// a + b + c + … 这样的长链是循环解析的，但得到的语法树很深，后面的递归也一样深，所以函数体解析完再量一次（max_depth）
+
+fn max_nest() -> int { 256 }
+
+fn max_depth() -> int { 1000 }
+
+fn enter(inout p: P) {
+    p.nest += 1
+    if p.nest > max_nest() { perr(p, "嵌套太深（最多 #{max_nest()} 层）") }
+}
+
+fn too_deep(line: int, col: int) {
+    fail(line, col, "表达式太深（语法树最多 #{max_depth()} 层）：请把长的运算链拆成几个变量")
+}
+
+// 语法树超过 left 层时报错；最多递归 left 层，本身不会栈溢出
+fn depth_expr(e: Expr, left: int) {
+    if left <= 0 { too_deep(e.line, e.col) }
+    n = left - 1
+    match e.kind {
+        EInterp(ps) => depth_list(ps, n)
+        EList(ps) => depth_list(ps, n)
+        ETuple(ps) => depth_list(ps, n)
+        EField(b, _) => depth_expr(b, n)
+        EUnary(_, a) => depth_expr(a, n)
+        EIndex(a, b) => {
+            depth_expr(a, n)
+            depth_expr(b, n)
+        }
+        EBinary(_, a, b) => {
+            depth_expr(a, n)
+            depth_expr(b, n)
+        }
+        ECall(_, args, _) => {
+            for a in args { depth_expr(a.value, n) }
+        }
+        EIf(cond, thn, els) => {
+            depth_expr(cond, n)
+            depth_block(thn, n, e.line, e.col)
+            match els {
+                Some(eb) => depth_block(eb, n, e.line, e.col)
+                None => {}
+            }
+        }
+        EMatch(_, scrut, arms) => {
+            depth_expr(scrut, n)
+            for a in arms { depth_expr(a.body, n) }
+        }
+        EBlock(b) => depth_block(b, n, e.line, e.col)
+        EScope(b) => depth_block(b, n, e.line, e.col)
+        ELock(mx, _, _, b) => {
+            depth_expr(mx, n)
+            depth_block(b, n, e.line, e.col)
+        }
+        ESelect(arms) => {
+            for a in arms {
+                depth_expr(a.body, n)
+                match a.src {
+                    Some(x) => depth_expr(x, n)
+                    None => {}
+                }
+            }
+        }
+        EReturn(val) => {
+            match val {
+                Some(x) => depth_expr(x, n)
+                None => {}
+            }
+        }
+        EClosure(_, body) => depth_expr(body, n)
+        _ => {}
+    }
+}
+
+fn depth_list(es: [Expr], left: int) {
+    for e in es { depth_expr(e, left) }
+}
+
+fn depth_block(b: Block, left: int, line: int, col: int) {
+    if left <= 0 { too_deep(line, col) }
+    n = left - 1
+    for s in b.stmts {
+        match s.kind {
+            SExpr(e) => depth_expr(e, n)
+            SAssign(t, _, r) => {
+                depth_expr(t, n)
+                depth_expr(r, n)
+            }
+            SForCond(cond, body) => {
+                match cond {
+                    Some(x) => depth_expr(x, n)
+                    None => {}
+                }
+                depth_block(body, n, s.line, s.col)
+            }
+            SForRange(_, _, lo, hi, body) => {
+                depth_expr(lo, n)
+                depth_expr(hi, n)
+                depth_block(body, n, s.line, s.col)
+            }
+            SDefer(body) => depth_block(body, n, s.line, s.col)
+            SLabel(_, body) => depth_block(body, n, s.line, s.col)
+            SForEach(_, _, it, body, _, _) => {
+                depth_expr(it, n)
+                depth_block(body, n, s.line, s.col)
+            }
+        }
+    }
+    match b.tail {
+        Some(x) => depth_expr(x, n)
+        None => {}
+    }
+}
+
+fn is_upper(s: str) -> bool {
+    len(s) > 0 && byte_at(s, 0) >= 'A' && byte_at(s, 0) <= 'Z'
+}
+
+// 类型以原文字符串表示，例如 "int"、"[str]"、"Expr"、"str?"；T!E 写成 "T!<E>"
+fn parse_type(inout p: P) -> str {
+    base = parse_base_type(&p)
+    for pk(p) == "?" || pk(p) == "!" {
+        k = pk(p)
+        advance(&p)
+        if k == "!" && pk(p) == "ident" {
+            // T!E：错误类型紧跟在 ! 后面
+            et = parse_base_type(&p)
+            base = base + "!<" + et + ">"
+        } else {
+            base = base + k
+        }
+    }
+    base
+}
+
+fn parse_base_type(inout p: P) -> str {
+    if pk(p) == "ident" && ptext(p) == "shared" {
+        // shared T：只作用在紧跟着的基础类型上，所以 shared Node? 是“可能没有的共享节点”。原文写成 @T
+        advance(&p)
+        inner = parse_base_type(&p)
+        return "@" + inner
+    }
+    // dyn I：实现了接口 I 的任意类型的值。原文写成 %I
+    if pk(p) == "ident" && ptext(p) == "dyn" && pk2(p) == "ident" {
+        advance(&p)
+        return "%" + ident(&p)
+    }
+    // 存储的闭包 Fn(int) -> bool：写法同 fn，原文写成 Fn(int)->bool
+    stored = pk(p) == "ident" && ptext(p) == "Fn" && pk2(p) == "("
+    if stored || pk(p) == "fn" {
+        advance(&p)
+        // 函数类型 fn(int, str) -> bool，原文统一写成 fn(int,str)->bool
+        expect(&p, "(")
+        fps: [str] = []
+        for pk(p) != ")" {
+            a = parse_type(&p)
+            fps.push(a)
+            if pk(p) != ")" { expect(&p, ",") }
+        }
+        expect(&p, ")")
+        r = "()"
+        if accept(&p, "->") { r = parse_type(&p) }
+        head = if stored { "Fn(" } else { "fn(" }
+        return head + join(fps, ",") + ")->" + r
+    }
+    if accept(&p, "[") {
+        t = parse_type(&p)
+        expect(&p, "]")
+        "[" + t + "]"
+    } else if accept(&p, "(") {
+        // () 是单元类型；(A, B) 是元组，原文写成 (A,B)；(A) 就是 A
+        if accept(&p, ")") { return "()" }
+        tts: [str] = []
+        for pk(p) != ")" {
+            a = parse_type(&p)
+            tts.push(a)
+            if pk(p) != ")" { expect(&p, ",") }
+        }
+        expect(&p, ")")
+        if len(tts) == 1 { tts[0].copy() } else { "(" + join(tts, ",") + ")" }
+    } else {
+        // 泛型类型 Name[A, B]，原文统一写成 Name[A,B]
+        n = qual_ident(&p)
+        if accept(&p, "[") {
+            targs: [str] = []
+            for pk(p) != "]" {
+                a = parse_type(&p)
+                targs.push(a)
+                if pk(p) != "]" { expect(&p, ",") }
+            }
+            expect(&p, "]")
+            if len(targs) == 0 { perr(p, "类型实参不能为空") }
+            n = n + "[" + join(targs, ",") + "]"
+        }
+        n
+    }
+}
+
+// ---------- 表达式 ----------
+
+fn parse_expr(inout p: P) -> Expr { parse_coalesce(&p) }
+
+// a ?? b：优先级最低，右结合
+fn parse_coalesce(inout p: P) -> Expr {
+    lhs = parse_or(&p)
+    if pk(p) == "??" {
+        line = pline(p)
+        col = pcol(p)
+        advance(&p)
+        rhs = parse_coalesce(&p)
+        mk(&p, line, col, EBinary("??", lhs, rhs))
+    } else {
+        lhs
+    }
+}
+
+fn parse_or(inout p: P) -> Expr {
+    lhs = parse_and(&p)
+    for pk(p) == "||" {
+        line = pline(p)
+        col = pcol(p)
+        advance(&p)
+        rhs = parse_and(&p)
+        lhs = mk(&p, line, col, EBinary("||", lhs, rhs))
+    }
+    lhs
+}
+
+fn parse_and(inout p: P) -> Expr {
+    lhs = parse_cmp(&p)
+    for pk(p) == "&&" {
+        line = pline(p)
+        col = pcol(p)
+        advance(&p)
+        rhs = parse_cmp(&p)
+        lhs = mk(&p, line, col, EBinary("&&", lhs, rhs))
+    }
+    lhs
+}
+
+fn is_cmp(k: str) -> bool {
+    k == "==" || k == "!=" || k == "<" || k == "<=" || k == ">" || k == ">="
+}
+
+fn parse_cmp(inout p: P) -> Expr {
+    lhs = parse_bitor(&p)
+    if is_cmp(pk(p)) {
+        line = pline(p)
+        col = pcol(p)
+        op = pk(p)
+        advance(&p)
+        rhs = parse_bitor(&p)
+        if is_cmp(pk(p)) { perr(p, "比较运算不能连写，请加括号") }
+        mk(&p, line, col, EBinary(op, lhs, rhs))
+    } else {
+        lhs
+    }
+}
+
+// 位运算的优先级同 Rust：比较 < | < ^ < & < 移位 < + - < * / %，所以 x & 1 == 0 是 (x & 1) == 0
+fn parse_bitor(inout p: P) -> Expr {
+    lhs = parse_bitxor(&p)
+    for pk(p) == "|" {
+        line = pline(p)
+        col = pcol(p)
+        advance(&p)
+        rhs = parse_bitxor(&p)
+        lhs = mk(&p, line, col, EBinary("|", lhs, rhs))
+    }
+    lhs
+}
+
+fn parse_bitxor(inout p: P) -> Expr {
+    lhs = parse_bitand(&p)
+    for pk(p) == "^" {
+        line = pline(p)
+        col = pcol(p)
+        advance(&p)
+        rhs = parse_bitand(&p)
+        lhs = mk(&p, line, col, EBinary("^", lhs, rhs))
+    }
+    lhs
+}
+
+fn parse_bitand(inout p: P) -> Expr {
+    lhs = parse_shift(&p)
+    for pk(p) == "&" {
+        line = pline(p)
+        col = pcol(p)
+        advance(&p)
+        rhs = parse_shift(&p)
+        lhs = mk(&p, line, col, EBinary("&", lhs, rhs))
+    }
+    lhs
+}
+
+fn parse_shift(inout p: P) -> Expr {
+    lhs = parse_add(&p)
+    for pk(p) == "<<" || pk(p) == ">>" || pk(p) == ">>>" {
+        line = pline(p)
+        col = pcol(p)
+        op = pk(p)
+        advance(&p)
+        rhs = parse_add(&p)
+        lhs = mk(&p, line, col, EBinary(op, lhs, rhs))
+    }
+    lhs
+}
+
+fn parse_add(inout p: P) -> Expr {
+    lhs = parse_mul(&p)
+    for pk(p) == "+" || pk(p) == "-" || pk(p) == "+%" || pk(p) == "-%" {
+        line = pline(p)
+        col = pcol(p)
+        op = pk(p)
+        advance(&p)
+        rhs = parse_mul(&p)
+        lhs = mk(&p, line, col, EBinary(op, lhs, rhs))
+    }
+    lhs
+}
+
+fn parse_mul(inout p: P) -> Expr {
+    lhs = parse_unary(&p)
+    for pk(p) == "*" || pk(p) == "/" || pk(p) == "%" || pk(p) == "*%" {
+        line = pline(p)
+        col = pcol(p)
+        op = pk(p)
+        advance(&p)
+        rhs = parse_unary(&p)
+        lhs = mk(&p, line, col, EBinary(op, lhs, rhs))
+    }
+    lhs
+}
+
+fn parse_unary(inout p: P) -> Expr {
+    enter(&p)
+    e = parse_unary_(&p)
+    p.nest -= 1
+    e
+}
+
+fn parse_unary_(inout p: P) -> Expr {
+    line = pline(p)
+    col = pcol(p)
+    if accept(&p, "-") {
+        a = parse_unary(&p)
+        mk(&p, line, col, EUnary("-", a))
+    } else if accept(&p, "!") {
+        a = parse_unary(&p)
+        mk(&p, line, col, EUnary("!", a))
+    } else {
+        parse_postfix(&p)
+    }
+}
+
+fn parse_args_into(inout p: P, inout args: [Arg]) {
+    expect(&p, "(")
+    for pk(p) != ")" {
+        label = ""
+        if pk(p) == "ident" && pk2(p) == ":" {
+            label = ptext(p)
+            advance(&p)
+            advance(&p)
+        }
+        amp = accept(&p, "&")
+        value = parse_expr(&p)
+        args.push(Arg(label: label, amp: amp, value: value))
+        if pk(p) != ")" { expect(&p, ",") }
+    }
+    expect(&p, ")")
+}
+
+fn parse_postfix(inout p: P) -> Expr {
+    e = parse_primary(&p)
+    for {
+        line = pline(p)
+        col = pcol(p)
+        if pk(p) == "." {
+            advance(&p)
+            // t.0、t.1：元组的元素
+            name = if pk(p) == "int" { int_str(p.toks[p.k].num) } else { "" }
+            if name != "" { advance(&p) } else { name = ident(&p) }
+            if pk(p) == "(" {
+                args: [Arg] = []
+                args.push(Arg(label: "", amp: false, value: e))
+                parse_args_into(&p, &args)
+                e = mk(&p, line, col, ECall(name, args, true))
+            } else {
+                e = mk(&p, line, col, EField(e, name))
+            }
+        } else if pk(p) == "[" {
+            advance(&p)
+            idx = parse_expr(&p)
+            expect(&p, "]")
+            e = mk(&p, line, col, EIndex(e, idx))
+        } else if pk(p) == "?" {
+            // e?：出错（或为 None）时直接从当前函数返回
+            advance(&p)
+            e = mk(&p, line, col, EUnary("?", e))
+        } else {
+            break
+        }
+    }
+    e
+}
+
+fn parse_interp(inout p: P, line: int, col: int) -> Expr {
+    expect(&p, "istart")
+    parts: [Expr] = []
+    for pk(p) != "iend" {
+        if pk(p) == "ipart" {
+            s = ptext(p)
+            pl = pline(p)
+            pc = pcol(p)
+            advance(&p)
+            parts.push(mk(&p, pl, pc, EStr(s)))
+        } else if accept(&p, "icode") {
+            parts.push(parse_expr(&p))
+            expect(&p, "icodeend")
+        } else {
+            perr(p, "插值里只能写一个表达式")
+        }
+    }
+    expect(&p, "iend")
+    mk(&p, line, col, EInterp(parts))
+}
+
+fn parse_primary(inout p: P) -> Expr {
+    line = pline(p)
+    col = pcol(p)
+    k = pk(p)
+    if k == "|" || k == "||" {
+        // 闭包 |x, y| body；|| body 是没有参数的闭包
+        advance(&p)
+        ps: [Param] = []
+        if k == "|" {
+            for pk(p) != "|" {
+                pl = pline(p)
+                pc = pcol(p)
+                pn = ident(&p)
+                pid = new_id(&p)
+                ps.push(Param(name: pn, mode: "read", ty: "", id: pid, line: pl, col: pc))
+                if pk(p) != "|" { expect(&p, ",") }
+            }
+            expect(&p, "|")
+        }
+        body = parse_expr(&p)
+        mk(&p, line, col, EClosure(ps, body))
+    } else if k == "int" {
+        n = p.toks[p.k].num
+        advance(&p)
+        mk(&p, line, col, EInt(n))
+    } else if k == "float" {
+        s = ptext(p)
+        advance(&p)
+        mk(&p, line, col, EFloat(s))
+    } else if k == "str" {
+        s = ptext(p)
+        advance(&p)
+        mk(&p, line, col, EStr(s))
+    } else if k == "istart" {
+        parse_interp(&p, line, col)
+    } else if k == "true" || k == "false" {
+        advance(&p)
+        mk(&p, line, col, EBool(k == "true"))
+    } else if k == "ident" && ptext(p) == "lock" && pk2(p) == "ident" {
+        // lock 不是关键字：只有后面紧跟一个名字时才是 lock m as c { … }（lock 当变量名的代码不受影响）
+        advance(&p)
+        m = parse_expr(&p)
+        if pk(p) != "ident" || ptext(p) != "as" { perr(p, "lock 的写法是 lock 互斥量 as 名字 { … }") }
+        advance(&p)
+        name = ident(&p)
+        id = new_id(&p)
+        if pk(p) != "{" { perr(p, "lock … as #{name} 后面需要 { … }") }
+        lb = parse_block(&p)
+        mk(&p, line, col, ELock(m, name, id, lb))
+    } else if k == "ident" {
+        name = qual_ident(&p)
+        if pk(p) == "(" {
+            args: [Arg] = []
+            parse_args_into(&p, &args)
+            mk(&p, line, col, ECall(name, args, false))
+        } else if is_upper(last_part(name)) {
+            // 大写开头、不带括号：无字段的变体或结构体
+            mk(&p, line, col, ECall(name, [], false))
+        } else {
+            mk(&p, line, col, EVar(name))
+        }
+    } else if k == "(" {
+        advance(&p)
+        e = parse_expr(&p)
+        if pk(p) == "," {
+            // 元组 (a, b, …)
+            items: [Expr] = [e]
+            for pk(p) == "," {
+                advance(&p)
+                if pk(p) == ")" { break }
+                items.push(parse_expr(&p))
+            }
+            expect(&p, ")")
+            return mk(&p, line, col, ETuple(items))
+        }
+        expect(&p, ")")
+        e
+    } else if k == "[" {
+        advance(&p)
+        items: [Expr] = []
+        for pk(p) != "]" {
+            items.push(parse_expr(&p))
+            if pk(p) != "]" { expect(&p, ",") }
+        }
+        expect(&p, "]")
+        mk(&p, line, col, EList(items))
+    } else if k == "{" {
+        b = parse_block(&p)
+        mk(&p, line, col, EBlock(b))
+    } else if k == "scope" {
+        advance(&p)
+        if pk(p) != "{" { perr(p, "scope 后面需要 { … }") }
+        sb = parse_block(&p)
+        mk(&p, line, col, EScope(sb))
+    } else if k == "if" {
+        parse_if(&p)
+    } else if k == "select" {
+        parse_select(&p)
+    } else if k == "match" {
+        parse_match(&p)
+    } else if k == "return" {
+        advance(&p)
+        val: Expr? = None
+        n = pk(p)
+        if n != "nl" && n != ";" && n != "}" && n != "," && n != ")" {
+            val = parse_expr(&p)
+        }
+        mk(&p, line, col, EReturn(val))
+    } else if k == "break" {
+        advance(&p)
+        mk(&p, line, col, EBreak(jump_label(&p)))
+    } else if k == "continue" {
+        advance(&p)
+        mk(&p, line, col, EContinue(jump_label(&p)))
+    } else {
+        perr(p, "这里需要表达式，实际是 #{show_tok(p)}")
+        exit(1)
+    }
+}
+
+// break / continue 后面同一行的名字是循环的标签
+fn jump_label(inout p: P) -> str {
+    if pk(p) == "ident" { ident(&p) } else { "" }
+}
+
+fn parse_if(inout p: P) -> Expr {
+    line = pline(p)
+    col = pcol(p)
+    expect(&p, "if")
+    cond = parse_expr(&p)
+    thn = parse_block(&p)
+    els: Block? = None
+    if accept(&p, "else") {
+        if pk(p) == "if" {
+            p.elifs += 1
+            if p.elifs > max_depth() / 2 { perr(p, "else if 连得太多（最多 #{max_depth() / 2} 个）：请改用 match") }
+            inner = parse_if(&p)
+            p.elifs -= 1
+            els = Block(stmts: [], tail: inner)
+        } else {
+            els = parse_block(&p)
+        }
+    }
+    mk(&p, line, col, EIf(cond, thn, els))
+}
+
+// 模式，可以是“或”模式 A | B | …（每个选项本身不是“或”模式；Some(1 | 2) 这样嵌在字段里可以）
+fn parse_pattern(inout p: P) -> Pat {
+    first = parse_pat1(&p)
+    if pk(p) != "|" { return first }
+    alts: [Pat] = [first]
+    for accept(&p, "|") {
+        alt = parse_pat1(&p)
+        alts.push(alt)
+    }
+    POr(alts)
+}
+
+fn parse_pat1(inout p: P) -> Pat {
+    if pk(p) == "ident" && pk2(p) == ":" {
+        // 类型模式 名字: 类型（只用于 dyn 值）
+        nm = ptext(p)
+        advance(&p)
+        advance(&p)
+        ty = parse_type(&p)
+        return PType(nm, new_id(&p), ty)
+    }
+    k = pk(p)
+    if k == "ident" {
+        name = qual_ident(&p)
+        if name == "_" {
+            PWild
+        } else if is_upper(last_part(name)) {
+            fields: [Pat] = []
+            if accept(&p, "(") {
+                for pk(p) != ")" {
+                    sub = parse_pattern(&p)
+                    fields.push(sub)
+                    if pk(p) != ")" { expect(&p, ",") }
+                }
+                expect(&p, ")")
+            }
+            // 模式里的模块限定可写可不写：变体总是按被匹配值的类型找
+            PVariant(last_part(name), fields)
+        } else {
+            PBind(name, new_id(&p))
+        }
+    } else if k == "(" {
+        advance(&p)
+        items: [Pat] = []
+        for pk(p) != ")" {
+            sub = parse_pattern(&p)
+            items.push(sub)
+            if pk(p) != ")" { expect(&p, ",") }
+        }
+        expect(&p, ")")
+        if len(items) < 2 { perr(p, "元组模式至少要有两个元素") }
+        PTuple(items)
+    } else if k == "str" {
+        s = ptext(p)
+        advance(&p)
+        PStr(s)
+    } else if k == "int" {
+        n = p.toks[p.k].num
+        advance(&p)
+        PInt(n)
+    } else if k == "-" {
+        advance(&p)
+        if pk(p) != "int" { perr(p, "期望整数") }
+        n = p.toks[p.k].num
+        advance(&p)
+        PInt(-n)
+    } else if k == "true" || k == "false" {
+        advance(&p)
+        PBool(k == "true")
+    } else {
+        perr(p, "无法识别的模式 #{show_tok(p)}")
+        exit(1)
+    }
+}
+
+fn parse_match(inout p: P) -> Expr {
+    line = pline(p)
+    col = pcol(p)
+    expect(&p, "match")
+    owning = accept(&p, "take")
+    scrut = parse_expr(&p)
+    expect(&p, "{")
+    skip_seps(&p)
+    arms: [Arm] = []
+    for pk(p) != "}" {
+        al = pline(p)
+        ac = pcol(p)
+        pat = parse_pattern(&p)
+        expect(&p, "=>")
+        body = parse_expr(&p)
+        arms.push(Arm(pat: pat, line: al, col: ac, body: body))
+        if pk(p) != "}" {
+            sep = pk(p)
+            if sep == "nl" || sep == ";" || sep == "," {
+                skip_seps(&p)
+            } else {
+                perr(p, "分支之间需要换行或逗号，实际是 #{show_tok(p)}")
+            }
+        }
+    }
+    expect(&p, "}")
+    mk(&p, line, col, EMatch(owning, scrut, arms))
+}
+
+// ---------- 语句与块 ----------
+
+fn is_var(e: Expr) -> bool {
+    match e.kind {
+        EVar(_) => true
+        _ => false
+    }
+}
+
+fn parse_stmt(inout p: P) -> Stmt {
+    line = pline(p)
+    col = pcol(p)
+    id = new_id(&p)
+    // defer { … }：defer 不是关键字，后面跟着 { 时才算（和 lock 一样，叫 defer 的变量照常能用）
+    if pk(p) == "ident" && ptext(p) == "defer" && pk2(p) == "{" {
+        advance(&p)
+        body = parse_block(&p)
+        return Stmt(id: id, line: line, col: col, kind: SDefer(body))
+    }
+    if pk(p) == "for" {
+        return parse_for(&p, id, line, col)
+    }
+    // outer: for …：带标签的循环，里面可以 break outer、continue outer
+    if pk(p) == "ident" && pk2(p) == ":" && p.k + 2 < len(p.toks) && p.toks[p.k + 2].kind == "for" {
+        name = ident(&p)
+        expect(&p, ":")
+        lid = new_id(&p)
+        lp = parse_for(&p, lid, pline(p), pcol(p))
+        return Stmt(id: id, line: line, col: col, kind: SLabel(name, Block(stmts: [lp], tail: None)))
+    }
+    // 别的语言的写法：给出 Lark 的写法，而不是“语句之后需要换行”
+    if pk(p) == "ident" && ptext(p) == "while" && pk2(p) != "=" && pk2(p) != ":" && pk2(p) != "." && pk2(p) != "nl" && pk2(p) != "[" && !is_compound(pk2(p)) {
+        perr(p, "Lark 没有 while：条件循环写 for 条件 { … }，死循环写 for { … }")
+    }
+    if pk(p) == "ident" && ptext(p) == "loop" && pk2(p) == "{" {
+        perr(p, "Lark 没有 loop：死循环写 for { … }")
+    }
+    e = parse_expr(&p)
+    if pk(p) == "," && is_var(e) {
+        // 解构：a, b = 元组。目标记成 ETuple
+        targets: [Expr] = [e]
+        for accept(&p, ",") {
+            targets.push(parse_postfix(&p))
+        }
+        expect(&p, "=")
+        trhs = parse_expr(&p)
+        tgt = mk(&p, line, col, ETuple(targets))
+        return Stmt(id: id, line: line, col: col, kind: SAssign(tgt, "", trhs))
+    }
+    k = pk(p)
+    if k == ":" && is_var(e) {
+        advance(&p)
+        t = parse_type(&p)
+        expect(&p, "=")
+        rhs = parse_expr(&p)
+        Stmt(id: id, line: line, col: col, kind: SAssign(e, t, rhs))
+    } else if k == "=" {
+        advance(&p)
+        rhs = parse_expr(&p)
+        Stmt(id: id, line: line, col: col, kind: SAssign(e, "", rhs))
+    } else if is_compound(k) {
+        advance(&p)
+        rhs = parse_expr(&p)
+        // 目标同时作为左操作数；副本与原节点 id 相同，旁表里的结果也相同
+        lhs = e.copy()
+        bin = mk(&p, line, col, EBinary(slice(k, 0, len(k) - 1), lhs, rhs))
+        Stmt(id: id, line: line, col: col, kind: SAssign(e, "", bin))
+    } else {
+        Stmt(id: id, line: line, col: col, kind: SExpr(e))
+    }
+}
+
+fn parse_for(inout p: P, id: int, line: int, col: int) -> Stmt {
+    expect(&p, "for")
+    if pk(p) == "{" {
+        body = parse_block(&p)
+        Stmt(id: id, line: line, col: col, kind: SForCond(None, body))
+    } else if is_for_each(p) {
+        // for x in …、for i, x in …（i 是从 0 开始的序号）、for (a, b) in …、for i, (a, b) in …
+        iname = ""
+        if pk(p) == "ident" && pk2(p) == "," {
+            iname = ident(&p)
+            expect(&p, ",")
+        }
+        tuple_pat = pk(p) == "("
+        pl = pline(p)
+        pc = pcol(p)
+        pat = if tuple_pat { parse_for_tuple(&p) } else { PWild }
+        name = if tuple_pat { "_e" + int_str(new_id(&p)) } else { ident(&p) }
+        expect(&p, "in")
+        a = parse_expr(&p)
+        if pk(p) == ".." && (iname != "" || tuple_pat) {
+            perr(p, "带序号或元组模式的 for 只能用于列表和迭代器；整数范围请写 for i in lo..hi")
+        }
+        if accept(&p, "..") {
+            b = parse_expr(&p)
+            body = parse_block(&p)
+            vid = new_id(&p)
+            Stmt(id: id, line: line, col: col, kind: SForRange(name, vid, a, b, body))
+        } else {
+            body0 = parse_block(&p)
+            body = if tuple_pat { destructure_body(&p, pat, name, pl, pc, body0) } else { body0 }
+            iid = if iname != "" { new_id(&p) } else { -1 }
+            vid = new_id(&p)
+            Stmt(id: id, line: line, col: col, kind: SForEach(name, vid, a, body, iname, iid))
+        }
+    } else {
+        c = parse_expr(&p)
+        body = parse_block(&p)
+        Stmt(id: id, line: line, col: col, kind: SForCond(c, body))
+    }
+}
+
+fn pk3(p: P) -> str {
+    if p.k + 2 < len(p.toks) { p.toks[p.k + 2].kind } else { "eof" }
+}
+
+// for 后面是循环变量而不是条件：x in、i, …、(a, …
+fn is_for_each(p: P) -> bool {
+    (pk(p) == "ident" && (pk2(p) == "in" || pk2(p) == ",")) || (pk(p) == "(" && pk2(p) == "ident" && pk3(p) == ",")
+}
+
+// for 里的元组模式 (a, b, …)：每一项是名字或 _
+fn parse_for_tuple(inout p: P) -> Pat {
+    expect(&p, "(")
+    items: [Pat] = []
+    for pk(p) != ")" {
+        nm = ident(&p)
+        if nm == "_" {
+            items.push(PWild)
+        } else {
+            bid = new_id(&p)
+            items.push(PBind(nm, bid))
+        }
+        if pk(p) != ")" { expect(&p, ",") }
+    }
+    expect(&p, ")")
+    PTuple(items)
+}
+
+// for (a, b) in xs { … } 相当于 for _e in xs { match _e { (a, b) => { … } } }：元素绑定到隐藏的变量，
+// 循环体是一个借用的 match，所以拆出来的名字和 for x in xs 的 x 一样是只读的，指向元素内部，不复制
+fn destructure_body(inout p: P, take pat: Pat, hidden: str, line: int, col: int, take body: Block) -> Block {
+    scrut = mk(&p, line, col, EVar(hidden))
+    inner = mk(&p, line, col, EBlock(body))
+    arms: [Arm] = [Arm(pat: pat, line: line, col: col, body: inner)]
+    m = mk(&p, line, col, EMatch(false, scrut, arms))
+    sid = new_id(&p)
+    Block(stmts: [Stmt(id: sid, line: line, col: col, kind: SExpr(m))], tail: None)
+}
+
+fn dummy_stmt_kind() -> StmtKind {
+    SForCond(None, Block(stmts: [], tail: None))
+}
+
+fn parse_block(inout p: P) -> Block {
+    enter(&p)
+    b = parse_block_(&p)
+    p.nest -= 1
+    b
+}
+
+fn parse_block_(inout p: P) -> Block {
+    expect(&p, "{")
+    skip_nl(&p)
+    stmts: [Stmt] = []
+    for pk(p) != "}" {
+        stmts.push(parse_stmt(&p))
+        k = pk(p)
+        if k == "nl" || k == ";" {
+            for pk(p) == "nl" || pk(p) == ";" { advance(&p) }
+        } else if k != "}" {
+            perr(p, "语句之后需要换行，实际是 #{show_tok(p)}")
+        }
+    }
+    expect(&p, "}")
+    // 最后一条若是表达式语句，就作为块的值
+    tail: Expr? = None
+    n = len(stmts)
+    if n > 0 && is_expr_stmt(stmts[n - 1]) {
+        last = stmts.pop()
+        kind = replace(&last.kind, dummy_stmt_kind())
+        match take kind {
+            SExpr(e) => {
+                tail = e
+            }
+            _ => {}
+        }
+    }
+    Block(stmts: stmts, tail: tail)
+}
+
+fn is_expr_stmt(s: Stmt) -> bool {
+    match s.kind {
+        SExpr(_) => true
+        _ => false
+    }
+}
+
+// ---------- 顶层 ----------
+
+fn parse_fields(inout p: P) -> [FieldDecl] {
+    expect(&p, "{")
+    skip_seps(&p)
+    fs: [FieldDecl] = []
+    for pk(p) != "}" {
+        fp = accept(&p, "pub")
+        n = ident(&p)
+        expect(&p, ":")
+        t = parse_type(&p)
+        fs.push(FieldDecl(name: n, ty: t, is_pub: fp))
+        skip_seps(&p)
+    }
+    expect(&p, "}")
+    fs
+}
+
+fn parse_variant_fields(inout p: P) -> [FieldDecl] {
+    fs: [FieldDecl] = []
+    if accept(&p, "(") {
+        i = 0
+        for pk(p) != ")" {
+            name = "_#{i}"
+            if pk(p) == "ident" && pk2(p) == ":" {
+                name = ident(&p)
+                advance(&p)
+            }
+            t = parse_type(&p)
+            fs.push(FieldDecl(name: name, ty: t, is_pub: true))
+            i += 1
+            if pk(p) != ")" { expect(&p, ",") }
+        }
+        expect(&p, ")")
+    }
+    fs
+}
+
+// 从 "fn" 开始解析一个函数。泛型函数实例化时会从同一个 token 位置再解析一遍，得到一份节点 id 全新的函数体
+// [T, U: Show + Eq]：约束写进 bounds（与类型参数一一对应，没有约束时为 ""）
+fn parse_tparams(inout p: P, inout bounds: [str]) -> [str] {
+    tps: [str] = []
+    if accept(&p, "[") {
+        for pk(p) != "]" {
+            tn = ident(&p)
+            tps.push(tn)
+            b = ""
+            if accept(&p, ":") {
+                b = parse_bound(&p)
+                for accept(&p, "+") {
+                    nb = parse_bound(&p)
+                    b = b + "+" + nb
+                }
+            }
+            bounds.push(b)
+            if pk(p) != "]" { expect(&p, ",") }
+        }
+        expect(&p, "]")
+        if len(tps) == 0 { perr(p, "类型参数列表不能为空") }
+    }
+    tps
+}
+
+// 一个约束：接口名，或者 Iter[T]（元素是 T 的列表或迭代器）
+fn parse_bound(inout p: P) -> str {
+    b = ident(&p)
+    if accept(&p, "[") {
+        a = ident(&p)
+        expect(&p, "]")
+        b = b + "[" + a + "]"
+    }
+    b
+}
+
+fn no_bounds(p: P, bounds: [str]) {
+    for b in bounds {
+        if b != "" { perr(p, "泛型类型的类型参数暂不支持约束，请把约束写在函数上") }
+    }
+}
+
+fn parse_params(inout p: P) -> [Param] {
+    expect(&p, "(")
+    ps: [Param] = []
+    for pk(p) != ")" {
+        pl = pline(p)
+        pc = pcol(p)
+        mode = "read"
+        if accept(&p, "inout") {
+            mode = "inout"
+        } else if accept(&p, "take") {
+            mode = "take"
+        }
+        pn = ident(&p)
+        expect(&p, ":")
+        pt = parse_type(&p)
+        pid = new_id(&p)
+        ps.push(Param(name: pn, mode: mode, ty: pt, id: pid, line: pl, col: pc))
+        if pk(p) != ")" { expect(&p, ",") }
+    }
+    expect(&p, ")")
+    ps
+}
+
+fn parse_fn(inout p: P) -> FnDecl {
+    tok = p.k
+    line = pline(p)
+    col = pcol(p)
+    expect(&p, "fn")
+    name = ident(&p)
+    bs: [str] = []
+    tps = parse_tparams(&p, &bs)
+    ps = parse_params(&p)
+    ret = "()"
+    if accept(&p, "->") { ret = parse_type(&p) }
+    body = parse_block(&p)
+    depth_block(body, max_depth(), line, col)
+    FnDecl(name: name, tparams: tps, tbounds: bs, tok: tok, params: ps, ret: ret, body: body, line: line, col: col, ext: false)
+}
+
+// extern "c" 块里的一个声明：fn 名字(参数) -> 返回类型，没有函数体
+fn parse_ext_fn(inout p: P) -> FnDecl {
+    tok = p.k
+    line = pline(p)
+    col = pcol(p)
+    expect(&p, "fn")
+    name = ident(&p)
+    ps = parse_params(&p)
+    ret = "()"
+    if accept(&p, "->") { ret = parse_type(&p) }
+    if pk(p) == "{" { perr(p, "extern \"c\" 里的函数只写签名，不能有函数体") }
+    FnDecl(name: name, tparams: [], tbounds: [], tok: tok, params: ps, ret: ret, body: Block(stmts: [], tail: None), line: line, col: col, ext: true)
+}
+
+fn parse_iface(inout p: P) -> IfaceDecl {
+    line = pline(p)
+    col = pcol(p)
+    expect(&p, "interface")
+    name = ident(&p)
+    expect(&p, "{")
+    skip_seps(&p)
+    ms: [IfaceMethod] = []
+    for pk(p) != "}" {
+        expect(&p, "fn")
+        mn = ident(&p)
+        ps = parse_params(&p)
+        ret = "()"
+        if accept(&p, "->") { ret = parse_type(&p) }
+        ms.push(IfaceMethod(name: mn, params: ps, ret: ret))
+        skip_seps(&p)
+    }
+    expect(&p, "}")
+    IfaceDecl(name: name, methods: ms, line: line, col: col)
+}
+
+// srcs 的前 nmain 个是命令行给出的文件，其余是 import 载入的模块（载入在 main.lark 里完成）
+fn parse_files(srcs: [str], nmain: int, fmods: [str]) -> Program {
+    ts0 = tokenize_files(srcs)
+    ims = file_imports(ts0, fmods)
+    p = P(toks: ts0, k: 0, next_id: 0, mods: ims, nest: 0, elifs: 0)
+    structs: [StructDecl] = []
+    enums: [EnumDecl] = []
+    fns: [FnDecl] = []
+    ifaces: [IfaceDecl] = []
+    consts: [ConstDecl] = []
+    tests: [str] = []
+    test_fns: [str] = []
+    pubs: [int] = []
+    skip_nl(&p)
+    for pk(p) != "eof" {
+        line = pline(p)
+        col = pcol(p)
+        if pk(p) == "import" {
+            // 只记语法；载入哪些文件由 main.lark 按行首的 import 文本找出
+            if col != 1 { perr(p, "import 必须写在行首") }
+            advance(&p)
+            if pk(p) != "str" { perr(p, "import 后面需要路径字符串，例如 import \"std/map\"") }
+            advance(&p)
+            skip_nl(&p)
+            continue
+        }
+        if accept(&p, "pub") {
+            if pk(p) != "type" && pk(p) != "enum" && pk(p) != "fn" && pk(p) != "interface" && pk(p) != "const" {
+                perr(p, "pub 后面需要 fn / type / enum / interface / const")
+            }
+            pubs.push(line)
+        }
+        if accept(&p, "type") {
+            name = ident(&p)
+            sbs: [str] = []
+            tps = parse_tparams(&p, &sbs)
+            no_bounds(p, sbs)
+            fields = parse_fields(&p)
+            structs.push(StructDecl(name: name, tparams: tps, fields: fields, line: line, col: col))
+        } else if accept(&p, "enum") {
+            name = ident(&p)
+            ebs: [str] = []
+            etps = parse_tparams(&p, &ebs)
+            no_bounds(p, ebs)
+            expect(&p, "{")
+            skip_seps(&p)
+            vs: [VariantDecl] = []
+            for pk(p) != "}" {
+                if !is_upper(ptext(p)) { perr(p, "变体名必须大写开头") }
+                vn = ident(&p)
+                vfs = parse_variant_fields(&p)
+                vs.push(VariantDecl(name: vn, fields: vfs))
+                skip_seps(&p)
+            }
+            expect(&p, "}")
+            enums.push(EnumDecl(name: name, tparams: etps, variants: vs, line: line, col: col))
+        } else if pk(p) == "interface" {
+            d = parse_iface(&p)
+            ifaces.push(d)
+        } else if pk(p) == "fn" {
+            f = parse_fn(&p)
+            fns.push(f)
+        } else if pk(p) == "ident" && ptext(p) == "extern" && pk2(p) == "str" {
+            // extern "c" { fn 名字(参数) -> 返回类型 … }：要调用的 C 函数；每个声明前可以写 pub
+            advance(&p)
+            if ptext(p) != "c" { perr(p, "extern 后面只支持 \"c\"") }
+            advance(&p)
+            expect(&p, "{")
+            skip_seps(&p)
+            for pk(p) != "}" {
+                el = pline(p)
+                if accept(&p, "pub") { pubs.push(el) }
+                ef = parse_ext_fn(&p)
+                fns.push(ef)
+                skip_seps(&p)
+            }
+            expect(&p, "}")
+        } else if pk(p) == "ident" && ptext(p) == "test" && pk2(p) == "str" {
+            // test "名字" { … }：当成一个无参函数；import 的模块里的测试只检查语法，不收
+            tok = p.k
+            advance(&p)
+            tst = ptext(p).copy()
+            if line / 100000 < nmain && has(tests, tst) { perr(p, "测试 \"#{tst}\" 重名了") }
+            advance(&p)
+            body = parse_block(&p)
+            depth_block(body, max_depth(), line, col)
+            if line / 100000 < nmain {
+                fnm = "test__" + int_str(len(tests))
+                tests.push(tst)
+                test_fns.push(fnm.copy())
+                fns.push(FnDecl(name: fnm, tparams: [], tbounds: [], tok: tok, params: [], ret: "()", body: body, line: line, col: col, ext: false))
+            }
+        } else if accept(&p, "const") {
+            cn = ident(&p)
+            expect(&p, "=")
+            cv = parse_expr(&p)
+            consts.push(ConstDecl(name: cn, value: cv, line: line, col: col))
+        } else {
+            perr(p, "顶层只能是 fn / type / enum / interface / const / test / extern，实际是 #{show_tok(p)}")
+        }
+        skip_nl(&p)
+    }
+    n = p.next_id
+    ts = replace(&p.toks, [])
+    ms = replace(&p.mods, [])
+    Program(structs: structs, enums: enums, fns: fns, ifaces: ifaces, nodes: n, toks: ts, nmain: nmain, pubs: pubs, fmods: fmods.copy(), mods: ms, consts: consts,
+        tests: tests, test_fns: test_fns, paths: [], testing: false)
+}
+
+// 每个文件导入了哪些模块，记成 “模块名@文件序号”（行号里编码了文件序号，见 lex.lark 的 file_base）。
+// 只有导入了 m 的文件里，m.x 才是模块限定的名字、m 才不能用作变量名
+fn file_imports(ts: [Tok], fmods: [str]) -> [str] {
+    out: [str] = []
+    for k in 0..len(ts) - 1 {
+        if ts[k].kind == "import" && ts[k + 1].kind == "str" {
+            m = path_last(ts[k + 1].text)
+            key = mod_key(m, ts[k].line)
+            if has(fmods, m) && !has(out, key) { out.push(key) }
+        }
+    }
+    out
+}
+
+fn mod_key(name: str, line: int) -> str { "#{name}@#{line / 100000}" }
+
+// 名字，或者模块限定的名字 m.x（m 是这个文件导入的模块时）
+fn qual_ident(inout p: P) -> str {
+    n = ident(&p)
+    if pk(p) == "." && has(p.mods, mod_key(n, p.toks[p.k - 1].line)) {
+        advance(&p)
+        n = n + "." + ident(&p)
+    }
+    n
+}
+
+// 限定名的最后一段：geo.Vec2 → Vec2
+fn last_part(s: str) -> str {
+    i = len(s) - 1
+    for i >= 0 {
+        if byte_at(s, i) == '.' { return slice(s, i + 1, len(s)) }
+        i -= 1
+    }
+    s
+}
+
+// select { v <- ch => …  after 100 => …  done => … }，分支之间换行或逗号
+fn parse_select(inout p: P) -> Expr {
+    line = pline(p)
+    col = pcol(p)
+    expect(&p, "select")
+    expect(&p, "{")
+    skip_seps(&p)
+    arms: [SelArm] = []
+    for pk(p) != "}" {
+        al = pline(p)
+        ac = pcol(p)
+        if pk(p) != "ident" { perr(p, "select 的分支要写成 v <- ch => …、after 毫秒 => … 或 done => …") }
+        word = ptext(p)
+        kind = ""
+        nm = ""
+        src: Expr? = None
+        if word == "done" && pk2(p) == "=>" {
+            advance(&p)
+            kind = "done"
+        } else if word == "after" && pk2(p) != "<" {
+            advance(&p)
+            kind = "after"
+            src = Some(parse_expr(&p))
+        } else {
+            nm = ident(&p)
+            expect(&p, "<")
+            expect(&p, "-")
+            kind = "recv"
+            src = Some(parse_expr(&p))
+        }
+        id = new_id(&p)
+        expect(&p, "=>")
+        body = parse_expr(&p)
+        arms.push(SelArm(kind: kind, name: nm, id: id, src: src, body: body, line: al, col: ac))
+        if pk(p) != "}" {
+            sep = pk(p)
+            if sep == "nl" || sep == ";" || sep == "," {
+                skip_seps(&p)
+            } else {
+                perr(p, "分支之间需要换行或逗号，实际是 #{show_tok(p)}")
+            }
+        }
+    }
+    expect(&p, "}")
+    mk(&p, line, col, ESelect(arms))
+}
+
+// ---------- 单元测试（lark1 --test，见 make unit-compiler） ----------
+
+test "解析：顶层声明" {
+    src = "type P {\n    a: int\n    b: [str]\n}\n\nfn f(x: int, inout ys: [int]) -> int { x }\n\nfn g[T: Eq, U](t: T) {}\n"
+    prog = parse_files([src], 1, [""])
+    assert_eq(len(prog.structs), 1)
+    assert_eq(prog.structs[0].name, "P")
+    assert_eq(len(prog.structs[0].fields), 2)
+    assert_eq(len(prog.fns), 2)
+    assert_eq(prog.fns[0].name, "f")
+    assert_eq(prog.fns[0].ret, "int")
+    assert_eq(prog.fns[0].params[1].name, "ys")
+    assert_eq(prog.fns[0].params[1].mode, "inout")
+    assert_eq(prog.fns[0].params[1].ty, "[int]")
+    assert_eq(prog.fns[1].ret, "()")
+    assert_eq(prog.fns[1].tparams, ["T", "U"])
+    assert_eq(prog.fns[1].tbounds, ["Eq", ""])
+}
+
+test "解析：extern \"c\" 块" {
+    src = "extern \"c\" {\n    fn strlen(s: str) -> usize\n    pub fn abs(n: c_int) -> c_int\n}\n\nfn main() {}\n"
+    prog = parse_files([src], 1, [""])
+    assert_eq(len(prog.fns), 3)
+    assert(prog.fns[0].ext)
+    assert_eq(prog.fns[0].params[0].ty, "str")
+    assert_eq(prog.fns[1].ret, "c_int")
+    assert(!prog.fns[2].ext)
+    assert_eq(prog.pubs, [3])
+}
+
+test "解析：test 块只收命令行给出的文件里的" {
+    src = "fn f() {}\n\ntest \"一\" {\n    assert(true)\n}\n\ntest \"二\" {}\n"
+    prog = parse_files([src], 1, [""])
+    assert_eq(prog.tests, ["一", "二"])
+    assert_eq(prog.test_fns, ["test__0", "test__1"])
+    assert_eq(len(prog.fns), 3)
+    // 作为 import 的模块载入时（nmain 为 0）不收
+    m = parse_files([src], 0, ["m"])
+    assert_eq(len(m.tests), 0)
+    assert_eq(len(m.fns), 1)
+}
+
+test "解析：for 里的序号和元组模式" {
+    src = "fn f(xs: [(int, int)]) {\n    for i, (a, _) in xs {\n        print(\"x\")\n    }\n}\n"
+    prog = parse_files([src], 1, [""])
+    s = prog.fns[0].body.stmts[0].copy()
+    match s.kind {
+        SForEach(name, _, _, body, iname, _) => {
+            // 元素绑定到隐藏的变量；循环体换成一个借用的 match（作为语句，块没有 tail）
+            assert_eq(slice(name, 0, 2), "_e")
+            assert_eq(iname, "i")
+            assert_eq(len(body.stmts), 1)
+            is_match = match body.stmts[0].kind {
+                SExpr(_) => true
+                _ => false
+            }
+            assert(is_match)
+            no_tail = match body.tail {
+                Some(_) => false
+                None => true
+            }
+            assert(no_tail)
+        }
+        _ => assert(false)
+    }
+}

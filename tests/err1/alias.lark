@@ -1,0 +1,12 @@
+// 期望错误：b 以 inout 传入的同时，又以借用方式把 b.items 传了进去
+type Box {
+    items: [int]
+    name: str
+}
+
+fn f(inout b: Box, items: [int]) {}
+
+fn main() {
+    b = Box(items: [1], name: "x")
+    f(&b, b.items)
+}

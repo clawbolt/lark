@@ -1,0 +1,5 @@
+收到 20000 个
+Some("甲") Some("乙") None
+panic: 向已经 close 的通道 send
+  在 main（examples/chanclose.lark:56）
+[退出码 101]

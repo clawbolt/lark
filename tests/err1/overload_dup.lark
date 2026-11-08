@@ -1,0 +1,5 @@
+// 期望错误：重载要求第一个参数类型不同
+fn f(x: int) -> int { x }
+fn f(y: int) -> int { y + 1 }
+
+fn main() {}

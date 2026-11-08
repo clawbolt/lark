@@ -1,0 +1,714 @@
+// lvm 的调度器：M:N，好几个 worker、各自的队列、偷别人的、等待和唤醒、通道、select、join、sleep。
+// 先证明再写：对应 formal/Lark/VmSched.lean、VmPar.lean 和 VmFair.lean，函数和定义一一对应：
+//   Wk ↔ Wk（run 是 -1 时没有）、Sh 加上各个 Wk ↔ S（队列、blocked、done）、pick ↔ doPick、preempt ↔ doPreempt、
+//   block ↔ doBlock、finish ↔ doFinish、wake ↔ doWake、grab ↔ doStealN（一次偷别人队列前面的一半，half）、
+//   spawn_th ↔ doSpawn、cnt ↔ cnt、Ch ↔ BCh（有界通道：buf、等着发的 sendq / sendv）、
+//   select 排进几个通道 ↔ selBlock、被一个叫醒后从所有通道撤掉（deliver）↔ selWake。
+// 证明了：每一步每个线程出现的次数不变（step_cnt、stealN_cnt），所以每个线程总在正好一个地方（reach2_inv），
+// 同一个线程不会同时在两个 worker 上跑（no_double2）；别人队列不空时偷得到（steal_half_ok）；
+// 有界通道收到的总是发出的那串的开头、缓冲不超过容量（bprefix、bbound）；按编号从小到大拿锁不会死锁（no_deadlock）；
+// pick 和 preempt 只改自己那个 worker，不同 worker 上谁先谁后一样（pick_comm、preempt_comm、pick_preempt_comm）；
+// select 的线程被叫醒一次以后哪个通道里都没有它（sel_no_twice）；队列里排第 k 个的线程，
+// 这个 worker 再拿 k + 1 次线程以内一定轮到它（fair）；睡着的按到期时间排在堆里，每次只从头上拿到期了的，
+// 和把所有睡着的都看一遍一样（VmTimer 的 due_ok、due_rest、due_split）；带超时的 select 每次等发一个新编号，
+// 编号对得上才叫醒，同一次等只会被叫醒一次（wake_once、stale_ignored）。tests.lark 每走一步都检查 cnt 和通道的不变式。
+//
+// 锁：共用的状态 Sh 一把（编号 0），每个 worker 的 Wk 一把（编号 w + 1）。只按编号从小到大拿：
+// - 拿线程（pick）、时间片用完放回尾巴（preempt）只拿自己的 Wk（VmFair：只改自己那个 worker）；
+// - 偷的时候先拿编号小的 Wk、再拿编号大的，搬完一半再放开（两把一起拿着，搬的时候线程总在某个队列里）；
+// - 要调度器做事（sys）、结束、等着时拿 Sh，里面再拿某个 Wk（唤醒放进队列、把 run 清掉）；
+// - 看是不是死锁时拿 Sh，再按顺序拿每个 Wk。
+// 线程的虚拟机状态跟着线程走：在队列里时放在队列里（ths 和 ids 一一对应），在跑时在 worker 手里，
+// 等着、结束了时放在 Sh 的 ts[x].th。
+//
+// 和模型不一样的地方：
+// - blocked 里删一个用"和最后一个换位置再删掉"（顺序不要紧，模型里是 pre ++ post），每个线程记着自己在 blocked 的哪个位置；
+// - 线程要调度器做的事不用等的话接着跑，时间片剩下的用完才抢占；
+// - 通道的容量是 -1 时不限（只有 bsend，不会满）；select 排进的通道有重复时，叫醒以后重复的也都撤掉。
+// 主线程（线程 0）结束程序就结束（别的线程还在跑也不管，像 Go 一样）。
+// 两种跑法：run_sim 在一个系统线程上轮流当每个 worker（结果每次一样，测试用）；
+// run_par 给每个 worker 开一个 Lark 的任务（spawn，运行时放到几个系统线程上），跑时间片的时候不拿任何锁（真的并行）。
+import "std/deque"
+import "std/heap"
+import "std/time"
+import "vm/core"
+import "vm/asm"
+
+pub const READY = 0
+pub const RUNNING = 1
+pub const BLOCKED = 2
+pub const DONE = 3
+
+// 调度器记着的一个线程（虚拟机的状态只在等着、结束了时放在 th 里）
+pub type T {
+    pub th: core.Th
+    pub state: int
+    pub bpos: int           // 在 blocked 的哪个位置（不在时 -1）
+    pub wait: int           // 正在等的那一次的编号（有定时器时；没有是 -1）
+    pub nid: int            // 下一次等用的编号
+    pub res: int            // 结束时的结果
+    pub joiners: [int]      // 等它结束的线程
+    pub sel: [int]          // 在等哪几个通道（select；recv 时只有一个）
+    pub multi: bool         // 是 select（叫醒时还要告诉它是第几个通道）
+    pub tsel: bool          // 是带超时的 select（超时时栈上是 0 和 -1）
+}
+
+pub type Ch {
+    pub cap: int                    // 缓冲最多几个；-1 是不限
+    pub buf: deque.Deque[int]
+    pub recvq: deque.Deque[int]     // 等着收的线程
+    pub sendq: deque.Deque[int]     // 等着发的线程（缓冲满了）
+    pub sendv: deque.Deque[int]     // 它们要发的值（和 sendq 一一对应）
+}
+
+// 一个 worker（锁 w + 1）
+pub type Wk {
+    pub run: int                        // 正在跑的线程，-1 是闲着
+    pub ids: deque.Deque[int]           // 队列
+    pub ths: deque.Deque[core.Th]       // 队列里每个线程的状态
+    pub slices: int
+    pub steals: int
+    pub stolen: int
+}
+
+// 共用的状态（锁 0）。qs 是各个 worker 的锁的引用，拿着锁 0 时往队列里放线程用
+pub type Sh {
+    pub qs: [Mutex[Wk]]
+    pub ts: [T]
+    pub blocked: [int]
+    pub done: [int]
+    pub timers: heap.Heap[Tm]   // 按到期时间排好的定时器（有的是旧的，见 VmTimer）
+    pub sleeping: int           // 有几个线程在等定时器（不算旧的）
+    pub chs: [Ch]
+    pub out: [str]
+    pub live: int
+    pub nloc: int
+    pub start: time.Instant
+    pub dead: bool
+    pub faults: int
+    pub slices: int
+    pub steals: int         // 偷了几次（最后从各个 worker 加起来）
+    pub stolen: int         // 一共偷了几个线程
+}
+
+// 复制 Sched 只是复制锁的引用：每个 worker 一份，拿到的是同一份状态
+pub type Sched {
+    pub sh: Mutex[Sh]
+    pub qs: [Mutex[Wk]]
+    pub budget: int
+}
+
+fn empty_q() -> deque.Deque[int] {
+    d: deque.Deque[int] = deque.new()
+    d
+}
+
+fn nothing() -> core.Th { core.new_th(0, 0) }
+
+fn new_t() -> T {
+    j: [int] = []
+    c: [int] = []
+    T(th: nothing(), state: READY, bpos: -1, wait: -1, nid: 0, res: 0, joiners: j, sel: c, multi: false, tsel: false)
+}
+
+fn new_wk() -> Wk {
+    t: deque.Deque[core.Th] = deque.new()
+    Wk(run: -1, ids: empty_q(), ths: t, slices: 0, steals: 0, stolen: 0)
+}
+
+fn pop_q(inout d: deque.Deque[int]) -> int {
+    match deque.pop_front(&d) {
+        Some(v) => v
+        None => -1
+    }
+}
+
+fn pop_th(inout d: deque.Deque[core.Th]) -> core.Th {
+    match take deque.pop_front(&d) {
+        Some(t) => t
+        None => nothing()
+    }
+}
+
+// 线程 x 放进 worker w 的队列尾巴；idle 时同时把 w 正在跑的清掉（x 就是它）
+fn put_q(sh: Sh, w: int, x: int, take th: core.Th, idle: bool) {
+    lock sh.qs[w] as k {
+        deque.push_back(&k.ids, x)
+        deque.push_back(&k.ths, th)
+        if idle { k.run = -1 }
+    }
+}
+
+fn set_idle(sh: Sh, w: int) {
+    lock sh.qs[w] as k { k.run = -1 }
+}
+
+// 开始：nw 个 worker，线程 0 在第 0 个的队列里（start）
+pub fn new_sched(p: asm.Prog, nw: int, budget: int) -> Sched {
+    qs: [Mutex[Wk]] = []
+    for _i in 0..nw { qs.push(mutex(new_wk())) }
+    ts: [T] = []
+    ts.push(new_t())
+    e1: [int] = []
+    e2: [int] = []
+    tm: heap.Heap[Tm] = heap.new()
+    cs: [Ch] = []
+    o: [str] = []
+    sh = Sh(qs: qs.copy(), ts: ts, blocked: e1, done: e2, timers: tm, sleeping: 0, chs: cs, out: o, live: 1, nloc: p.nloc,
+        start: time.now(), dead: false, faults: 0, slices: 0, steals: 0, stolen: 0)
+    put_q(sh, 0, 0, core.new_th(0, p.nloc), false)
+    Sched(sh: mutex(sh), qs: qs, budget: budget)
+}
+
+fn clock(sh: Sh) -> int { time.elapsed_ms(sh.start) }
+
+// ---------- 只动自己那个 worker 的步（只拿自己的锁） ----------
+
+// pick：worker 闲着，从自己的队列头上拿一个
+fn pick(inout k: Wk) -> (int, core.Th) {
+    if k.run != -1 || deque.is_empty(k.ids) { return (-1, nothing()) }
+    x = pop_q(&k.ids)
+    th = pop_th(&k.ths)
+    k.run = x
+    (x, th)
+}
+
+fn pick_in(m: Mutex[Wk]) -> (int, core.Th) {
+    lock m as k { pick(&k) }
+}
+
+// preempt：时间片用完，放回自己队列的尾巴（算一个时间片）
+pub fn preempt(s: Sched, w: int, x: int, take th: core.Th) { requeue(s, w, x, th, 1) }
+
+// n 是算几个时间片：sys 以后接着跑、正好用完时那个时间片已经在 do_sys 里算过了
+fn requeue(s: Sched, w: int, x: int, take th: core.Th, n: int) {
+    lock s.qs[w] as k {
+        deque.push_back(&k.ids, x)
+        deque.push_back(&k.ths, th)
+        k.run = -1
+        k.slices += n
+    }
+}
+
+// ---------- 偷（两把 Wk 的锁，先小后大） ----------
+
+// me 闲着、队列空了：从 from 的队列头上搬一半（向上取整）到自己的队列，再拿头上的来跑
+fn grab(inout me: Wk, inout from: Wk) -> (int, core.Th) {
+    if me.run != -1 || !deque.is_empty(me.ids) { return pick(&me) }
+    n = (deque.iter_len(from.ids) + 1) / 2
+    if n == 0 { return (-1, nothing()) }
+    for _i in 0..n {
+        deque.push_back(&me.ids, pop_q(&from.ids))
+        deque.push_back(&me.ths, pop_th(&from.ths))
+    }
+    me.steals += 1
+    me.stolen += n
+    pick(&me)
+}
+
+fn steal_from(s: Sched, w: int, v: int) -> (int, core.Th) {
+    lo = if w < v { s.qs[w].copy() } else { s.qs[v].copy() }
+    hi = if w < v { s.qs[v].copy() } else { s.qs[w].copy() }
+    lock lo as a {
+        lock hi as b {
+            if w < v { grab(&a, &b) } else { grab(&b, &a) }
+        }
+    }
+}
+
+// worker w 要跑的线程：先拿自己队列头上的，没有就从后面的 worker 开始偷；都没有时编号是 -1
+pub fn acquire(s: Sched, w: int) -> (int, core.Th) {
+    x, th = pick_in(s.qs[w].copy())
+    if x >= 0 { return (x, th) }
+    n = len(s.qs)
+    for i in 1..n {
+        y, t2 = steal_from(s, w, (w + i) % n)
+        if y >= 0 { return (y, t2) }
+    }
+    (-1, nothing())
+}
+
+// ---------- 拿着 Sh 的锁做的步 ----------
+
+// block：正在跑的 x 要等
+fn block(inout sh: Sh, w: int, x: int, take th: core.Th) {
+    sh.ts[x].th = th
+    sh.ts[x].state = BLOCKED
+    sh.ts[x].bpos = len(sh.blocked)
+    sh.blocked.push(x)
+    set_idle(sh, w)
+}
+
+// wake：等着的 x 放进 worker w 的队列尾巴（从 blocked 里拿掉：和最后一个换位置）
+pub fn wake(inout sh: Sh, w: int, x: int) {
+    i = sh.ts[x].bpos
+    last = sh.blocked[len(sh.blocked) - 1]
+    sh.blocked[i] = last
+    sh.ts[last].bpos = i
+    _p = sh.blocked.pop()
+    sh.ts[x].bpos = -1
+    sh.ts[x].state = READY
+    th = replace(&sh.ts[x].th, nothing())
+    put_q(sh, w, x, th, false)
+}
+
+// finish：正在跑的 x 结束了，等它的都叫醒（结果放在它们的栈上）
+fn finish(inout sh: Sh, w: int, x: int, res: int, take th: core.Th) {
+    sh.ts[x].th = th
+    sh.ts[x].state = DONE
+    sh.ts[x].res = res
+    sh.done.push(x)
+    sh.live -= 1
+    set_idle(sh, w)
+    js = replace(&sh.ts[x].joiners, [])
+    for j in js {
+        sh.ts[j].th.st.push(res)
+        wake(&sh, w, j)
+    }
+}
+
+// spawn_th（doSpawn；spawn 是 Lark 的关键字）：新线程放进 worker w 的队列尾巴，返回编号
+pub fn spawn_th(inout sh: Sh, w: int, pc: int, arg: int) -> int {
+    th = core.new_th(pc, sh.nloc)
+    th.st.push(arg)
+    x = len(sh.ts)
+    sh.ts.push(new_t())
+    sh.live += 1
+    put_q(sh, w, x, th, false)
+    x
+}
+
+// 线程 t 出现在几个地方（cnt）：各个 worker 的 run 和队列、blocked、done。拿着 Sh 的锁时调用，Wk 的锁一个一个地拿
+pub fn cnt(sh: Sh, t: int) -> int {
+    c = 0
+    for w in 0..len(sh.qs) {
+        k = lock sh.qs[w] as q { count_in(q, t) }
+        c += k
+    }
+    for x in sh.blocked {
+        if x == t { c += 1 }
+    }
+    for x in sh.done {
+        if x == t { c += 1 }
+    }
+    c
+}
+
+fn count_in(k: Wk, t: int) -> int {
+    c = if k.run == t { 1 } else { 0 }
+    for x in deque.to_list(k.ids) {
+        if x == t { c += 1 }
+    }
+    c
+}
+
+// 第 w 个 worker 的队列（测试用）
+pub fn queue(s: Sched, w: int) -> [int] {
+    lock s.qs[w] as k { deque.to_list(k.ids) }
+}
+
+// 第 w 个 worker 正在跑的（测试用）
+pub fn running(s: Sched, w: int) -> int {
+    lock s.qs[w] as k { k.run }
+}
+
+// ---------- 定时器（VmTimer） ----------
+
+// 一项定时器：什么时候到期、哪个线程、它等的是哪一次（编号对得上才叫醒，wwake）
+pub type Tm {
+    pub at: int
+    pub x: int
+    pub id: int
+}
+
+// 堆按到期时间排（同一时刻先等的先醒）；std/heap 在别的模块里比较，所以要 pub
+pub fn cmp(a: Tm, b: Tm) -> int {
+    if a.at != b.at { return a.at - b.at }
+    a.id - b.id
+}
+
+// 开始等，带定时器：发一个新编号（wblock），定时器放进堆里
+fn add_timer(inout sh: Sh, x: int, ms: int) {
+    id = sh.ts[x].nid
+    sh.ts[x].nid += 1
+    sh.ts[x].wait = id
+    sh.sleeping += 1
+    heap.insert(&sh.timers, Tm(at: clock(sh) + ms, x: x, id: id))
+}
+
+// 不用定时器叫醒了（通道先来了）：定时器那一项留在堆里，编号对不上了，到期时扔掉
+fn cancel_timer(inout sh: Sh, y: int) {
+    if sh.ts[y].wait == -1 { return }
+    sh.ts[y].wait = -1
+    sh.sleeping -= 1
+}
+
+// 从堆头上拿到期了的（due）叫醒到 worker w；旧的（编号对不上）扔掉。带超时的 select 超时：从所有通道撤掉，栈上是 0 和 -1
+fn timers(inout sh: Sh, w: int) {
+    if heap.is_empty(sh.timers) { return }
+    now = clock(sh)
+    for true {
+        top = match take heap.peek_min(sh.timers) {
+            Some(t) => t
+            None => { return }
+        }
+        if top.at > now { return }
+        _t = heap.pop_min(&sh.timers)
+        y = top.x
+        if sh.ts[y].wait != top.id { continue }
+        cancel_timer(&sh, y)
+        if sh.ts[y].tsel {
+            cs = replace(&sh.ts[y].sel, [])
+            for c in cs { rm_q(&sh.chs[c].recvq, y) }
+            sh.ts[y].th.st.push(0)
+            sh.ts[y].th.st.push(-1)
+            sh.ts[y].multi = false
+            sh.ts[y].tsel = false
+        }
+        wake(&sh, w, y)
+    }
+}
+
+// ---------- 通道 ----------
+
+// 栈是空的时候是 d
+fn pop_or(inout th: core.Th, d: int) -> int {
+    if len(th.st) == 0 { return d }
+    th.st.pop()
+}
+
+fn ch_ok(sh: Sh, ci: int) -> bool { ci >= 0 && ci < len(sh.chs) }
+
+// 缓冲还有没有空位
+fn has_room(c: Ch) -> bool { c.cap < 0 || deque.iter_len(c.buf) < c.cap }
+
+fn index_of(xs: [int], v: int) -> int {
+    for i in 0..len(xs) {
+        if xs[i] == v { return i }
+    }
+    -1
+}
+
+// 从队列里删掉所有的 x（rm）
+fn rm_q(inout d: deque.Deque[int], x: int) {
+    xs = deque.to_list(d)
+    deque.clear(&d)
+    for v in xs {
+        if v != x { deque.push_back(&d, v) }
+    }
+}
+
+// 等着收的 y 从通道 ci 收到 v：是 select 的话再告诉它是第几个通道，并从所有通道里撤掉（selWake）
+fn deliver(inout sh: Sh, w: int, ci: int, y: int, v: int) {
+    sh.ts[y].th.st.push(v)
+    cs = replace(&sh.ts[y].sel, [])
+    if sh.ts[y].multi {
+        sh.ts[y].th.st.push(index_of(cs, ci))
+        for c in cs { rm_q(&sh.chs[c].recvq, y) }
+    }
+    sh.ts[y].multi = false
+    sh.ts[y].tsel = false
+    cancel_timer(&sh, y)
+    wake(&sh, w, y)
+}
+
+// 从通道 ci 拿一个，有的话 (true, 值)：缓冲里有就拿走，有人等着发就把它的值补进缓冲（brecv、brefill）；
+// 缓冲是空的、有人等着发（容量是 0）就直接拿（takeW）
+fn take_from(inout sh: Sh, w: int, ci: int) -> (bool, int) {
+    if !deque.is_empty(sh.chs[ci].buf) {
+        v = pop_q(&sh.chs[ci].buf)
+        y = pop_q(&sh.chs[ci].sendq)
+        if y >= 0 {
+            u = pop_q(&sh.chs[ci].sendv)
+            deque.push_back(&sh.chs[ci].buf, u)
+            wake(&sh, w, y)
+        }
+        return (true, v)
+    }
+    y = pop_q(&sh.chs[ci].sendq)
+    if y >= 0 {
+        u = pop_q(&sh.chs[ci].sendv)
+        wake(&sh, w, y)
+        return (true, u)
+    }
+    (false, 0)
+}
+
+// ---------- 要调度器做的事 ----------
+
+// 返回 (接着跑不跑, 线程的状态)；不接着跑的时候线程已经放好了（队列里、等着、结束了）
+fn sys(inout sh: Sh, w: int, x: int, take th: core.Th, k: int, a: int) -> (bool, core.Th) {
+    if k == core.SYS_YIELD {
+        put_q(sh, w, x, th, true)
+        return (false, nothing())
+    }
+    if k == core.SYS_SPAWN {
+        arg = pop_or(&th, 0)
+        y = spawn_th(&sh, w, a, arg)
+        th.st.push(y)
+    } else if k == core.SYS_NEWCH {
+        th.st.push(len(sh.chs))
+        sh.chs.push(Ch(cap: a, buf: empty_q(), recvq: empty_q(), sendq: empty_q(), sendv: empty_q()))
+    } else if k == core.SYS_SEND {
+        if len(th.st) < 2 { return fault(&sh, w, x, th, "send 要栈上有通道和值") }
+        vv = pop_or(&th, 0)
+        ci = pop_or(&th, -1)
+        if !ch_ok(sh, ci) { return fault(&sh, w, x, th, "send 的通道不对") }
+        y = pop_q(&sh.chs[ci].recvq)
+        if y >= 0 {
+            // 有人等着收（缓冲一定是空的）：直接交给它（handoff）
+            deliver(&sh, w, ci, y, vv)
+        } else if has_room(sh.chs[ci]) {
+            deque.push_back(&sh.chs[ci].buf, vv)      // bsend
+        } else {
+            // 满了：等着（bwait），值排在 sendv 里
+            deque.push_back(&sh.chs[ci].sendq, x)
+            deque.push_back(&sh.chs[ci].sendv, vv)
+            block(&sh, w, x, th)
+            return (false, nothing())
+        }
+    } else if k == core.SYS_RECV {
+        ci = pop_or(&th, -1)
+        if !ch_ok(sh, ci) { return fault(&sh, w, x, th, "recv 要栈上有通道") }
+        ok, v = take_from(&sh, w, ci)
+        if !ok {
+            deque.push_back(&sh.chs[ci].recvq, x)
+            sh.ts[x].sel = [ci]
+            sh.ts[x].multi = false
+            block(&sh, w, x, th)
+            return (false, nothing())
+        }
+        th.st.push(v)
+    } else if k == core.SYS_SELECT || k == core.SYS_TSELECT {
+        timed = k == core.SYS_TSELECT
+        ms = if timed { pop_or(&th, 0) } else { 0 }
+        if a < 1 || len(th.st) < a { return fault(&sh, w, x, th, "select 要栈上有 #{a} 个通道") }
+        rev: [int] = []
+        for _i in 0..a { rev.push(pop_or(&th, -1)) }
+        cs: [int] = []
+        for i in 0..a { cs.push(rev[a - 1 - i]) }
+        for c in cs {
+            if !ch_ok(sh, c) { return fault(&sh, w, x, th, "select 的通道不对") }
+        }
+        // 按顺序看哪个已经有东西
+        for i in 0..a {
+            ok, v = take_from(&sh, w, cs[i])
+            if ok {
+                th.st.push(v)
+                th.st.push(i)
+                return (true, th)
+            }
+        }
+        // 都没有、超时是 0：马上返回超时
+        if timed && ms <= 0 {
+            th.st.push(0)
+            th.st.push(-1)
+            return (true, th)
+        }
+        // 排进每个通道（selBlock），带超时的再放一个定时器
+        for c in cs { deque.push_back(&sh.chs[c].recvq, x) }
+        sh.ts[x].sel = cs
+        sh.ts[x].multi = true
+        sh.ts[x].tsel = timed
+        if timed { add_timer(&sh, x, ms) }
+        block(&sh, w, x, th)
+        return (false, nothing())
+    } else if k == core.SYS_SLEEP {
+        ms = pop_or(&th, 0)
+        add_timer(&sh, x, ms)
+        block(&sh, w, x, th)
+        return (false, nothing())
+    } else if k == core.SYS_JOIN {
+        y = pop_or(&th, -1)
+        if y < 0 || y >= len(sh.ts) || y == x { return fault(&sh, w, x, th, "join 的线程不对") }
+        if sh.ts[y].state == DONE {
+            th.st.push(sh.ts[y].res)
+        } else {
+            sh.ts[y].joiners.push(x)
+            block(&sh, w, x, th)
+            return (false, nothing())
+        }
+    } else if k == core.SYS_SELF {
+        th.st.push(x)
+    } else if k == core.SYS_PRINT {
+        v = pop_or(&th, 0)
+        sh.out.push("#{v}")
+    }
+    (true, th)
+}
+
+fn fault(inout sh: Sh, w: int, x: int, take th: core.Th, why: str) -> (bool, core.Th) {
+    sh.out.push("线程 #{x} 出错（pc #{th.pc - 1}）：#{why}")
+    sh.faults += 1
+    finish(&sh, w, x, 0, th)
+    (false, nothing())
+}
+
+fn do_sys(s: Sched, w: int, x: int, take th: core.Th, k: int, a: int) -> (bool, core.Th) {
+    lock s.sh as sh {
+        sh.slices += 1
+        sys(&sh, w, x, th, k, a)
+    }
+}
+
+fn do_finish(s: Sched, w: int, x: int, take th: core.Th, res: int, bad: bool) {
+    lock s.sh as sh {
+        sh.slices += 1
+        if bad {
+            sh.faults += 1
+            sh.out.push("线程 #{x} 出错（pc #{th.pc}）")
+        }
+        finish(&sh, w, x, res, th)
+    }
+}
+
+// worker w 拿一个线程跑：跑到时间片用完、等着或者结束为止；没有线程可跑时返回 false
+pub fn run_one(s: Sched, w: int, code: [core.Ins]) -> bool {
+    x, th = acquire(s, w)
+    if x < 0 { return false }
+    left = s.budget
+    for true {
+        r = core.slice(code, left, &th)
+        left -= r.used
+        match r.stop {
+            Budget => {
+                preempt(s, w, x, th)
+                return true
+            }
+            Next => {
+                preempt(s, w, x, th)
+                return true
+            }
+            Done(v, _has) => {
+                do_finish(s, w, x, th, v, false)
+                return true
+            }
+            Fault => {
+                do_finish(s, w, x, th, 0, true)
+                return true
+            }
+            Call(k, a) => {
+                go, t2 = do_sys(s, w, x, th, k, a)
+                if !go { return true }
+                th = t2
+                if left <= 0 {
+                    requeue(s, w, x, th, 0)
+                    return true
+                }
+            }
+        }
+    }
+    true
+}
+
+// ---------- 结束、死锁 ----------
+
+fn all_idle(sh: Sh) -> bool {
+    for w in 0..len(sh.qs) {
+        idle = lock sh.qs[w] as k { k.run == -1 && deque.is_empty(k.ids) }
+        if !idle { return false }
+    }
+    true
+}
+
+// 主线程还没结束，可是没有在跑的、没有在队列里的、没有睡着的：都在等，再也不会醒（死锁）。
+// 拿着 Sh 的锁再按顺序拿每个 Wk 的锁看，看到的是同一个时刻的样子
+pub fn check_dead(s: Sched) -> bool {
+    lock s.sh as sh {
+        if !sh.dead && sh.ts[0].state != DONE && sh.sleeping == 0 && all_idle(sh) { sh.dead = true }
+        sh.dead
+    }
+}
+
+// 叫醒睡够了的；返回是不是该停了（主线程结束了或者死锁了）
+fn tick(s: Sched, w: int) -> bool {
+    lock s.sh as sh {
+        timers(&sh, w)
+        sh.ts[0].state == DONE || sh.dead
+    }
+}
+
+fn wk_stats(m: Mutex[Wk]) -> (int, int, int) {
+    lock m as k { (k.slices, k.steals, k.stolen) }
+}
+
+// 最后的样子：各个 worker 的统计加起来
+pub fn result(s: Sched) -> Sh {
+    lock s.sh as sh {
+        for w in 0..len(s.qs) {
+            a, b, c = wk_stats(s.qs[w].copy())
+            sh.slices += a
+            sh.steals += b
+            sh.stolen += c
+        }
+        sh.copy()
+    }
+}
+
+// 每个线程正好在一个地方、每个通道满足 BInv；不是的话记到 out 里
+pub fn check_all(s: Sched) {
+    lock s.sh as sh {
+        errs: [str] = []
+        for t in 0..len(sh.ts) {
+            c = cnt(sh, t)
+            if c != 1 { errs.push("调度器出错：线程 #{t} 在 #{c} 个地方") }
+        }
+        for i in 0..len(sh.chs) {
+            n = deque.iter_len(sh.chs[i].buf)
+            lim = sh.chs[i].cap
+            if lim >= 0 && n > lim { errs.push("调度器出错：通道 #{i} 的缓冲有 #{n} 个，超过容量 #{lim}") }
+            if !deque.is_empty(sh.chs[i].sendq) && n != lim { errs.push("调度器出错：通道 #{i} 有人等着发，缓冲却没满") }
+            if !deque.is_empty(sh.chs[i].recvq) && n != 0 { errs.push("调度器出错：通道 #{i} 有人等着收，缓冲却不是空的") }
+        }
+        for e in errs { sh.out.push(e) }
+    }
+}
+
+// ---------- 两种跑法 ----------
+
+// 在一个系统线程上轮流当每个 worker：每一轮每个 worker 拿一个线程跑。check 时每一步以后检查
+pub fn run_sim(p: asm.Prog, nw: int, budget: int, check: bool) -> Sh {
+    s = new_sched(p, nw, budget)
+    for true {
+        if tick(s, 0) { break }
+        any = false
+        for w in 0..nw {
+            if run_one(s, w, p.code) { any = true }
+            if check { check_all(s) }
+        }
+        if !any {
+            if check_dead(s) { break }
+            sleep_ms(1)
+        }
+    }
+    result(s)
+}
+
+pub type Arg {
+    pub w: int
+    pub code: [core.Ins]
+    pub s: Sched
+}
+
+// 每跑 16 个线程看一次睡着的和该不该停（拿 Sh 的锁）；闲着时每次都看
+fn worker(take a: Arg) {
+    n = 0
+    for true {
+        if n % 16 == 0 && tick(a.s, a.w) { break }
+        n += 1
+        if !run_one(a.s, a.w, a.code) {
+            if check_dead(a.s) { break }
+            n = 0
+            sleep_ms(1)
+        }
+    }
+}
+
+// 每个 worker 一个 Lark 任务：真的并行
+pub fn run_par(p: asm.Prog, nw: int, budget: int) -> Sh {
+    s = new_sched(p, nw, budget)
+    scope {
+        for w in 0..nw { spawn(worker, Arg(w: w, code: p.code.copy(), s: s.copy())) }
+    }
+    result(s)
+}

@@ -1,0 +1,63 @@
+// lvm：从零写的轻量线程（先证明再写）。线程跑在一个小的栈式虚拟机里，像 Erlang 一样按跑了几条指令抢占，
+// 由 lvm 自己的调度器放到好几个 worker 上（M:N：每个 worker 有自己的队列，闲了去偷别人的）。
+// 阶段 1 是虚拟机和时间片（vm/core，证明 formal/Lark/VmCore.lean），阶段 2 是调度器（vm/sched，证明 formal/Lark/VmSched.lean），
+// 阶段 3 是函数调用（vm/core，VmCall.lean），阶段 4 是一次偷一半、有界通道、每个 worker 一把锁（vm/sched，VmPar.lean），
+// 阶段 5 是 select、拿线程和放回只拿自己 worker 的锁、公平（vm/sched，VmFair.lean），
+// 阶段 6 是定时器按到期时间排在堆里、带超时的 select（vm/sched，VmTimer.lean），
+// 汇编在 vm/asm。构建：在 apps/lvm 里 lark build，得到 build/lvm
+//
+//   lvm run [-w worker 数] [-b 时间片] [--sim] [-s] 程序.s
+//     -w  几个 worker（默认 4），每个是一个 Lark 任务，真的并行
+//     -b  一个时间片最多跑几条指令（默认 200）
+//     --sim  在一个系统线程上轮流当每个 worker（每次结果一样）
+//     -s  最后打印统计：线程数、时间片数、偷了几次（几个线程）、用了多久
+//
+// 程序的写法见 vm/asm.lark，例子在 examples/。主线程（线程 0）结束程序就结束（别的线程还在跑也不等），
+// 它的结果是 lvm 的输出的最后一行。
+// 退出码：有线程出错是 1，死锁（还有线程在等但再也不会醒）是 2。
+import "std/flag"
+import "std/os"
+import "std/time"
+import "vm/asm"
+import "vm/sched"
+
+fn main() {
+    p = flag.new("lvm", "轻量线程的小虚拟机（M:N 调度）")
+    c = flag.new("run", "跑一个程序：lvm run [-w N] [-b 时间片] [--sim] [-s] 程序.s")
+    c.add_int("workers", "w", 4, "几个 worker")
+    c.add_int("budget", "b", 200, "一个时间片最多跑几条指令")
+    c.add_bool("sim", "", "在一个系统线程上轮流当每个 worker")
+    c.add_bool("stats", "s", "最后打印统计")
+    p.add_command(c)
+    a = p.parse_or_exit()
+    match run(a) {
+        Ok(code) => exit(code)
+        Err(e) => {
+            eprint("lvm：#{e}")
+            exit(1)
+        }
+    }
+}
+
+fn run(a: flag.Args) -> int! {
+    if len(a.rest) != 1 { return Err("要给一个程序文件") }
+    nw = a.get_int("workers")
+    budget = a.get_int("budget")
+    if nw < 1 { return Err("-w 至少是 1") }
+    if budget < 1 { return Err("-b 至少是 1") }
+    src = os.read(a.rest[0])?
+    prog = asm.parse(src)?
+    t0 = time.now()
+    wd = if a.get_bool("sim") { sched.run_sim(prog, nw, budget, false) } else { sched.run_par(prog, nw, budget) }
+    ms = time.elapsed_ms(t0)
+    for line in wd.out { print(line) }
+    if wd.dead {
+        eprint("lvm：死锁了，还有 #{wd.live} 个线程在等")
+        return Ok(2)
+    }
+    print("结果 #{wd.ts[0].res}")
+    if a.get_bool("stats") {
+        eprint("线程 #{len(wd.ts)} 个，时间片 #{wd.slices} 个，偷了 #{wd.steals} 次（#{wd.stolen} 个线程），worker #{nw} 个，用了 #{ms} 毫秒")
+    }
+    Ok(if wd.faults > 0 { 1 } else { 0 })
+}

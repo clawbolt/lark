@@ -1,0 +1,75 @@
+// 接口对象 dyn I（需要 lark1 及以后的版本）
+// 需要 dyn Shape 的地方可以放任何实现了 Shape 的值：自动装箱，调用方法时经虚表找到对应的实现。
+// 泛型（[T: Shape]）在编译时为每个类型生成一份代码；dyn 在运行时分派，所以不同类型能放进同一个列表。
+
+interface Shape {
+    fn area(s: Self) -> int
+    fn name(s: Self) -> str
+    fn scaled(s: Self, k: int) -> int
+}
+
+type Rect {
+    w: int
+    h: int
+}
+
+type Circle {
+    r: int
+}
+
+fn area(s: Rect) -> int { s.w * s.h }
+fn name(s: Rect) -> str { "矩形 #{s.w}x#{s.h}" }
+fn scaled(s: Rect, k: int) -> int { s.w * s.h * k * k }
+
+fn area(s: Circle) -> int { 3 * s.r * s.r }
+fn name(s: Circle) -> str { "圆 r=#{s.r}" }
+fn scaled(s: Circle, k: int) -> int { 3 * s.r * s.r * k * k }
+
+// str 也能实现接口
+fn area(s: str) -> int { len(s) }
+fn name(s: str) -> str { "字符串 \"" + s + "\"" }
+fn scaled(s: str, k: int) -> int { len(s) * k }
+
+fn total(shapes: [dyn Shape]) -> int {
+    sum = 0
+    for s in shapes { sum += s.area() }
+    sum
+}
+
+fn biggest(shapes: [dyn Shape]) -> str {
+    best = ""
+    most = -1
+    for s in shapes {
+        if s.area() > most {
+            most = s.area()
+            best = s.name()
+        }
+    }
+    best
+}
+
+type Scene {
+    title: str
+    items: [dyn Shape]
+}
+
+fn pick(big: bool) -> dyn Shape {
+    if big { Rect(w: 10, h: 10) } else { Circle(r: 1) }
+}
+
+fn main() {
+    shapes: [dyn Shape] = [Rect(w: 2, h: 3), Circle(r: 2), "lark"]
+    for s in shapes {
+        print("#{s.name()}：面积 #{s.area()}，放大 2 倍 #{s.scaled(2)}")
+    }
+    print("总面积：#{total(shapes)}，最大的是 #{biggest(shapes)}")
+
+    // 复制 dyn 值会复制里面的具体值
+    more = shapes.copy()
+    more.push(pick(true))
+    more.push(pick(false))
+    print("加了两个之后：#{len(more)} 个，原来的还是 #{len(shapes)} 个")
+
+    scene = Scene(title: "示例", items: more)
+    print("#{scene.title}：总面积 #{total(scene.items)}")
+}

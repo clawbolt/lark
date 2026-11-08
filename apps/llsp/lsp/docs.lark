@@ -1,0 +1,126 @@
+// 打开的文档（LSP 规范的 “Document Synchronization”）：didOpen / didChange / didClose。
+// 先证明再写：对应 formal/Lark/LspDoc.lean，函数和定义一一对应：
+//   Doc 的列表 ↔ Store、get / del / put ↔ get / del / put、Change ↔ Change、apply1 / apply_all ↔ apply1 / applyAll、
+//   Ev ↔ Ev、step ↔ step（event 从 JSON 里读出 Ev，模型里没有）
+// 证明了：打开以后读到的就是打开时的内容、关掉以后读不到（open_get、close_get）；版本更大时内容是按顺序作用
+// 所有修改的结果（change_get）；版本没变大或者没打开时什么都不变（change_stale、change_unknown）；版本不会变小（change_mono）；
+// 一串修改拆成两次通知发结果一样（change_split）；一个文档只被它自己的通知改变（step_other、run_other）。
+import "std/json"
+import "lsp/pos"
+import "lsp/edit"
+
+pub type Doc {
+    pub uri: str
+    pub ver: int
+    pub text: str
+}
+
+pub enum Change {
+    Whole(t: str)
+    Range(a: pos.Pos, b: pos.Pos, t: str)
+}
+
+pub enum Ev {
+    Opn(uri: str, ver: int, text: str)
+    Chg(uri: str, ver: int, cs: [Change])
+    Cls(uri: str)
+}
+
+// ---------- 记着的文档 ----------
+
+pub fn get(s: [Doc], uri: str) -> Doc? {
+    for d in s {
+        if d.uri == uri { return Some(d.copy()) }
+    }
+    None
+}
+
+fn del(s: [Doc], uri: str) -> [Doc] {
+    out: [Doc] = []
+    for d in s {
+        if d.uri != uri { out.push(d.copy()) }
+    }
+    out
+}
+
+fn put(s: [Doc], uri: str, ver: int, text: str) -> [Doc] {
+    out: [Doc] = [Doc(uri: uri, ver: ver, text: text)]
+    for d in del(s, uri) { out.push(d.copy()) }
+    out
+}
+
+// ---------- 修改 ----------
+
+pub fn apply1(enc: pos.Enc, d: str, c: Change) -> str {
+    match c {
+        Whole(t) => t.copy()
+        Range(a, b, t) => edit.change(enc, d, a.copy(), b.copy(), t)
+    }
+}
+
+// 按顺序作用：后一处的位置是相对前一处改完以后的文档说的
+pub fn apply_all(enc: pos.Enc, d: str, cs: [Change]) -> str {
+    out = d.copy()
+    for c in cs { out = apply1(enc, out, c) }
+    out
+}
+
+// ---------- 通知 ----------
+
+pub fn step(enc: pos.Enc, inout s: [Doc], take e: Ev) {
+    match take e {
+        Opn(uri, ver, text) => { s = put(s, uri, ver, text) }
+        Chg(uri, ver, cs) => {
+            match take get(s, uri) {
+                Some(d) => {
+                    if d.ver < ver { s = put(s, uri, ver, apply_all(enc, d.text, cs)) }
+                }
+                None => {}
+            }
+        }
+        Cls(uri) => { s = del(s, uri) }
+    }
+}
+
+// ---------- 从 JSON 里读出通知 ----------
+
+fn read_pos(j: json.Json, key: str) -> pos.Pos? {
+    l = json.path_int(j, "#{key}.line")?
+    c = json.path_int(j, "#{key}.character")?
+    Some(pos.Pos(line: l, ch: c))
+}
+
+fn read_change(j: json.Json) -> Change? {
+    t = json.path_str(j, "text")?
+    match take json.path(j, "range") {
+        Some(r) => {
+            a = read_pos(r, "start")?
+            b = read_pos(r, "end")?
+            Some(Range(a, b, t))
+        }
+        None => Some(Whole(t))
+    }
+}
+
+// 认识的三种通知；别的方法、或者缺了字段的通知是 None（丢掉，和不认识的通知一样）
+pub fn event(method: str, params: json.Json) -> Ev? {
+    uri = json.path_str(params, "textDocument.uri")?
+    if method == "textDocument/didOpen" {
+        ver = json.path_int(params, "textDocument.version")?
+        text = json.path_str(params, "textDocument.text")?
+        return Some(Opn(uri, ver, text))
+    }
+    if method == "textDocument/didChange" {
+        ver = json.path_int(params, "textDocument.version")?
+        arr = json.path(params, "contentChanges")?
+        items = match take arr {
+            Arr(xs) => xs
+            _ => { return None }
+        }
+        cs: [Change] = []
+        for x in items { cs.push(read_change(x)?) }
+        return Some(Chg(uri, ver, cs))
+    }
+    if method == "textDocument/didClose" { return Some(Cls(uri)) }
+    None
+}

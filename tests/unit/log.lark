@@ -1,0 +1,60 @@
+// std/log 的测试：一条日志的文字（text 和 JSON 两种写法）、级别、固定字段。时间用固定的毫秒数
+import "std/log"
+
+fn quiet(name: str) -> log.Logger {
+    lg = log.new(name)
+    lg.level = log.INFO
+    lg.as_json = false
+    lg
+}
+
+test "文字格式" {
+    lg = quiet("app")
+    ms = 1_761_710_641_123
+    none: [str] = []
+    assert_eq(lg.format_line(log.INFO, "开始", ["port", "8080"], ms), "2025-10-29T04:04:01.123Z INFO app: 开始 port=8080")
+    lg.show_time = false
+    assert_eq(lg.format_line(log.WARN, "慢", ["path", "/a b", "q", "x=1", "e", ""], ms), "WARN app: 慢 path=\"/a b\" q=\"x=1\" e=\"\"")
+    assert_eq(lg.format_line(log.ERROR, "坏", ["msg", "第一行\n第二行", "单"], ms), "ERROR app: 坏 msg=\"第一行\\n第二行\" 单=\"\"")
+    c = lg.with("conn", "17").with("peer", "1.2.3.4")
+    assert_eq(c.format_line(log.DEBUG, "关闭", ["n", "3"], ms), "DEBUG app: 关闭 conn=17 peer=1.2.3.4 n=3")
+    // with 返回新的 Logger，原来的不变
+    assert_eq(len(lg.fields), 0)
+    lg.name = ""
+    assert_eq(lg.format_line(log.INFO, "无名", none, ms), "INFO 无名")
+}
+
+test "JSON 格式" {
+    lg = quiet("app")
+    lg.as_json = true
+    ms = 1_761_710_641_123
+    none: [str] = []
+    assert_eq(lg.format_line(log.INFO, "说 \"你好\"", ["k", "v"], ms), "{\"time\":\"2025-10-29T04:04:01.123Z\",\"level\":\"INFO\",\"name\":\"app\",\"msg\":\"说 \\\"你好\\\"\",\"k\":\"v\"}")
+    lg.show_time = false
+    assert_eq(lg.with("a", "1").format_line(log.ERROR, "x", none, ms), "{\"level\":\"ERROR\",\"name\":\"app\",\"msg\":\"x\",\"a\":\"1\"}")
+}
+
+test "级别" {
+    lg = quiet("")
+    assert(!lg.enabled(log.DEBUG))
+    assert(lg.enabled(log.INFO))
+    assert(lg.enabled(log.ERROR))
+    lg.level = log.OFF
+    assert(!lg.enabled(log.ERROR))
+    lg.level = log.DEBUG
+    assert(lg.enabled(log.DEBUG))
+    assert_eq(log.parse_level(" Warning ") ?? -1, log.WARN)
+    assert_eq(log.parse_level("DEBUG") ?? -1, log.DEBUG)
+    assert_eq(log.parse_level("off") ?? -1, log.OFF)
+    assert_eq(log.parse_level("loud") ?? -1, -1)
+    assert_eq(log.level_name(log.WARN), "WARN")
+    // 级别不够时什么也不写（写到 fd -1 也不会出错）
+    lg.fd = -1
+    lg.level = log.ERROR
+    lg.info("看不见")
+    lg.error("写不出去也不 panic")
+    lg.level = log.DEBUG
+    lg.debug("写不出去")
+    lg.warn("写不出去")
+    lg.log(log.WARN, "写不出去", ["k", "v"])
+}

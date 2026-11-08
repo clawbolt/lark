@@ -1,0 +1,66 @@
+// 闭包（需要 lark1 及以后的版本）
+// 闭包只能直接作为参数传入，不能存进变量、字段或列表，也不能返回；
+// 外层变量按只读方式捕获。所以不需要堆分配，也不会悬空。
+
+fn map[T, U](xs: [T], f: fn(T) -> U) -> [U] {
+    out: [U] = []
+    for x in xs {
+        out.push(f(x))
+    }
+    out
+}
+
+fn filter[T](xs: [T], keep: fn(T) -> bool) -> [T] {
+    out: [T] = []
+    for x in xs {
+        if keep(x) { out.push(x.copy()) }
+    }
+    out
+}
+
+fn fold[T, A](xs: [T], take init: A, f: fn(A, T) -> A) -> A {
+    acc = init
+    for x in xs {
+        acc = f(acc, x)
+    }
+    acc
+}
+
+fn each[T](xs: [T], f: fn(T)) {
+    for x in xs { f(x) }
+}
+
+fn times(n: int, f: fn(int)) {
+    for i in 0..n { f(i) }
+}
+
+// 函数类型的参数可以继续传给别的函数
+fn twice(x: int, f: fn(int) -> int) -> int {
+    y = f(x)
+    apply(y, f)
+}
+
+fn apply(x: int, f: fn(int) -> int) -> int { f(x) }
+
+fn show(xs: [int]) -> str { join(xs.map(|x| int_str(x)), " ") }
+
+fn main() {
+    nums = [1, 2, 3, 4, 5]
+    k = 10
+    print("翻倍：#{show(nums.map(|x| x * 2))}")
+    print("大于 2：#{show(nums.filter(|x| x > 2))}")
+    print("加 k：#{show(nums.map(|x| x + k))}")
+    print("求和：#{nums.fold(0, |a, x| a + x)}")
+    words = nums.map(|x| "第#{x}个")
+    print(join(words, "、"))
+    prefix = "· "
+    words.each(|w| print(prefix + w))
+    times(2, |i| {
+        sq = i * i
+        print("第 #{i} 次，平方 #{sq}")
+    })
+    print("两次加 k：#{twice(1, |x| x + k)}")
+    // 闭包里再用闭包：内层捕获的 k 也来自最外层
+    grid = [1, 2].map(|r| show([1, 2, 3].map(|c| r * c + k)))
+    print(join(grid, " | "))
+}

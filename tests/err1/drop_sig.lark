@@ -1,0 +1,8 @@
+// 期望错误：析构函数必须写成 fn drop(inout x: T)
+type File {
+    fd: int
+}
+
+fn drop(f: File) {}
+
+fn main() {}

@@ -1,0 +1,9 @@
+// 期望错误：u 是借用的，不能移走（引用不能被存进结构体）
+type User { name: str }
+type Holder { u: User }
+
+fn wrap(u: User) -> Holder {
+    Holder(u: u)
+}
+
+fn main() {}

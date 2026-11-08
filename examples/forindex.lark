@@ -1,0 +1,49 @@
+// for i, x in …：同时拿到从 0 开始的序号和元素（需要 lark1 及以后的版本）
+// 列表里 i 就是下标，x 和 for x in xs 一样是借用的元素；迭代器里 i 数的是第几个值。
+// i 是循环里的一个新变量，改它不影响循环。只要序号时可以写 for i, _ in xs。
+// 编译：lark1 examples/forindex.lark -o out.c
+import "std/iter"
+
+type Countdown {
+    n: int
+}
+
+fn next(inout cd: Countdown) -> int? {
+    if cd.n == 0 { return None }
+    cd.n -= 1
+    Some(cd.n + 1)
+}
+
+// 第一个满足条件的位置
+fn position(xs: [str], want: str) -> int {
+    for i, x in xs {
+        if x == want { return i }
+    }
+    -1
+}
+
+fn main() {
+    fruits = ["苹果", "香蕉", "橙子"]
+    for i, f in fruits {
+        print("#{i + 1}. #{f}")
+    }
+    print("香蕉在第 #{position(fruits, "香蕉")} 个位置，葡萄：#{position(fruits, "葡萄")}")
+
+    for i, n in Countdown(n: 3) {
+        print("第 #{i} 个值是 #{n}")
+    }
+
+    // 适配器的结果也能这样遍历
+    for i, sq in iter.count_from(1).map(|n| n * n).take_n(3) {
+        print("squares[#{i}] = #{sq}")
+    }
+
+    // 只要序号；break / continue 照常
+    grid = [[1, 2], [3, 4], [5, 6]]
+    for r, _ in grid {
+        if r == 1 { continue }
+        for c, v in grid[r] {
+            print("(#{r}, #{c}) = #{v}")
+        }
+    }
+}

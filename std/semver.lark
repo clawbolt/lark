@@ -1,0 +1,142 @@
+// Lark 标准库 · 语义化版本（semver.org 2.0.0；先证明再写，见 formal/Lark/Semver.lean）
+// 用法：import "std/semver"
+//
+//   v = semver.parse("1.4.0-rc.1+build.5")?   // Version!：v.major、v.minor、v.patch、v.pre（["rc", "1"]）、v.build
+//   semver.format(v)                         // "1.4.0-rc.1+build.5"；"#{v}" 一样
+//   a < b、cmp(a, b)                         // 按规范第 11 条比先后；构建信息不参与比较（cmp 是接口方法，不加模块名）
+//   sort.sort(&vs)                           // Version 满足 Ord
+//
+// 证明了：比较是全序（交换两边结果反过来、小于可以传递、cmp 是 0 当且仅当除了构建信息都一样）；
+// 合法的版本 format 再 parse 回到原样。和证明里的模型不同的地方：
+// - 主、次、修订号超过 18 位时 parse 出错（int 装不下；模型里是不限大小的自然数）；
+// - 预发布的数字标识符存成字符串，比较时先比长度再逐字节比。没有前导零，所以和按数字比一样，也不会溢出。
+// == 比较所有字段（包括构建信息）；只看先后时用 cmp(a, b) == 0。
+
+import "std/str"
+
+pub type Version {
+    pub major: int
+    pub minor: int
+    pub patch: int
+    pub pre: [str]      // 预发布的标识符，没有时是 []
+    pub build: [str]    // 构建信息的标识符，没有时是 []
+}
+
+// 解析 主.次.修订[-预发布][+构建]。数字不能有前导零；标识符不能是空的，只能用 0-9 A-Z a-z -；
+// 预发布里全是数字的标识符也不能有前导零。前面不能写 v（"v1.0.0" 是错误）
+pub fn parse(s: str) -> Version! {
+    plus = find_byte(s, '+', 0, len(s))
+    dash = find_byte(s, '-', 0, plus)
+    nums = str.split(slice(s, 0, dash), ".")
+    if len(nums) != 3 { return Err("版本号：要写成 主.次.修订，这里是 \"#{slice(s, 0, dash)}\"") }
+    major = parse_num(nums[0], "主版本号")?
+    minor = parse_num(nums[1], "次版本号")?
+    patch = parse_num(nums[2], "修订号")?
+    pre: [str] = []
+    if dash < plus { pre = parse_ids(slice(s, dash + 1, plus), "预发布", true)? }
+    build: [str] = []
+    if plus < len(s) { build = parse_ids(slice(s, plus + 1, len(s)), "构建信息", false)? }
+    Ok(Version(major: major, minor: minor, patch: patch, pre: pre, build: build))
+}
+
+// 写成 主.次.修订[-预发布][+构建]
+pub fn format(v: Version) -> str {
+    s = "#{v.major}.#{v.minor}.#{v.patch}"
+    if len(v.pre) > 0 { s += "-" + join(v.pre, ".") }
+    if len(v.build) > 0 { s += "+" + join(v.build, ".") }
+    s
+}
+
+// "#{v}"：和 format 一样
+pub fn show(v: Version) -> str { format(v) }
+
+// 规范第 11 条：负数表示 a 在前，0 表示一样（构建信息不算），正数表示 a 在后。a < b 调用它
+pub fn cmp(a: Version, b: Version) -> int {
+    if a.major != b.major { return sign(a.major - b.major) }
+    if a.minor != b.minor { return sign(a.minor - b.minor) }
+    if a.patch != b.patch { return sign(a.patch - b.patch) }
+    cmp_pre(a.pre, b.pre)
+}
+
+// ---------- 比较（对应 formal/Lark/Semver.lean 的 cmpPre / cmpList / cmpId） ----------
+
+fn sign(d: int) -> int { if d < 0 { -1 } else if d > 0 { 1 } else { 0 } }
+
+// 没有预发布的比有的大；都有时逐个比标识符，前面都一样时标识符多的大
+fn cmp_pre(a: [str], b: [str]) -> int {
+    if len(a) == 0 || len(b) == 0 { return sign(len(b) - len(a)) }
+    n = if len(a) < len(b) { len(a) } else { len(b) }
+    for i in 0..n {
+        c = cmp_id(a[i], b[i])
+        if c != 0 { return c }
+    }
+    sign(len(a) - len(b))
+}
+
+// 数字的比字母数字的小；都是数字时按数字比（没有前导零：先比长度再逐字节比）；都是字母数字时逐字节比
+fn cmp_id(x: str, y: str) -> int {
+    dx = all_digits(x)
+    dy = all_digits(y)
+    if dx && dy {
+        if len(x) != len(y) { return sign(len(x) - len(y)) }
+        return cmp_bytes(x, y)
+    }
+    if dx { return -1 }
+    if dy { return 1 }
+    cmp_bytes(x, y)
+}
+
+// 按字节的字典序：前面都一样时短的小
+fn cmp_bytes(x: str, y: str) -> int {
+    n = if len(x) < len(y) { len(x) } else { len(y) }
+    for i in 0..n {
+        d = byte_at(x, i) - byte_at(y, i)
+        if d != 0 { return sign(d) }
+    }
+    sign(len(x) - len(y))
+}
+
+// ---------- 解析（对应 parseNum / parseId / parseBuilds） ----------
+
+fn find_byte(s: str, c: int, start: int, end: int) -> int {
+    i = start
+    for i < end && byte_at(s, i) != c { i += 1 }
+    i
+}
+
+fn all_digits(s: str) -> bool {
+    for i in 0..len(s) {
+        c = byte_at(s, i)
+        if c < '0' || c > '9' { return false }
+    }
+    true
+}
+
+fn ident_char(c: int) -> bool {
+    (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-'
+}
+
+fn parse_num(t: str, what: str) -> int! {
+    if t == "" { return Err("版本号：#{what}是空的") }
+    if !all_digits(t) { return Err("版本号：#{what} \"#{t}\" 不是数字") }
+    if len(t) > 1 && byte_at(t, 0) == '0' { return Err("版本号：#{what} \"#{t}\" 有前导零") }
+    if len(t) > 18 { return Err("版本号：#{what} \"#{t}\" 太大（超过 18 位）") }
+    n = 0
+    for i in 0..len(t) { n = n * 10 + (byte_at(t, i) - '0') }
+    Ok(n)
+}
+
+// 按 . 分开的标识符；pre 时全是数字的标识符不能有前导零
+fn parse_ids(t: str, what: str, pre: bool) -> [str]! {
+    ids = str.split(t, ".")
+    for id in ids {
+        if id == "" { return Err("版本号：#{what}有空的标识符") }
+        for i in 0..len(id) {
+            if !ident_char(byte_at(id, i)) { return Err("版本号：#{what}的标识符 \"#{id}\" 里只能有 0-9 A-Z a-z -") }
+        }
+        if pre && all_digits(id) && len(id) > 1 && byte_at(id, 0) == '0' {
+            return Err("版本号：#{what}的数字标识符 \"#{id}\" 有前导零")
+        }
+    }
+    Ok(ids)
+}

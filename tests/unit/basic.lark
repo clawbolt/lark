@@ -1,0 +1,45 @@
+// lark1 --test 的用例：test 块、assert、assert_eq；失败或 panic 的测试不影响其它测试
+type Point {
+    x: int
+    y: int
+}
+
+fn show(p: Point) -> str { "(#{p.x}, #{p.y})" }
+
+fn add(a: int, b: int) -> int { a + b }
+
+fn main() {
+    print("测试模式下不会运行 main")
+}
+
+test "加法" {
+    assert(add(1, 2) == 3)
+    assert_eq(add(-1, 1), 0)
+}
+
+test "字符串、列表和可选值" {
+    assert_eq("ab" + "c", "abc")
+    assert_eq([1, 2], [1, 2])
+    assert_eq(Some(3), Some(3))
+}
+
+test "失败的 assert_eq 会显示两边" {
+    print("这行输出只在失败时显示")
+    assert_eq(["a", "b"], ["a", "c"])
+}
+
+test "失败的 assert" {
+    xs = [1, 2, 3]
+    assert(len(xs) == 4)
+}
+
+test "panic 也算失败" {
+    xs: [int] = []
+    _x = xs[0]
+}
+
+test "结构体" {
+    p = Point(x: 1, y: 2)
+    assert_eq(p, Point(x: 1, y: 2))
+    assert_eq(Point(x: 3, y: 4), Point(x: 3, y: 5))
+}

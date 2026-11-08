@@ -1,0 +1,40 @@
+// std/iter：列表和迭代器上的常用函数（需要 lark1 及以后的版本）
+// [I: Iter[T]] 的来源可以是列表，也可以是自定义迭代器；T 从来源推断，所以闭包参数不用写类型。
+// 适配器（map、filter、take_n、enumerate、skip_n）是惰性的，最后用 collect 取成列表；find、any、all 会提前停下，可以用于无限迭代器。
+// 编译：lark1 examples/iterlib.lark -o out.c
+import "std/iter"
+
+type Countdown {
+    n: int
+}
+
+fn next(inout cd: Countdown) -> int? {
+    if cd.n == 0 { return None }
+    cd.n -= 1
+    Some(cd.n + 1)
+}
+
+fn main() {
+    xs = [3, 1, 4, 1, 5, 9, 2, 6]
+    sq = iter.map(xs.copy(), |x| x * x).collect()
+    print("平方：#{sq}")
+    ev = iter.filter(iter.range(0, 10), |n| n % 2 == 0).collect()
+    print("偶数：#{ev}")
+    big = iter.find(xs.copy(), |x| x > 4)
+    print("第一个大于 4 的：#{big}")
+    total = iter.fold(iter.range(1, 101), 0, |acc, n| acc + n)
+    print("1 到 100 的和：#{total}")
+    firsts = iter.take_n(iter.count_from(10), 3).collect()
+    print("无限迭代器的前 3 个：#{firsts}")
+    down = iter.collect(Countdown(n: 3))
+    print("倒数：#{down}")
+    names = ["甲", "乙", "丙"]
+    numbered = iter.enumerate(names).collect()
+    print("带序号：#{numbered}")
+    has7 = iter.any(xs.copy(), |x| x == 7)
+    pos = iter.all(xs.copy(), |x| x > 0)
+    print("有 7：#{has7}，全为正：#{pos}")
+    n = iter.count(Countdown(n: 5))
+    rest = iter.skip_n(xs, 5).collect()
+    print("个数：#{n}，跳过 5 个：#{rest}")
+}

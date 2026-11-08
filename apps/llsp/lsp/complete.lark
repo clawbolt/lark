@@ -1,0 +1,139 @@
+// 补全（LSP 规范的 “textDocument/completion”）：光标前面那半个词是前缀，列出以它开头的名字。
+// 先证明再写：对应 formal/Lark/LspComp.lean，函数和定义一一对应：
+//   uniq ↔ uniq、complete ↔ complete、prefix_at ↔ prefixAt、kw_names ↔ kwNames、cands ↔ cands、
+//   line_beg / is_pub / pub_names ↔ lineBeg / isPub / pubNames
+// 证明了：补全的每一项都是候选、以前缀开头，每个以前缀开头的候选都在里面（complete_iff），没有重复（complete_nodup）；
+// 本文件的每一项要么是关键字、要么是真有的声明（local_sound），`模块.` 的每一项是那个文件真有的 pub 声明（module_sound）。
+// 没证：`模块.` 时按 import 找文件（和 defn.lark 一样）；方法、字段、局部变量、标准库还不支持。
+import "std/os"
+import "std/json"
+import "lsp/pos"
+import "lsp/docs"
+import "lsp/diag"
+import "lsp/defn"
+import "lsp/symbols"
+
+// 去掉重复的，留最后一个（uniq）
+pub fn uniq(xs: [str]) -> [str] {
+    out: [str] = []
+    for i in 0..len(xs) {
+        later = false
+        for j in i + 1..len(xs) {
+            if xs[j] == xs[i] { later = true }
+        }
+        if !later { out.push(xs[i].copy()) }
+    }
+    out
+}
+
+fn starts(s: str, p: str) -> bool { len(p) <= len(s) && slice(s, 0, len(p)) == p }
+
+// 以前缀开头的候选，去掉重复的（complete）
+pub fn complete(cs: [str], pre: str) -> [str] {
+    keep: [str] = []
+    for c in cs {
+        if starts(c, pre) { keep.push(c.copy()) }
+    }
+    uniq(keep)
+}
+
+// 光标 o 前面那半个词（prefixAt）
+pub fn prefix_at(d: str, o: int) -> str {
+    e = if o < 0 { 0 } else if o > len(d) { len(d) } else { o }
+    slice(d, defn.word_start(d, e), e)
+}
+
+pub fn kw_names() -> [str] {
+    ["fn", "type", "enum", "interface", "const", "pub", "import", "if", "else", "match", "for", "in", "return",
+        "break", "continue", "true", "false", "take", "inout", "scope", "select", "int", "float", "u8", "bool", "str"]
+}
+
+// 本文件的候选：声明，再加上关键字和内置类型（cands）
+pub fn cands(d: str) -> [str] {
+    out: [str] = []
+    for x in defn.decls(d) { out.push(x.name.copy()) }
+    for k in kw_names() { out.push(k.copy()) }
+    out
+}
+
+// 偏移 p 所在的行的开头（lineBeg）
+pub fn line_beg(d: str, p: int) -> int {
+    k = if p > len(d) { len(d) } else { p }
+    for k > 0 && byte_at(d, k - 1) != 10 { k -= 1 }
+    k
+}
+
+pub fn is_pub(d: str, p: int) -> bool {
+    b = line_beg(d, p)
+    b + 4 <= len(d) && slice(d, b, b + 4) == "pub "
+}
+
+// 别的模块能用的名字：pub 的声明（pubNames）
+pub fn pub_names(t: str) -> [str] {
+    out: [str] = []
+    for x in defn.decls(t) {
+        if is_pub(t, x.at) { out.push(x.name.copy()) }
+    }
+    out
+}
+
+// ---------- 回复（没证） ----------
+
+// CompletionItemKind：按声明的关键字（symbols.kind_of 的 SymbolKind）换；关键字和内置类型是 Keyword（14）
+fn item_kind(sym: int) -> int {
+    if sym == 12 { 3 } else if sym == 23 { 22 } else if sym == 10 { 13 } else if sym == 14 { 21 } else if sym == 11 { 8 } else { 14 }
+}
+
+// 名字 n 在 d 里的种类：第一个叫 n 的声明的；不是声明时是 Keyword
+fn kind_in(d: str, n: str) -> int {
+    at = defn.find(d, n)
+    if at < 0 { return 14 }
+    item_kind(symbols.kind_of(d, line_beg(d, at)))
+}
+
+fn items(src: str, names: [str]) -> json.Json {
+    out: [json.Json] = []
+    for n in names {
+        out.push(json.object([("label", json.Str(n.copy())), ("kind", json.Num(kind_in(src, n)))]))
+    }
+    json.Arr(out)
+}
+
+// 文档现在的内容：打开着的用编辑器里的，否则读文件
+fn text_of(files: [docs.Doc], uri: str, path: str) -> str? {
+    match take docs.get(files, uri) {
+        Some(x) => { return Some(x.text.copy()) }
+        None => {}
+    }
+    match take os.read(path) {
+        Ok(t) => Some(t)
+        Err(_) => None
+    }
+}
+
+// textDocument/completion 的结果：CompletionItem 的列表；文档没打开时是 null
+pub fn completion(enc: pos.Enc, files: [docs.Doc], params: json.Json) -> json.Json {
+    uri = json.path_str(params, "textDocument.uri") ?? ""
+    l = json.path_int(params, "position.line") ?? -1
+    c = json.path_int(params, "position.character") ?? -1
+    d = match take docs.get(files, uri) {
+        Some(x) => x.text.copy()
+        None => { return json.Null }
+    }
+    o = pos.off_of(enc, pos.doc(d), pos.Pos(line: l, ch: c))
+    pre = prefix_at(d, o)
+    q = defn.qualifier(d, o)
+    if q == "" { return items(d, complete(cands(d), pre)) }
+    // 模块.：import 进来的那个文件里 pub 的声明
+    none: [str] = []
+    path = diag.file_path(uri)
+    imp = defn.import_of(d, q)
+    if path == "" || imp == "" { return items(d, none) }
+    f = defn.resolve(path, imp)
+    if f == "" { return items(d, none) }
+    t = match take text_of(files, "file://" + f, f) {
+        Some(x) => x
+        None => { return items(d, none) }
+    }
+    items(t, complete(pub_names(t), pre))
+}

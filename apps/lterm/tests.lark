@@ -1,0 +1,1673 @@
+// lterm 的单元测试：lark test（在 apps/lterm 里运行）。阶段 1 是转义序列的解析器（formal/Lark/VtParse.lean），阶段 2 是 UTF-8 的流式解码和字符宽度（VtUtf8.lean），阶段 3 是屏幕（VtScreen.lean），阶段 4 是颜色和样式（VtSgr.lean），阶段 5 是模式和备用屏幕（VtMode.lean），阶段 6 是滚动缓冲和改大小（VtSb.lean），阶段 7 是只画变了的地方（VtDraw.lean），阶段 8 是翻看滚动缓冲（VtView.lean），阶段 9 是回答终端查询（VtReply.lean），阶段 10 是画框线的字符集（VtCharset.lean），lterm app 窗口的颜色表（vt/win，没有证明），阶段 11 是滚动区域从顶上开始时滚出去的行也存（VtRegion.lean），阶段 12 是鼠标选中和复制（VtSel.lean），阶段 13 是把鼠标交给程序（VtMouse.lean）。
+// 例子和 Vt*.lean 的 #guard 是同一批；随机的测试检查证明过的性质（step_cancel、step_escape、run_len、run_text、run_osc；feed_join、feed_pend、feed_ne、width_le；step_ok、up_outside、down_outside；VtSgr 的 step_ok、run_append；VtMode 的 step_ok、alt_restore、nowrap_y；VtSb 的 up_keep、keep_len、resize_ok、resize_cur、resize_lost；VtDraw 的 draw_ok、applyRow_le、diff_same、cost_le；VtView 的 view_len、view_zero、view_sub、up_down；VtReply 的 dsr_parse；VtCharset 的 map_out、map_ascii、map_width、gfx_inj、reset_ascii；VtRegion 的 region_keep、region_below、up_clamp；VtSel 的 mk_symm、mk_in、copy_lines、trim_end、left_*、right_*；VtMouse 的 sgr_parse、code_*、off_quiet、press_on、motion_*、x10_len）
+import "std/rand"
+import "vt/parse"
+import "vt/decode"
+import "vt/width"
+import "std/utf8"
+import "vt/screen"
+import "vt/term"
+import "vt/style"
+import "vt/mode"
+import "vt/draw"
+import "vt/view"
+import "vt/charset"
+import "vt/win"
+import "vt/sel"
+import "vt/mouse"
+import "std/str"
+
+// 一段字节从头解析，动作写成 "a; b; c"
+fn acts(d: str) -> str {
+    p = parse.new()
+    joined(parse.run(&p, d))
+}
+
+fn joined(xs: [parse.Act]) -> str {
+    out = ""
+    for i in 0..len(xs) {
+        if i > 0 { out += "; " }
+        out += parse.show(xs[i])
+    }
+    out
+}
+
+test "解析：转义序列（和 VtParse.lean 的 #guard 一样）" {
+    assert_eq(acts("ab\x1b[1;2Hc"), "print 97; print 98; csi [1,2] [] 72; print 99")
+    assert_eq(acts("\x1b[?25l"), "csi [25] [63] 108")
+    assert_eq(acts("\x1b[H"), "csi [] [] 72")
+    assert_eq(acts("\x1b[;5H"), "csi [0,5] [] 72")
+    assert_eq(acts("\x1b[99999999m"), "csi [65535] [] 109")
+    assert_eq(acts("\x1b[1\n2m"), "exec 10; csi [12] [] 109")
+    assert_eq(acts("\x1b[12\x18x"), "exec 24; print 120")
+    assert_eq(acts("\x1b(B"), "esc [40] 66")
+    assert_eq(acts("\x1b]0;hi\x07x"), "osc 0;hi; print 120")
+    assert_eq(acts("\x1b]2;t\x1b\\"), "osc 2;t; esc [] 92")
+    assert_eq(acts("\x1bP1$qm\x1b\\"), "dcs [1] [36] 113 m; esc [] 92")
+    assert_eq(acts("\x1b[1?2hx"), "print 120")
+    assert_eq(acts("\x1b_abc\x1b\\d"), "esc [] 92; print 100")
+}
+
+test "解析：常见的序列" {
+    // SGR：粗体红字，再复位；冒号的子参数当成分号
+    assert_eq(acts("\x1b[1;31mx\x1b[0m"), "csi [1,31] [] 109; print 120; csi [0] [] 109")
+    assert_eq(acts("\x1b[38:2::1:2:3m"), "csi [38,2,0,1,2,3] [] 109")
+    // 备用屏幕、括号粘贴；DECSCUSR（光标形状）带中间字节空格
+    assert_eq(acts("\x1b[?1049h\x1b[?2004l"), "csi [1049] [63] 104; csi [2004] [63] 108")
+    assert_eq(acts("\x1b[2 q"), "csi [2] [32] 113")
+    // 控制字符：回车、换行、退格、制表符、响铃
+    assert_eq(acts("a\r\n\x08\t\x07"), "print 97; exec 13; exec 10; exec 8; exec 9; exec 7")
+    // UTF-8 的 “中” 是三个字节，各一个 print；DEL 丢掉
+    assert_eq(acts("\xe4\xb8\xad\x7f"), "print 228; print 184; print 173")
+    // 序列跨两段读：接着上一段的状态
+    p = parse.new()
+    a = joined(parse.run(&p, "x\x1b[3"))
+    b = joined(parse.run(&p, "1mz"))
+    assert_eq(a, "print 120")
+    assert_eq(b, "csi [31] [] 109; print 122")
+}
+
+// 偏向转义序列的随机字节
+fn rand_bytes(inout r: rand.Rng, n: int) -> str {
+    parts = ["\x1b", "[", "]", "P", "_", "X", "(", "?", ";", ":", "0", "1", "9", "$", " ", "m", "H", "q", "\x07", "\x18", "\x1a", "\\", "a", "\n", "\x7f", "\xe4", "\x9b"]
+    out = ""
+    for _i in 0..n {
+        k = r.range(0, len(parts) + 8)
+        out += if k < len(parts) { parts[k].copy() } else { from_byte(r.range(0, 256)) }
+    }
+    out
+}
+
+test "解析：随机的字节流（step_cancel、step_escape、run_len、分两段读）" {
+    r = rand.new(51)
+    wrong = 0
+    for _t in 0..500 {
+        n = r.range(0, 40)
+        d = rand_bytes(&r, n)
+        // run_len：动作不比字节多
+        p = parse.new()
+        whole = parse.run(&p, d)
+        if len(whole) > len(d) { wrong += 1 }
+        // step_cancel：CAN 从任何状态回到 Ground，读了一半的全清掉
+        q = p.copy()
+        match take parse.step(&q, 0x18) {
+            Some(a) => { if parse.show(a) != "exec 24" { wrong += 1 } }
+            None => { wrong += 1 }
+        }
+        if q.st != parse.Ground || len(q.params) != 0 || q.cur != 0 || q.any || len(q.inter) != 0 || q.data != "" { wrong += 1 }
+        // step_escape：ESC 从任何状态重新开始
+        e = p.copy()
+        _x = parse.step(&e, 0x1B)
+        if e.st != parse.Escape || len(e.params) != 0 || len(e.inter) != 0 || e.data != "" { wrong += 1 }
+        // 分两段读和一次读完一样
+        k = r.range(0, len(d) + 1)
+        p2 = parse.new()
+        a1 = joined(parse.run(&p2, slice(d, 0, k)))
+        a2 = joined(parse.run(&p2, slice(d, k, len(d))))
+        both = if a1 == "" { a2.copy() } else if a2 == "" { a1.copy() } else { a1 + "; " + a2 }
+        if both != joined(whole) { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "解析：普通文字原样输出、OSC 里的文字不输出（run_text、run_osc）" {
+    r = rand.new(52)
+    wrong = 0
+    for _t in 0..300 {
+        s = ""
+        m = r.range(0, 30)
+        for _i in 0..m {
+            c = r.range(0x20, 256)
+            if c != 0x7F { s += from_byte(c) }
+        }
+        // run_text：一个字节一个 print，按顺序，状态还是 Ground
+        p = parse.new()
+        got = parse.run(&p, s)
+        if len(got) != len(s) || p.st != parse.Ground { wrong += 1 } else {
+            for i in 0..len(s) {
+                if parse.show(got[i]) != "print #{byte_at(s, i)}" { wrong += 1 }
+            }
+        }
+        // run_osc：ESC ] 之后的文字一个都不输出，全收进 data
+        q = parse.new()
+        quiet = parse.run(&q, "\x1b]" + s)
+        if len(quiet) != 0 || q.st != parse.OscString || q.data != s { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}
+
+// ---------- 阶段 2：UTF-8 的流式解码和字符宽度（formal/Lark/VtUtf8.lean） ----------
+
+// 一段字节一次喂完再 flush：码点写成 "a b c"
+fn cps(d: str) -> str {
+    dec = decode.new()
+    out = ""
+    for i in 0..len(d) {
+        for c in decode.feed(&dec, byte_at(d, i)) { out += "#{decode.code(c)} " }
+    }
+    for c in decode.flush(&dec) { out += "#{decode.code(c)} " }
+    out
+}
+
+fn std_cps(d: str) -> str {
+    out = ""
+    for c in utf8.code_points(d) { out += "#{c} " }
+    out
+}
+
+test "解码：和 VtUtf8.lean 的 #guard 一样" {
+    for d in ["\xe4\xb8\xada", "\xc3A", "\xc0\x80", "\xed\xa0\x80", "\xf7\xbf\xbf\xbf", "\xf0\x9f\x98\x80\xe4\xb8", "\xf0\x9fA\x80"] {
+        assert_eq(cps(d), std_cps(d))
+    }
+    assert_eq(cps("\xe4\xb8\xada"), "20013 97 ")
+    // 一个字符切在两段之间：先喂两个字节、存着；再喂一个字节、交出 “中”
+    dec = decode.new()
+    assert_eq(len(decode.feed(&dec, 0xE4)), 0)
+    assert_eq(len(decode.feed(&dec, 0xB8)), 0)
+    assert_eq(dec.pend, "\xe4\xb8")
+    got = decode.feed(&dec, 0xAD)
+    assert_eq(len(got), 1)
+    assert_eq(decode.code(got[0]), 20013)
+    assert_eq(dec.pend, "")
+}
+
+test "解码：随机的字节流分段喂（feed_join、feed_pend、feed_ne，和 std/utf8 一样）" {
+    parts = ["a", "\xe4", "\xb8", "\xad", "\xf0", "\x9f", "\x98", "\x80", "\xc3", "\xa9", "\xed", "\xa0", "\xe0", "\xf4", "\x90", "\xbf", "\xc0", "\xff"]
+    r = rand.new(61)
+    wrong = 0
+    for _t in 0..500 {
+        d = ""
+        m = r.range(0, 24)
+        for _i in 0..m {
+            k = r.range(0, len(parts) + 4)
+            d += if k < len(parts) { parts[k].copy() } else { from_byte(r.range(0, 256)) }
+        }
+        dec = decode.new()
+        seen = ""
+        codes = ""
+        for i in 0..len(d) {
+            for c in decode.feed(&dec, byte_at(d, i)) {
+                if len(c) == 0 || len(c) > 4 { wrong += 1 }          // feed_ne
+                seen += c
+                codes += "#{decode.code(c)} "
+            }
+            // feed_pend：存着的要么空、要么是合法字符的真前缀（最多 3 个字节）
+            if dec.pend != "" && !decode.prefix_ok(dec.pend) { wrong += 1 }
+            if len(dec.pend) > 3 { wrong += 1 }
+            // feed_join：交出去的拼起来再接上存着的，正好是喂过的
+            if seen + dec.pend != slice(d, 0, i + 1) { wrong += 1 }
+        }
+        for c in decode.flush(&dec) { codes += "#{decode.code(c)} " }
+        if codes != std_cps(d) { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "宽度：表排好了、常见的字符（width_le、width_ascii）" {
+    assert_eq(width.sorted_r(width.zero_tab()), true)
+    assert_eq(width.sorted_r(width.wide_tab()), true)
+    for c in 0x20..0x7F { assert_eq(width.width(c), 1) }
+    assert_eq(width.width(0x41), 1)
+    assert_eq(width.width(20013), 2)       // 中
+    assert_eq(width.width(0x0301), 0)      // 组合重音
+    assert_eq(width.width(0x200D), 0)      // 零宽连接符
+    assert_eq(width.width(0x1F600), 2)     // 😀
+    assert_eq(width.width(0xAC00), 2)      // 가
+    assert_eq(width.width(0xFF21), 2)      // 全角 Ａ
+    assert_eq(width.width(0x00E9), 1)      // é
+    assert_eq(width.width(0x0300), 0)      // 区间的两头
+    assert_eq(width.width(0x036F), 0)
+    assert_eq(width.width(0x0370), 1)
+    // width_le：随便哪个码点宽度都是 0、1、2；二分查找和逐个比一样
+    r = rand.new(62)
+    wrong = 0
+    for _t in 0..2000 {
+        c = r.range(0, 0x40000)
+        w = width.width(c)
+        if w < 0 || w > 2 { wrong += 1 }
+        slow = if lin(width.zero_tab(), c) { 0 } else if lin(width.wide_tab(), c) { 2 } else { 1 }
+        if c >= 0x7F && w != slow { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}
+
+// 逐个区间比（inR 的原样）
+fn lin(t: [int], c: int) -> bool {
+    for i in 0..len(t) / 2 {
+        if t[i * 2] <= c && c <= t[i * 2 + 1] { return true }
+    }
+    false
+}
+
+// ---------- 阶段 3：屏幕（formal/Lark/VtScreen.lean） ----------
+
+// 第 i 行写成字符串；宽字符的右半写成 _
+fn row_text(s: screen.S, i: int) -> str {
+    out = ""
+    for c in screen.line(s, i) { out += if c == 0 { "_" } else { utf8.from_code_point(c) } }
+    out
+}
+
+fn run_ops(r: int, c: int, ops: [screen.Op]) -> screen.S {
+    s = screen.new(r, c)
+    for o in ops { screen.step(&s, o.copy()) }
+    s
+}
+
+fn texts(t: str) -> [screen.Op] {
+    out: [screen.Op] = []
+    for i in 0..len(t) { out.push(screen.Write(byte_at(t, i), 1)) }
+    out
+}
+
+fn cat(a: [screen.Op], b: [screen.Op]) -> [screen.Op] {
+    out = a.copy()
+    for o in b { out.push(o.copy()) }
+    out
+}
+
+fn crlf() -> [screen.Op] { [screen.Cr, screen.Lf] }
+
+test "屏幕：和 VtScreen.lean 的 #guard 一样" {
+    s1 = run_ops(3, 5, cat(cat(texts("ab"), crlf()), texts("c")))
+    assert_eq(row_text(s1, 0), "ab   ")
+    assert_eq(row_text(s1, 1), "c    ")
+    assert_eq(s1.x, 1)
+    assert_eq(s1.y, 1)
+    // 写满最后一列：pend；下一个字先换行
+    s2 = run_ops(2, 3, texts("abc"))
+    assert_eq(s2.x, 2)
+    assert_eq(s2.pend, true)
+    s3 = run_ops(2, 3, texts("abcd"))
+    assert_eq(row_text(s3, 0), "abc")
+    assert_eq(row_text(s3, 1), "d  ")
+    // 在最后一行换行：往上滚
+    s4 = run_ops(2, 3, cat(cat(cat(cat(texts("a"), crlf()), texts("b")), crlf()), texts("c")))
+    assert_eq(row_text(s4, 0), "b  ")
+    assert_eq(row_text(s4, 1), "c  ")
+    // 宽字符；覆盖了右半，左半变成空格
+    s5 = run_ops(1, 4, [screen.Write(20013, 2)])
+    assert_eq(row_text(s5, 0), "中_  ")
+    assert_eq(s5.x, 2)
+    s6 = run_ops(1, 4, [screen.Write(20013, 2), screen.Cr, screen.Fwd(1), screen.Write(120, 1)])
+    assert_eq(row_text(s6, 0), " x  ")
+    // 宽字符在最后一列写不下：换到下一行
+    s7 = run_ops(2, 3, cat(texts("ab"), [screen.Write(20013, 2)]))
+    assert_eq(row_text(s7, 0), "ab ")
+    assert_eq(row_text(s7, 1), "中_ ")
+    // EL 0、ED 2、ICH、DCH
+    assert_eq(row_text(run_ops(1, 5, cat(texts("abcde"), [screen.Back(2), screen.El(0)])), 0), "ab   ")
+    s8 = run_ops(2, 3, cat(texts("abcd"), [screen.Ed(2)]))
+    assert_eq(row_text(s8, 0) + row_text(s8, 1), "      ")
+    assert_eq(row_text(run_ops(1, 5, cat(texts("abc"), [screen.Cr, screen.Fwd(1), screen.Ich(2)])), 0), "a  bc")
+    assert_eq(row_text(run_ops(1, 5, cat(texts("abcde"), [screen.Cr, screen.Fwd(1), screen.Dch(2)])), 0), "ade  ")
+    // 滚动区域第 2、3 行往上滚，第 1、4 行不动
+    ops = cat(cat(cat(cat(cat(cat(cat(texts("1"), crlf()), texts("2")), crlf()), texts("3")), crlf()), texts("4")), [screen.Stbm(2, 3), screen.Su(1)])
+    s9 = run_ops(4, 1, ops)
+    assert_eq(row_text(s9, 0) + row_text(s9, 1) + row_text(s9, 2) + row_text(s9, 3), "13 4")
+    // CUP
+    s10 = run_ops(3, 5, [screen.Cup(2, 3)])
+    assert_eq(s10.y, 1)
+    assert_eq(s10.x, 2)
+    s11 = run_ops(3, 5, [screen.Cup(99, 99)])
+    assert_eq(s11.y, 2)
+    assert_eq(s11.x, 4)
+}
+
+fn rand_op(inout r: rand.Rng) -> screen.Op {
+    k = r.range(0, 22)
+    n = r.range(0, 5)
+    m = r.range(0, 5)
+    if k < 4 { return screen.Write(97 + n, 1) }
+    if k < 6 { return screen.Write(20013 + n, 2) }
+    if k == 6 { return screen.Write(0x0301, 0) }
+    if k == 7 { return screen.Cr }
+    if k == 8 { return screen.Lf }
+    if k == 9 { return screen.Ri }
+    if k == 10 { return screen.Bs }
+    if k == 11 { return screen.Tab }
+    if k == 12 { return screen.Cup(n * 3, m * 3) }
+    if k == 13 { return if n < 2 { screen.Up(m) } else if n < 4 { screen.Down(m) } else { screen.Fwd(m) } }
+    if k == 14 { return screen.Back(m) }
+    if k == 15 { return screen.Ed(n) }
+    if k == 16 { return screen.El(n) }
+    if k == 17 { return if n < 2 { screen.Ech(m) } else if n < 4 { screen.Ich(m) } else { screen.Dch(m) } }
+    if k == 18 { return if n < 3 { screen.Il(m) } else { screen.Dl(m) } }
+    if k == 19 { return screen.Su(m) }
+    if k == 20 { return screen.Sd(m) }
+    screen.Stbm(n, m * 2)
+}
+
+test "屏幕：随机的操作，每一步以后都是好的（step_ok），滚动只动区域里的行（up_outside、down_outside）" {
+    r = rand.new(71)
+    wrong = 0
+    for _t in 0..200 {
+        nr = r.range(1, 7)
+        nc = r.range(1, 9)
+        s = screen.new(nr, nc)
+        steps = r.range(0, 60)
+        for _i in 0..steps {
+            o = rand_op(&r)
+            before = s.copy()
+            screen.step(&s, o.copy())
+            if !screen.ok(s) { wrong += 1 }
+            // SU / SD：区域外面的行不变
+            outside = match o {
+                Su(_) => true
+                Sd(_) => true
+                _ => false
+            }
+            if outside {
+                for i in 0..nr {
+                    if (i < before.top || i > before.bot) && row_text(s, i) != row_text(before, i) { wrong += 1 }
+                }
+            }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+fn feed_all(rows: int, cols: int, d: str) -> term.Term {
+    t = term.new(rows, cols)
+    term.feed(&t, d)
+    t
+}
+
+test "终端：字节流经过解析、解码、屏幕" {
+    t1 = feed_all(3, 6, "ab\r\ncd")
+    assert_eq(term.text(t1, 0), "ab    ")
+    assert_eq(term.text(t1, 1), "cd    ")
+    // 光标定位、擦除到行尾；颜色（SGR）不影响文字
+    t2 = feed_all(2, 5, "hello\x1b[1;3H\x1b[K\x1b[31mX\x1b[0m")
+    assert_eq(term.text(t2, 0), "heX  ")
+    // 中文：一个字符的三个字节分两段到
+    t3 = term.new(1, 6)
+    term.feed(&t3, "a\xe4\xb8")
+    term.feed(&t3, "\xadb")
+    assert_eq(term.text(t3, 0), "a中b  ")
+    // 坏字节是 U+FFFD；字符没凑齐就来了控制字符：先交出去
+    t4 = feed_all(1, 4, "\xe4\r")
+    assert_eq(term.text(t4, 0), "\xef\xbf\xbd   ")
+    // 换行到底：滚动；ED 2 清屏、CUP 回到左上角
+    t5 = feed_all(2, 3, "a\r\nb\r\nc")
+    assert_eq(term.text(t5, 0) + "|" + term.text(t5, 1), "b  |c  ")
+    t6 = feed_all(2, 3, "abc\x1b[2J\x1b[Hz")
+    assert_eq(term.text(t6, 0) + "|" + term.text(t6, 1), "z  |   ")
+    // 私有序列（隐藏光标）不动屏幕
+    t7 = feed_all(1, 3, "\x1b[?25lab")
+    assert_eq(term.text(t7, 0), "ab ")
+    // ESC M（反向换行）在第一行：往下滚
+    t8 = feed_all(2, 3, "ab\x1bM")
+    assert_eq(term.text(t8, 0) + "|" + term.text(t8, 1), "   |ab ")
+}
+
+// ---------- 阶段 4：颜色和样式（formal/Lark/VtSgr.lean） ----------
+
+// 从 s 开始走一个 CSI … m 的参数，结果 pack 成整数（样式比较都比 pack）
+fn ap(s: style.Sty, ps: [int]) -> int {
+    t = s.copy()
+    style.apply(&t, ps)
+    style.pack(t)
+}
+
+fn fgbg(fg: style.Color, bg: style.Color) -> style.Sty {
+    t = style.dflt()
+    t.fg = fg.copy()
+    t.bg = bg.copy()
+    t
+}
+
+fn xs(x: style.X) -> str {
+    match x {
+        Plain => "plain"
+        Pick(fg) => "pick #{fg}"
+        Index(fg) => "index #{fg}"
+        Red(fg) => "red #{fg}"
+        Green(fg, r) => "green #{fg} #{r}"
+        Blue(fg, r, g) => "blue #{fg} #{r} #{g}"
+        Dead => "dead"
+    }
+}
+
+test "样式：和 VtSgr.lean 的 #guard 一样" {
+    d = style.dflt()
+    z = style.pack(d)
+    assert_eq(z, 0)
+    b1 = fgbg(style.Idx(1), style.Dflt)
+    b1.bold = true
+    assert_eq(ap(d, [1, 31]), style.pack(b1))
+    assert_eq(ap(d, [38, 5, 208]), style.pack(fgbg(style.Idx(208), style.Dflt)))
+    u = fgbg(style.Dflt, style.Rgb(1, 2, 3))
+    u.under = true
+    assert_eq(ap(d, [48, 2, 1, 2, 3, 4]), style.pack(u))
+    // 超出范围的下标：不改；写坏的扩展色：后面的参数都不管
+    assert_eq(ap(d, [38, 5, 300]), z)
+    assert_eq(ap(d, [38, 7, 1]), z)
+    // 复位；22 同时去掉粗体和暗淡；亮色；默认色
+    empty: [int] = []
+    assert_eq(ap(b1, empty), z)
+    bd = style.dflt()
+    bd.bold = true
+    bd.dim = true
+    assert_eq(ap(bd, [22]), z)
+    assert_eq(ap(d, [90, 107]), style.pack(fgbg(style.Idx(8), style.Idx(15))))
+    assert_eq(ap(fgbg(style.Idx(3), style.Dflt), [39]), z)
+    // 分两段走：读了一半的扩展色记着
+    s1 = style.dflt()
+    x1 = style.Plain
+    style.run(&s1, &x1, [38, 2])
+    assert_eq(xs(x1), "red true")
+    style.run(&s1, &x1, [10])
+    style.run(&s1, &x1, [20, 30])
+    assert_eq(style.pack(s1), style.pack(fgbg(style.Rgb(10, 20, 30), style.Dflt)))
+    assert_eq(xs(x1), "plain")
+}
+
+// 偏向 SGR 里有意思的参数
+fn rand_param(inout r: rand.Rng) -> int {
+    pool = [0, 1, 2, 3, 4, 5, 7, 8, 9, 22, 23, 24, 25, 27, 28, 29, 31, 37, 38, 38, 39, 41, 48, 48, 49, 90, 97, 100, 107, 255, 256, 2, 5]
+    k = r.range(0, len(pool) + 6)
+    if k < len(pool) { return pool[k] }
+    r.range(0, 400)
+}
+
+fn first_n(l: [int], n: int) -> [int] {
+    out: [int] = []
+    for i in 0..len(l) {
+        if i < n { out.push(l[i]) }
+    }
+    out
+}
+
+fn skip_n(l: [int], n: int) -> [int] {
+    out: [int] = []
+    for i in 0..len(l) {
+        if i >= n { out.push(l[i]) }
+    }
+    out
+}
+
+test "样式：随机的参数，颜色总在范围里（step_ok），分两段一样（run_append），pack 和 sgr 来回一样" {
+    r = rand.new(83)
+    wrong = 0
+    for _t in 0..500 {
+        n = r.range(0, 14)
+        ps: [int] = []
+        for _i in 0..n { ps.push(rand_param(&r)) }
+        // 一个一个走，每一步都是好的
+        s = style.dflt()
+        x = style.Plain
+        for p in ps {
+            nx = style.step(&s, x, p)
+            x = nx
+            if !style.ok(s) { wrong += 1 }
+        }
+        // 分两段走
+        k = r.range(0, n + 1)
+        s2 = style.dflt()
+        x2 = style.Plain
+        style.run(&s2, &x2, first_n(ps, k))
+        style.run(&s2, &x2, skip_n(ps, k))
+        if style.pack(s2) != style.pack(s) || xs(x2) != xs(x) { wrong += 1 }
+        // pack / unpack
+        v = style.pack(s)
+        if style.pack(style.unpack(v)) != v { wrong += 1 }
+        // sgr 写出来的序列再解析、再走一遍：同一个样式
+        p = parse.new()
+        got = -1
+        for a in parse.run(&p, style.sgr(s)) {
+            match a {
+                Csi(qs, _, f) => { if f == 0x6D { got = ap(style.dflt(), qs) } }
+                _ => {}
+            }
+        }
+        if got != v { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "样式：屏幕上的样式跟着字走（写、滚动、插入、删除、擦除）" {
+    r = rand.new(97)
+    wrong = 0
+    for _t in 0..200 {
+        nr = r.range(1, 7)
+        nc = r.range(1, 9)
+        s = screen.new(nr, nc)
+        steps = r.range(0, 60)
+        for _i in 0..steps {
+            o = rand_op(&r)
+            // 每个字用它自己的码点当样式，之后看样式是不是还跟着它
+            pen = match o {
+                Write(c, _) => c
+                _ => -1
+            }
+            if pen >= 0 { screen.step(&s, screen.Pen(pen)) }
+            screen.step(&s, o.copy())
+            if !screen.ok(s) { wrong += 1 }
+            for i in 0..nr {
+                cs = screen.row(s, i)
+                ss = screen.srow(s, i)
+                for j in 0..nc {
+                    v = cs[j]
+                    if v == screen.SPACER {
+                        if j == 0 || ss[j] != screen.wide_ch(cs[j - 1]) { wrong += 1 }
+                    } else if v != screen.BLANK && ss[j] != screen.cell_ch(v) {
+                        wrong += 1
+                    }
+                }
+            }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "终端：SGR 改之后写的字的样式" {
+    t1 = feed_all(1, 6, "\x1b[1;31mA\x1b[0mB\x1b[38;2;1;2;3mC")
+    assert_eq(term.text(t1, 0), "ABC   ")
+    b1 = fgbg(style.Idx(1), style.Dflt)
+    b1.bold = true
+    ss = screen.srow(t1.m.scr, 0)
+    assert_eq(ss[0], style.pack(b1))
+    assert_eq(ss[1], 0)
+    assert_eq(ss[2], style.pack(fgbg(style.Rgb(1, 2, 3), style.Dflt)))
+    assert_eq(ss[3], 0)
+    // 带着颜色写出来
+    t2 = feed_all(1, 10, "\x1b[1;31mred\x1b[0m ok")
+    assert_eq(term.ansi(t2, 0), "\x1b[0;1;31mred\x1b[0m ok    ")
+    assert_eq(term.ansi(feed_all(1, 3, "\x1b[44mab"), 0), "\x1b[0;44mab\x1b[0m ")
+    assert_eq(term.ansi(feed_all(1, 2, "\x1b[38;5;208m中"), 0), "\x1b[0;38;5;208m中\x1b[0m")
+    // 擦掉的格子是默认样式；滚上去的行带着样式；ESC c 复位样式
+    t3 = feed_all(2, 3, "\r\n\x1b[32mab\x1b[2;2H\x1b[K\n")
+    assert_eq(term.text(t3, 0), "a  ")
+    assert_eq(screen.srow(t3.m.scr, 0)[0], style.pack(fgbg(style.Idx(2), style.Dflt)))
+    assert_eq(screen.srow(t3.m.scr, 0)[1], 0)
+    t4 = feed_all(1, 2, "\x1b[31m\x1bcx")
+    assert_eq(screen.srow(t4.m.scr, 0)[0], 0)
+}
+
+// ---------- 阶段 5：模式、备用屏幕、保存光标（formal/Lark/VtMode.lean） ----------
+
+fn mrun(r: int, c: int, ops: [mode.Op]) -> mode.M {
+    t = mode.new(r, c)
+    for o in ops { mode.step(&t, o.copy()) }
+    t
+}
+
+fn ws(s: str) -> [mode.Op] {
+    out: [mode.Op] = []
+    for i in 0..len(s) { out.push(mode.Scr(screen.Write(byte_at(s, i), 1))) }
+    out
+}
+
+fn mcat(a: [mode.Op], b: [mode.Op]) -> [mode.Op] {
+    out = a.copy()
+    for o in b { out.push(o.copy()) }
+    out
+}
+
+test "模式：和 VtMode.lean 的 #guard 一样" {
+    // 关掉自动换行：写到最后一列以后都写在最后一列上
+    t1 = mrun(2, 3, mcat([mode.Mode(7, false)], ws("abcd")))
+    assert_eq(row_text(t1.scr, 0), "abd")
+    assert_eq(row_text(t1.scr, 1), "   ")
+    assert_eq(t1.scr.x, 2)
+    t1b = mrun(2, 3, ws("abcd"))
+    assert_eq(row_text(t1b.scr, 1), "d  ")
+    // 备用屏幕：进去是空的、光标不动；出来主屏幕原样回来
+    t2 = mrun(1, 3, mcat(mcat(ws("ab"), [mode.Mode(1049, true)]), ws("x")))
+    assert_eq(row_text(t2.scr, 0), "  x")
+    assert_eq(mode.in_alt(t2), true)
+    t3 = mrun(1, 3, mcat(mcat(mcat(ws("ab"), [mode.Mode(1049, true)]), ws("xyz")), [mode.Scr(screen.Ed(2)), mode.Mode(1049, false)]))
+    assert_eq(row_text(t3.scr, 0), "ab ")
+    assert_eq(t3.scr.x, 2)
+    assert_eq(mode.in_alt(t3), false)
+    // 重复进去不会把备用屏幕当成主屏幕存起来；不在里面时出来不动
+    t4 = mrun(1, 3, mcat(mcat(mcat(ws("ab"), [mode.Mode(47, true)]), ws("x")), [mode.Mode(1047, true), mode.Mode(1049, false)]))
+    assert_eq(row_text(t4.scr, 0), "ab ")
+    t5 = mrun(1, 3, mcat(ws("ab"), [mode.Mode(1049, false)]))
+    assert_eq(row_text(t5.scr, 0), "ab ")
+    assert_eq(mode.in_alt(t5), false)
+    // 保存、恢复光标
+    t6 = mrun(2, 3, mcat(ws("ab"), [mode.Save, mode.Scr(screen.Cup(2, 1)), mode.Restore]))
+    assert_eq(t6.scr.x, 2)
+    assert_eq(t6.scr.y, 0)
+    // 光标、括号粘贴；不认识的模式不动
+    t7 = mrun(1, 1, [mode.Mode(25, false), mode.Mode(2004, true), mode.Mode(12345, false)])
+    assert_eq(t7.tcem, false)
+    assert_eq(t7.paste, true)
+    assert_eq(t7.awm, true)
+}
+
+// 两个屏幕一模一样：字、样式、光标、pend、滚动区域
+fn same_scr(a: screen.S, b: screen.S) -> bool {
+    if a.rows != b.rows || a.cols != b.cols || a.x != b.x || a.y != b.y || a.pend != b.pend || a.top != b.top || a.bot != b.bot { return false }
+    for i in 0..len(a.cells) {
+        if a.cells[i] != b.cells[i] || a.sty[i] != b.sty[i] { return false }
+    }
+    true
+}
+
+// alt：要不要切换屏幕的模式
+fn rand_mop(inout r: rand.Rng, alt: bool) -> mode.Op {
+    k = r.range(0, 10)
+    on = r.range(0, 2) == 0
+    if k == 0 {
+        ms = [7, 25, 2004, 6, 12345]
+        return mode.Mode(ms[r.range(0, len(ms))], on)
+    }
+    if k == 1 && alt {
+        ms = [47, 1047, 1049]
+        return mode.Mode(ms[r.range(0, len(ms))], on)
+    }
+    if k == 2 { return mode.Save }
+    if k == 3 { return mode.Restore }
+    mode.Scr(rand_op(&r))
+}
+
+test "模式：随机的操作都是好的（step_ok），备用屏幕出来主屏幕原样回来（alt_restore），不换行（nowrap_y）" {
+    r = rand.new(113)
+    wrong = 0
+    for _t in 0..200 {
+        nr = r.range(1, 7)
+        nc = r.range(1, 9)
+        t = mode.new(nr, nc)
+        k1 = r.range(0, 40)
+        for _i in 0..k1 {
+            o = rand_mop(&r, true)
+            // 自动换行关掉时写字：还在这一行
+            y0 = t.scr.y
+            nowrap = match o {
+                Scr(so) => {
+                    match so {
+                        Write(_, _) => !t.awm
+                        _ => false
+                    }
+                }
+                _ => false
+            }
+            mode.step(&t, o.copy())
+            if !mode.ok(t) { wrong += 1 }
+            if nowrap && t.scr.y != y0 { wrong += 1 }
+        }
+        // 从主屏幕进去，做一些不切换屏幕的操作，再出来
+        if !mode.in_alt(t) {
+            before = t.scr.copy()
+            mode.step(&t, mode.Mode(1049, true))
+            k2 = r.range(0, 40)
+            for _i in 0..k2 {
+                mode.step(&t, rand_mop(&r, false))
+                if !mode.ok(t) { wrong += 1 }
+            }
+            mode.step(&t, mode.Mode(1049, false))
+            if !same_scr(t.scr, before) { wrong += 1 }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "终端：模式、备用屏幕、保存光标的序列" {
+    // vim 这样的程序：进备用屏幕、画东西、退出；原来的内容和光标回来
+    t1 = feed_all(2, 4, "$ vi\r\n\x1b[?1049h\x1b[2J\x1b[Hfile\x1b[?1049l")
+    assert_eq(term.text(t1, 0) + "|" + term.text(t1, 1), "$ vi|    ")
+    assert_eq(t1.m.scr.x, 0)
+    assert_eq(t1.m.scr.y, 1)
+    // 在备用屏幕里
+    t2 = feed_all(1, 4, "ab\x1b[?1049hc")
+    assert_eq(term.text(t2, 0), "  c ")
+    // 关掉自动换行；一次设好几个模式
+    t3 = feed_all(2, 3, "\x1b[?7;25labcd")
+    assert_eq(term.text(t3, 0) + "|" + term.text(t3, 1), "abd|   ")
+    assert_eq(t3.m.tcem, false)
+    t3b = feed_all(1, 1, "\x1b[?2004h")
+    assert_eq(t3b.m.paste, true)
+    // ESC 7 / ESC 8、CSI s / CSI u
+    t4 = feed_all(2, 4, "ab\x1b7\x1b[2;1Hx\x1b8y")
+    assert_eq(term.text(t4, 0) + "|" + term.text(t4, 1), "aby |x   ")
+    t5 = feed_all(1, 4, "a\x1b[s\x1b[3Gz\x1b[ub")
+    assert_eq(term.text(t5, 0), "abz ")
+    // 备用屏幕里写字用的样式出来以后还是现在的样式
+    t6 = feed_all(1, 3, "\x1b[?1049h\x1b[31m\x1b[?1049lx")
+    assert_eq(screen.srow(t6.m.scr, 0)[0], style.pack(fgbg(style.Idx(1), style.Dflt)))
+    // ESC c 复位模式
+    t7 = feed_all(1, 3, "\x1b[?7l\x1b[?1049h\x1bc")
+    assert_eq(t7.m.awm, true)
+    assert_eq(mode.in_alt(t7.m), false)
+}
+
+// ---------- 阶段 6：滚动缓冲、改大小（formal/Lark/VtSb.lean） ----------
+
+// 一行格子写成字符串（和 row_text 一样，宽字符的右半写成 _）
+fn cells_text(r: [int]) -> str {
+    out = ""
+    for v in r {
+        c = screen.cell_ch(v)
+        out += if c == 0 { "_" } else { utf8.from_code_point(c) }
+    }
+    out
+}
+
+fn rows_text(rs: [[int]]) -> str {
+    out = ""
+    for i in 0..len(rs) {
+        if i > 0 { out += "|" }
+        out += cells_text(rs[i])
+    }
+    out
+}
+
+fn screen_text(s: screen.S) -> str {
+    out = ""
+    for i in 0..s.rows {
+        if i > 0 { out += "|" }
+        out += row_text(s, i)
+    }
+    out
+}
+
+fn sb_text(s: screen.S) -> str { rows_text(s.out) }
+
+test "滚动缓冲、改大小：和 VtSb.lean 的 #guard 一样" {
+    // 两行的屏幕写了两行：往上滚 1 行时滚出去的是 "a"
+    s1 = run_ops(2, 2, cat(cat(texts("a"), crlf()), texts("b")))
+    screen.step(&s1, screen.Su(1))
+    assert_eq(sb_text(s1), "a ")
+    assert_eq(screen_text(s1), "b |  ")
+    // 缓冲满了丢最旧的
+    l: [[int]] = [[1], [2], [3], [4]]
+    k1 = mode.keep(l, 2)
+    assert_eq(len(k1), 2)
+    assert_eq(k1[0][0], 3)
+    assert_eq(k1[1][0], 4)
+    assert_eq(len(mode.keep(l, 5)), 4)
+    // 改窄：截断；宽字符被切开，剩下的一半变成空格；改宽：补空格
+    s2 = run_ops(1, 4, texts("abcd"))
+    screen.resize(&s2, 1, 2)
+    assert_eq(row_text(s2, 0), "ab")
+    assert_eq(s2.x, 1)
+    s3 = run_ops(1, 4, cat(texts("a"), [screen.Write(20013, 2)]))
+    screen.resize(&s3, 1, 2)
+    assert_eq(row_text(s3, 0), "a ")
+    s4 = run_ops(1, 2, texts("ab"))
+    screen.resize(&s4, 2, 4)
+    assert_eq(screen_text(s4), "ab  |    ")
+    // 行数变少、光标在最后一行：顶上的行挪进滚动缓冲，光标那一行留在屏幕上
+    s5 = run_ops(2, 2, cat(cat(texts("a"), crlf()), texts("b")))
+    screen.resize(&s5, 1, 2)
+    assert_eq(sb_text(s5), "a ")
+    assert_eq(row_text(s5, 0), "b ")
+    assert_eq(s5.y, 0)
+    // 光标在第一行：不挪，只截掉下面的行
+    s6 = run_ops(2, 2, cat(cat(cat(texts("a"), crlf()), texts("b")), [screen.Cup(1, 1)]))
+    screen.resize(&s6, 1, 2)
+    assert_eq(len(s6.out), 0)
+    assert_eq(row_text(s6, 0), "a ")
+}
+
+fn blanks(c: int) -> str {
+    out = ""
+    for _i in 0..c { out += " " }
+    out
+}
+
+test "滚动缓冲、改大小：随机的屏幕（up_keep、resize_ok、resize_cur、resize_lost）" {
+    r = rand.new(131)
+    wrong = 0
+    for _t in 0..300 {
+        nr = r.range(1, 7)
+        nc = r.range(1, 9)
+        s = screen.new(nr, nc)
+        k = r.range(0, 40)
+        for _i in 0..k { screen.step(&s, rand_op(&r)) }
+        // 滚动区域变回整个屏幕，清掉之前记下的行
+        screen.step(&s, screen.Stbm(0, 0))
+        _x, _y = screen.take_out(&s)
+        // 往上滚 n 行：滚出去的行接上滚动以后的屏幕 = 滚动以前的屏幕接上 n 个空行
+        n = r.range(1, nr + 1)
+        before = screen_text(s)
+        want = before
+        for _i in 0..n { want += "|" + blanks(nc) }
+        screen.step(&s, screen.Su(n))
+        if sb_text(s) + "|" + screen_text(s) != want { wrong += 1 }
+        _a, _b = screen.take_out(&s)
+        // 改大小
+        r2 = r.range(1, 7)
+        c2 = r.range(1, 9)
+        old = s.copy()
+        cutn = screen.cut(old, r2)
+        screen.resize(&s, r2, c2)
+        if !screen.ok(s) { wrong += 1 }
+        // 光标那一行还在光标所在的地方
+        if row_text(s, s.y) != cells_text(screen.row_fix(c2, screen.row(old, old.y))) { wrong += 1 }
+        // 挪走的是顶上的 cut 行
+        if len(s.out) != cutn { wrong += 1 }
+        for i in 0..len(s.out) {
+            if cells_text(s.out[i]) != row_text(old, i) { wrong += 1 }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "滚动缓冲、改大小：随机的终端操作，缓冲不超过 cap，屏幕都是好的（keep_len、resizeT_ok）" {
+    r = rand.new(137)
+    wrong = 0
+    for _t in 0..200 {
+        t = mode.new(r.range(1, 7), r.range(1, 9))
+        t.cap = r.range(0, 6)
+        k = r.range(0, 60)
+        for _i in 0..k {
+            if r.range(0, 10) == 0 {
+                mode.resize(&t, r.range(1, 7), r.range(1, 9))
+            } else {
+                mode.step(&t, rand_mop(&r, true))
+            }
+            if !mode.ok(t) { wrong += 1 }
+            if mode.sb_len(t) > t.cap || len(t.sb) != len(t.sbs) { wrong += 1 }
+            if len(t.scr.out) != 0 { wrong += 1 }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "终端：滚动缓冲和改大小" {
+    // 滚出屏幕的行按顺序进滚动缓冲
+    t1 = feed_all(2, 3, "a\r\nb\r\nc\r\nd")
+    assert_eq(join_lines(term.history(t1)), "a  |b  ")
+    assert_eq(term.text(t1, 0) + "|" + term.text(t1, 1), "c  |d  ")
+    // 备用屏幕上滚出去的行不进历史
+    t2 = feed_all(2, 3, "x\x1b[?1049h1\r\n2\r\n3\r\n\x1b[?1049l")
+    assert_eq(len(term.history(t2)), 0)
+    assert_eq(term.text(t2, 0), "x  ")
+    // 滚动区域不从顶上开始时不进历史（从顶上开始的见阶段 11）
+    t3 = feed_all(3, 3, "\x1b[2;3r\x1b[3;1Ha\r\nb\r\n")
+    assert_eq(len(term.history(t3)), 0)
+    // 改大小：行数变少时顶上的行进历史
+    t4 = feed_all(3, 4, "a\r\nb\r\nc")
+    term.resize(&t4, 1, 2)
+    assert_eq(join_lines(term.history(t4)), "a   |b   ")
+    assert_eq(term.text(t4, 0), "c ")
+    // 在备用屏幕上改大小：存着的主屏幕也改，出来以后是新的大小
+    t5 = feed_all(2, 4, "ab\r\ncd\x1b[?1049h")
+    term.resize(&t5, 1, 3)
+    term.feed(&t5, "\x1b[?1049l")
+    assert_eq(term.text(t5, 0), "cd ")
+    assert_eq(join_lines(term.history(t5)), "ab  ")
+    // 缓冲满了丢最旧的
+    t6 = term.new(1, 2)
+    t6.m.cap = 2
+    term.feed(&t6, "1\r\n2\r\n3\r\n4")
+    assert_eq(join_lines(term.history(t6)), "2 |3 ")
+}
+
+fn join_lines(xs: [str]) -> str {
+    out = ""
+    for i in 0..len(xs) {
+        if i > 0 { out += "|" }
+        out += xs[i]
+    }
+    out
+}
+
+// ---------- 阶段 7：只画变了的地方（formal/Lark/VtDraw.lean） ----------
+
+fn feq(a: draw.F, b: draw.F) -> bool {
+    if a.rows != b.rows || a.cols != b.cols { return false }
+    for i in 0..a.rows {
+        if len(a.cells[i]) != len(b.cells[i]) || len(a.sty[i]) != len(b.sty[i]) { return false }
+        for j in 0..len(a.cells[i]) {
+            if a.cells[i][j] != b.cells[i][j] || a.sty[i][j] != b.sty[i][j] { return false }
+        }
+    }
+    true
+}
+
+fn fr(rows: [[int]]) -> draw.F {
+    ss: [[int]] = []
+    for r in rows {
+        z: [int] = []
+        for _v in r { z.push(0) }
+        ss.push(z)
+    }
+    c = if len(rows) > 0 { len(rows[0]) } else { 0 }
+    draw.F(cells: rows.copy(), sty: ss, rows: len(rows), cols: c)
+}
+
+test "画屏幕：和 VtDraw.lean 的 #guard 一样" {
+    z: [int] = [0, 0, 0]
+    assert_eq(draw.pre([1, 2, 3], z, [1, 2, 4], z), 2)
+    o = fr([[1, 2, 3], [4, 5]])
+    n = fr([[1, 9, 3], [4, 5]])
+    d1 = draw.diff(o, n)
+    assert_eq(len(d1), 1)
+    assert_eq(d1[0].row, 0)
+    assert_eq(d1[0].col, 1)
+    assert_eq(len(d1[0].cells), 2)
+    assert_eq(d1[0].cells[0], 9)
+    assert_eq(d1[0].cells[1], 3)
+    assert_eq(feq(draw.apply(o, d1), n), true)
+    d2 = draw.diff(fr([[1, 2, 3]]), fr([[1, 2, 7]]))
+    assert_eq(d2[0].col, 2)
+    assert_eq(len(d2[0].cells), 1)
+    assert_eq(d2[0].cells[0], 7)
+    assert_eq(len(draw.diff(o, o)), 0)
+    // 样式不一样也要画
+    o2 = fr([[1, 2]])
+    n2 = fr([[1, 2]])
+    n2.sty[0][1] = 5
+    d3 = draw.diff(o2, n2)
+    assert_eq(d3[0].col, 1)
+    // 开始的那一格是宽字符的右半：退回到左半（applyRow_le）
+    w = screen.wide(20013)
+    d4 = draw.diff(fr([[w, screen.SPACER, 32]]), fr([[w, screen.SPACER, 120]]))
+    assert_eq(d4[0].col, 2)
+    d5 = draw.diff(fr([[w, screen.SPACER]]), fr([[w, screen.SPACER]]))
+    assert_eq(len(d5), 0)
+    d6 = draw.diff(fr([[32, w, screen.SPACER]]), fr([[32, screen.wide(20014), screen.SPACER]]))
+    assert_eq(d6[0].col, 1)
+    d7 = draw.diff(fr([[w, 97]]), fr([[w, screen.SPACER]]))
+    assert_eq(d7[0].col, 0)
+    assert_eq(feq(draw.apply(fr([[w, 97]]), d7), fr([[w, screen.SPACER]])), true)
+}
+
+// 随机的屏幕，写字时换着用几个样式
+fn rand_screen(inout r: rand.Rng, nr: int, nc: int) -> screen.S {
+    b = style.dflt()
+    b.bold = true
+    pens = [0, style.pack(fgbg(style.Idx(1), style.Dflt)), style.pack(b), style.pack(fgbg(style.Rgb(1, 2, 3), style.Idx(200)))]
+    s = screen.new(nr, nc)
+    k = r.range(0, 50)
+    for _i in 0..k {
+        o = rand_op(&r)
+        if r.range(0, 3) == 0 { screen.step(&s, screen.Pen(pens[r.range(0, len(pens))])) }
+        screen.step(&s, o)
+    }
+    s
+}
+
+test "画屏幕：随机的两帧，执行 diff 出来的命令得到新的一帧（draw_ok），没变时不画（diff_same），画出去的不比一行多（cost_le）" {
+    r = rand.new(149)
+    wrong = 0
+    for _t in 0..300 {
+        nr = r.range(1, 6)
+        nc = r.range(1, 8)
+        s1 = rand_screen(&r, nr, nc)
+        o = draw.frame(s1)
+        // 新的一帧：在旧的屏幕上接着做一些操作（像真的程序那样一点一点改）
+        s2 = s1.copy()
+        k = r.range(0, 8)
+        for _i in 0..k { screen.step(&s2, rand_op(&r)) }
+        n = draw.frame(s2)
+        d = draw.diff(o, n)
+        if !feq(draw.apply(o, d), n) { wrong += 1 }
+        if len(draw.diff(n, n)) != 0 { wrong += 1 }
+        for c in d {
+            if len(c.cells) > nc || len(c.cells) != len(c.sty) { wrong += 1 }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "画屏幕：画出去的转义序列喂给我们自己的终端，得到同样的画面和光标" {
+    r = rand.new(151)
+    wrong = 0
+    for _t in 0..200 {
+        nr = r.range(1, 6)
+        nc = r.range(2, 8)
+        s1 = rand_screen(&r, nr, nc)
+        s2 = rand_screen(&r, nr, nc)
+        o = draw.frame(s1)
+        n = draw.frame(s2)
+        // 先整个画旧的一帧，再画 diff
+        e = term.new(nr, nc)
+        prev: draw.F? = None
+        term.feed(&e, draw.update(prev, o, s1.x, s1.y, true))
+        if !feq(draw.frame(e.m.scr), o) { wrong += 1 }
+        term.feed(&e, draw.update(Some(o.copy()), n, s2.x, s2.y, false))
+        if !feq(draw.frame(e.m.scr), n) { wrong += 1 }
+        if e.m.scr.x != s2.x || e.m.scr.y != s2.y || e.m.tcem { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}
+
+// ---------- 阶段 8：翻看滚动缓冲（formal/Lark/VtView.lean） ----------
+
+fn win_text(f: draw.F) -> str { rows_text(f.cells) }
+
+test "翻看：和 VtView.lean 的 #guard 一样" {
+    // 缓冲 1 2 3，屏幕 4 5
+    t = feed_all(2, 1, "1\r\n2\r\n3\r\n4\r\n5")
+    assert_eq(join_lines(term.history(t)), "1|2|3")
+    assert_eq(win_text(view.window(t.m, 0)), "4|5")
+    assert_eq(win_text(view.window(t.m, 1)), "3|4")
+    assert_eq(win_text(view.window(t.m, 3)), "1|2")
+    // 翻过头：停在最上面
+    assert_eq(win_text(view.window(t.m, 9)), "1|2")
+    assert_eq(view.up(3, 5, 1), 3)
+    assert_eq(view.down(2, view.up(3, 2, 1)), 1)
+    // 缓冲是空的
+    t2 = feed_all(2, 1, "4\r\n5")
+    assert_eq(win_text(view.window(t2.m, 7)), "4|5")
+    // 缓冲比屏幕短：下面接着屏幕的开头
+    t3 = feed_all(3, 1, "1\r\n4\r\n5\r\n6")
+    assert_eq(win_text(view.window(t3.m, 1)), "1|4|5")
+}
+
+test "翻看：随机的缓冲和翻的行数（view_len、view_zero、view_sub、up_down）" {
+    r = rand.new(157)
+    wrong = 0
+    for _t in 0..200 {
+        nr = r.range(1, 6)
+        nc = r.range(1, 6)
+        t = term.new(nr, nc)
+        k = r.range(0, 15)
+        for i in 0..k { term.feed(&t, "#{i % 10}\r\n") }
+        nsb = mode.sb_len(t.m)
+        // 历史：缓冲 ++ 屏幕
+        hist: [str] = []
+        for i in 0..nsb { hist.push(cells_text(mode.sb_row(t.m, i))) }
+        for i in 0..nr { hist.push(row_text(t.m.scr, i)) }
+        if !feq(view.window(t.m, 0), draw.frame(t.m.scr)) { wrong += 1 }
+        off = r.range(0, nsb + 4)
+        w = view.window(t.m, off)
+        if w.rows != nr || len(w.cells) != nr { wrong += 1 }
+        start = nsb - view.clamp(nsb, off)
+        for i in 0..nr {
+            if cells_text(w.cells[i]) != hist[start + i] { wrong += 1 }
+        }
+        n = r.range(0, 5)
+        if off + n <= nsb && view.down(n, view.up(nsb, n, off)) != off { wrong += 1 }
+        if view.up(nsb, n, off) > nsb { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "翻看：按键和右上角的标记" {
+    v = view.new()
+    assert_eq(view.keys(&v, "ab", 5, 2), "ab")
+    assert_eq(view.keys(&v, "\x1d[", 5, 2), "")
+    assert_eq(v.view, true)
+    // 翻看时按键不交给 shell
+    assert_eq(view.keys(&v, "kkk", 5, 2), "")
+    assert_eq(v.off, 3)
+    _a = view.keys(&v, "j", 5, 2)
+    assert_eq(v.off, 2)
+    _b = view.keys(&v, "g", 5, 2)
+    assert_eq(v.off, 5)
+    _c = view.keys(&v, "G", 5, 2)
+    assert_eq(v.off, 0)
+    _d = view.keys(&v, "b\x1b[A", 5, 2)
+    assert_eq(v.off, 3)
+    _e = view.keys(&v, "\x1b[6~", 5, 2)
+    assert_eq(v.off, 1)
+    _f = view.keys(&v, "\x1b[1;5Ck", 5, 2)
+    assert_eq(v.off, 2)
+    assert_eq(view.keys(&v, "qx", 5, 2), "x")
+    assert_eq(v.view, false)
+    assert_eq(v.off, 0)
+    // 单独一个 Esc 也回去
+    _g = view.keys(&v, "\x1d[k", 5, 2)
+    _h = view.keys(&v, "\x1b", 5, 2)
+    assert_eq(v.view, false)
+    // Ctrl-] Ctrl-] 交给 shell 一个；Ctrl-] 后面跟别的键，两个都交给 shell；前缀可以跨两段
+    assert_eq(view.keys(&v, "\x1d\x1d", 5, 2), "\x1d")
+    assert_eq(view.keys(&v, "\x1dx", 5, 2), "\x1dx")
+    assert_eq(view.keys(&v, "\x1d", 5, 2), "")
+    assert_eq(view.keys(&v, "[", 5, 2), "")
+    assert_eq(v.view, true)
+    // 右上角的标记：反显
+    f = view.mark(draw.frame(screen.new(1, 8)), 2, 5)
+    assert_eq(cells_text(f.cells[0]), "   [2/5]")
+    inv = style.dflt()
+    inv.inverse = true
+    assert_eq(f.sty[0][7], style.pack(inv))
+    assert_eq(f.sty[0][0], 0)
+    // 放不下就不写
+    f2 = view.mark(draw.frame(screen.new(1, 3)), 2, 5)
+    assert_eq(cells_text(f2.cells[0]), "   ")
+}
+
+// ---------- 阶段 9：回答终端查询（formal/Lark/VtReply.lean） ----------
+
+fn acts_of(d: str) -> str {
+    p = parse.new()
+    out = ""
+    for a in parse.run(&p, d) { out += parse.show(a) + ";" }
+    out
+}
+
+test "回答：和 VtReply.lean 的 #guard 一样" {
+    assert_eq(term.dsr(0, 0), "\x1b[1;1R")
+    assert_eq(term.dsr(23, 79), "\x1b[24;80R")
+    // 回答交给解析器：正好一个 CSI [行, 列] R（dsr_parse）
+    p = parse.new()
+    got = parse.run(&p, term.dsr(4, 11))
+    assert_eq(len(got), 1)
+    ok = match got[0] {
+        Csi(ps, inter, f) => len(ps) == 2 && ps[0] == 5 && ps[1] == 12 && len(inter) == 0 && f == 0x52
+        _ => false
+    }
+    assert_eq(ok, true)
+}
+
+test "回答：随机的光标位置，回答解析回来是同一个位置（dsr_parse）" {
+    r = rand.new(163)
+    wrong = 0
+    for _t in 0..300 {
+        y = r.range(0, 70000)
+        x = r.range(0, 70000)
+        p = parse.new()
+        got = parse.run(&p, term.dsr(y, x))
+        if len(got) != 1 { wrong += 1 }
+        for a in got {
+            match a {
+                Csi(ps, inter, f) => {
+                    // 解析器的参数最多 65535（maxParam）
+                    wy = if y + 1 > 65535 { 65535 } else { y + 1 }
+                    wx = if x + 1 > 65535 { 65535 } else { x + 1 }
+                    if len(ps) != 2 || ps[0] != wy || ps[1] != wx || len(inter) != 0 || f != 0x52 { wrong += 1 }
+                }
+                _ => { wrong += 1 }
+            }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "终端：回答查询、方向键和小键盘的模式" {
+    // 光标位置（从 1 开始）
+    t1 = feed_all(5, 10, "ab\r\ncde\x1b[6n")
+    assert_eq(term.take_reply(&t1), "\x1b[2;4R")
+    assert_eq(term.take_reply(&t1), "")
+    // 状态、DA1、DA2；不认识的不回答
+    t2 = feed_all(2, 2, "\x1b[5n\x1b[c\x1b[0c\x1b[>c\x1b[7n\x1b[1c")
+    assert_eq(term.take_reply(&t2), "\x1b[0n\x1b[?1;2c\x1b[?1;2c\x1b[>0;10;1c")
+    // 查询不动屏幕
+    assert_eq(term.text(t2, 0), "  ")
+    // 几个查询连在一起、跨两段到
+    t3 = term.new(3, 3)
+    term.feed(&t3, "\x1b[3;2H\x1b[")
+    term.feed(&t3, "6n")
+    assert_eq(term.take_reply(&t3), "\x1b[3;2R")
+    // 方向键、小键盘的模式；ESC c 复位
+    t4 = feed_all(1, 1, "\x1b[?1h\x1b=")
+    assert_eq(t4.ckm, true)
+    assert_eq(t4.kpam, true)
+    term.feed(&t4, "\x1b[?1l\x1b>")
+    assert_eq(t4.ckm, false)
+    assert_eq(t4.kpam, false)
+    term.feed(&t4, "\x1b[?1h\x1b=\x1bc")
+    assert_eq(t4.ckm, false)
+    assert_eq(t4.kpam, false)
+    // ?1 和别的模式写在一起
+    t5 = feed_all(1, 3, "\x1b[?1;7lab\x1b[?1;2004h")
+    assert_eq(t5.ckm, true)
+    assert_eq(t5.m.paste, true)
+    assert_eq(t5.m.awm, false)
+    // 回答也是解析器认得的序列
+    assert_eq(acts_of("\x1b[0n\x1b[?1;2c"), acts_of("\x1b[0n") + acts_of("\x1b[?1;2c"))
+}
+
+// ---------- 阶段 10：画框线的字符集（formal/Lark/VtCharset.lean） ----------
+
+fn cs_run(ops: [int]) -> charset.Cs {
+    // 0：G0 画线、1：G1 画线、2：G0 ASCII、3：G1 ASCII、4：SO、5：SI、6：复位
+    s = charset.new()
+    for o in ops {
+        if o == 0 { charset.designate(&s, 0, 0x30) }
+        if o == 1 { charset.designate(&s, 1, 0x30) }
+        if o == 2 { charset.designate(&s, 0, 0x42) }
+        if o == 3 { charset.designate(&s, 1, 0x42) }
+        if o == 4 { charset.so(&s) }
+        if o == 5 { charset.si(&s) }
+        if o == 6 { s = charset.new() }
+    }
+    s
+}
+
+fn cs_map(s: charset.Cs, t: str) -> [int] {
+    out: [int] = []
+    for i in 0..len(t) { out.push(charset.map(s, byte_at(t, i))) }
+    out
+}
+
+test "字符集：和 VtCharset.lean 的 #guard 一样" {
+    // ESC ( 0 以后 lqkxmj 是框线
+    b = cs_map(cs_run([0]), "lqkxmj")
+    assert_eq(b[0], 0x250C)
+    assert_eq(b[1], 0x2500)
+    assert_eq(b[2], 0x2510)
+    assert_eq(b[3], 0x2502)
+    assert_eq(b[4], 0x2514)
+    assert_eq(b[5], 0x2518)
+    // 大写字母、数字不变
+    c = cs_map(cs_run([0]), "A0^")
+    assert_eq(c[0], 0x41)
+    assert_eq(c[1], 0x30)
+    assert_eq(c[2], 0x5E)
+    // G1：SO 以后才用，SI 回来
+    q1 = cs_map(cs_run([1]), "q")
+    assert_eq(q1[0], 0x71)
+    q2 = cs_map(cs_run([1, 4]), "q")
+    assert_eq(q2[0], 0x2500)
+    q3 = cs_map(cs_run([1, 4, 5]), "q")
+    assert_eq(q3[0], 0x71)
+    // ESC ( B 换回来；复位
+    q4 = cs_map(cs_run([0, 2]), "q")
+    assert_eq(q4[0], 0x71)
+    q5 = cs_map(cs_run([0, 6]), "q")
+    assert_eq(q5[0], 0x71)
+}
+
+test "字符集：随机的切换，每个字符的性质（map_out、map_ascii、map_width、gfx_inj、reset_ascii）" {
+    r = rand.new(167)
+    wrong = 0
+    // 32 个字符两两不同、都占一格
+    g = charset.gfx()
+    for i in 0..len(g) {
+        if width.width(g[i]) != 1 { wrong += 1 }
+        for j in 0..len(g) {
+            if i != j && g[i] == g[j] { wrong += 1 }
+        }
+    }
+    for _t in 0..300 {
+        ops: [int] = []
+        k = r.range(0, 8)
+        for _i in 0..k { ops.push(r.range(0, 7)) }
+        s = cs_run(ops)
+        for c in 0..0x100 {
+            m = charset.map(s, c)
+            if (c < 0x5F || c > 0x7E) && m != c { wrong += 1 }
+            if !charset.active(s) && m != c { wrong += 1 }
+            if charset.active(s) && c >= 0x5F && c <= 0x7E && width.width(m) != 1 { wrong += 1 }
+        }
+        // ESC ( B 再 SI 以后一定是 ASCII
+        s2 = s.copy()
+        charset.designate(&s2, 0, 0x42)
+        charset.si(&s2)
+        if charset.active(s2) { wrong += 1 }
+        // 设置 G0 不影响 G1
+        s3 = s.copy()
+        charset.designate(&s3, 0, 0x30)
+        if s3.g1 != s.g1 { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "终端：画框线" {
+    // dialog 这样的程序：ESC ( 0 画框、ESC ( B 换回来写字
+    t1 = feed_all(3, 4, "\x1b(0lqqk\r\nx\x1b(Bok\x1b(0x\r\nmqqj\x1b(B")
+    assert_eq(term.text(t1, 0), "┌──┐")
+    assert_eq(term.text(t1, 1), "│ok│")
+    assert_eq(term.text(t1, 2), "└──┘")
+    // ESC ) 0 + SO / SI
+    t2 = feed_all(1, 4, "\x1b)0q\x0eq\x0fq")
+    assert_eq(term.text(t2, 0), "q─q ")
+    // 不认识的字符集（ESC ( A）当作 ASCII；ESC c 复位
+    t3 = feed_all(1, 3, "\x1b(Aq\x1b(0\x1bcq")
+    assert_eq(term.text(t3, 0), "q  ")
+    // 框线字符占一格：光标位置和 ASCII 一样
+    t4 = feed_all(1, 5, "\x1b(0qqq")
+    assert_eq(t4.m.scr.x, 3)
+}
+
+// ---------- 快的版本和照着证明写的版本对照 ----------
+
+fn same_s(a: screen.S, b: screen.S) -> bool {
+    if !same_scr(a, b) { return false }
+    if len(a.out) != len(b.out) { return false }
+    for i in 0..len(a.out) {
+        if cells_text(a.out[i]) != cells_text(b.out[i]) { return false }
+    }
+    true
+}
+
+test "屏幕：快的版本（直接改格子）和照着证明写的版本，每一步结果都一样" {
+    r = rand.new(173)
+    wrong = 0
+    for _t in 0..300 {
+        nr = r.range(1, 7)
+        nc = r.range(1, 9)
+        fast = screen.new(nr, nc)
+        slow = screen.new(nr, nc)
+        slow.slow = true
+        k = r.range(0, 80)
+        for _i in 0..k {
+            o = rand_op(&r)
+            if r.range(0, 4) == 0 {
+                p = r.range(0, 5)
+                screen.step(&fast, screen.Pen(p))
+                screen.step(&slow, screen.Pen(p))
+            }
+            // 自动换行关掉时的写法（write_nowrap）也对照
+            nw = r.range(0, 6) == 0
+            if nw {
+                w = r.range(1, 3)
+                c = 97 + r.range(0, 5)
+                screen.write_nowrap(&fast, c, w)
+                screen.write_nowrap(&slow, c, w)
+            } else {
+                screen.step(&fast, o.copy())
+                screen.step(&slow, o.copy())
+            }
+            if !same_s(fast, slow) || !screen.ok(fast) { wrong += 1 }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "滚动缓冲：满了以后一直滚，留下的总是最新的 cap 行（keep_suffix）" {
+    t = term.new(1, 3)
+    t.m.cap = 5
+    for i in 0..2000 { term.feed(&t, "#{i % 1000}\r\n") }
+    h = term.history(t)
+    assert_eq(len(h), 5)
+    assert_eq(h[0], "995")
+    assert_eq(h[4], "999")
+    // 物理上存着的行有上限（攒多了一次挪走）
+    assert_eq(len(t.m.sb) < 5 + 256 + 2, true)
+}
+
+// ---------- lterm app 的窗口：颜色表和一格怎么画（vt/win，不开窗口） ----------
+
+fn px(v: int, s: style.Sty) -> win.Px { win.cell(win.palette(), v, style.pack(s)) }
+
+test "窗口：颜色表、样式变成前景色背景色、宽字符" {
+    pal = win.palette()
+    assert_eq(len(pal), 256)
+    assert_eq(pal[16], 0x000000)
+    assert_eq(pal[231], 0xFFFFFF)
+    assert_eq(pal[196], 0xFF0000)
+    assert_eq(pal[232], 0x080808)
+    assert_eq(pal[255], 0xEEEEEE)
+    // 默认样式
+    a = px(0x41, style.dflt())
+    assert_eq(a.cp, 0x41)
+    assert_eq(a.fg, win.FG)
+    assert_eq(a.bg, win.BG)
+    assert_eq(a.fl, 0)
+    // 粗体的红字是亮红；反显换过来；隐藏的字和背景一样
+    s = style.dflt()
+    style.apply(&s, [1, 31, 4])
+    b = px(0x41, s)
+    assert_eq(b.fg, pal[9])
+    assert_eq(b.fl, 3)
+    s2 = style.dflt()
+    style.apply(&s2, [7, 38, 2, 1, 2, 3])
+    c = px(0x41, s2)
+    assert_eq(c.fg, win.BG)
+    assert_eq(c.bg, 0x010203)
+    s3 = style.dflt()
+    style.apply(&s3, [8, 44])
+    d = px(0x41, s3)
+    assert_eq(d.fg, d.bg)
+    // 宽字符：左半是码点（带 4），右半是 -1
+    t = feed_all(1, 4, "中")
+    r0 = screen.row(t.m.scr, 0)
+    e = px(r0[0], style.dflt())
+    f = px(r0[1], style.dflt())
+    assert_eq(e.cp, 0x4E2D)
+    assert_eq(e.fl, 4)
+    assert_eq(f.cp, -1)
+}
+
+// ---------- 阶段 11：滚动区域从顶上开始时滚出去的行也存（formal/Lark/VtRegion.lean） ----------
+
+test "滚动区域：和 VtRegion.lean 的 #guard 一样，像 codex 那样下面留一块界面" {
+    // 三行的屏幕，区域是前两行：在区域的最后一行换行，滚出去的是 "a"，第三行不动
+    s = run_ops(3, 2, cat(cat(cat(cat(cat(texts("a"), crlf()), texts("b")), crlf()), texts("c")), [screen.Stbm(1, 2), screen.Cup(2, 1), screen.Lf]))
+    assert_eq(sb_text(s), "a ")
+    assert_eq(screen_text(s), "b |  |c ")
+    // 终端：最后一行是程序的界面，上面三行是滚动区域，输出从区域的最后一行推上去
+    t = feed_all(4, 4, "\x1b[4;1HUI\x1b[1;3r\x1b[3;1H1\r\n2\r\n3\r\n4")
+    assert_eq(join_lines(term.history(t)), "    |    |1   ")
+    assert_eq(term.text(t, 0), "2   ")
+    assert_eq(term.text(t, 2), "4   ")
+    assert_eq(term.text(t, 3), "UI  ")
+    // SU 滚超过区域的行数：最多存整个区域（up_clamp）
+    t2 = feed_all(3, 2, "a\r\nb\x1b[1;2r\x1b[5S")
+    assert_eq(join_lines(term.history(t2)), "a |b ")
+}
+
+test "滚动区域：随机的屏幕和区域，滚出去的行接上区域正好是原来的区域加空行（region_keep、region_below、up_clamp）" {
+    r = rand.new(173)
+    wrong = 0
+    for _t in 0..300 {
+        nr = r.range(2, 7)
+        nc = r.range(1, 9)
+        s = screen.new(nr, nc)
+        k = r.range(0, 40)
+        for _i in 0..k { screen.step(&s, rand_op(&r)) }
+        screen.step(&s, screen.Stbm(0, 0))
+        _x, _y = screen.take_out(&s)
+        b = r.range(1, nr)
+        n = r.range(1, nr + 3)
+        screen.step(&s, screen.Stbm(1, b + 1))
+        if s.top != 0 || s.bot != b { wrong += 1 }
+        before: [str] = []
+        for i in 0..nr { before.push(cells_text(screen.row(s, i))) }
+        screen.step(&s, screen.Su(n))
+        m = if n < b + 1 { n } else { b + 1 }
+        got: [str] = []
+        for o in s.out { got.push(cells_text(o)) }
+        for i in 0..b + 1 { got.push(cells_text(screen.row(s, i))) }
+        want: [str] = []
+        for i in 0..b + 1 { want.push(before[i].copy()) }
+        for _i in 0..m { want.push(blanks(nc)) }
+        if len(got) != len(want) {
+            wrong += 1
+        } else {
+            for i in 0..len(want) {
+                if got[i] != want[i] { wrong += 1 }
+            }
+        }
+        // 区域下面的行不动
+        for i in b + 1..nr {
+            if cells_text(screen.row(s, i)) != before[i] { wrong += 1 }
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+// ---------- 阶段 12：鼠标选中、复制（formal/Lark/VtSel.lean） ----------
+
+fn codes(t: str) -> [int] {
+    out: [int] = []
+    for i in 0..len(t) { out.push(byte_at(t, i)) }
+    out
+}
+
+test "选中：和 VtSel.lean 的 #guard 一样" {
+    g1 = [codes("ab   "), codes("cd ef")]
+    // 从 (0,1) 拖到 (1,1)；反着拖一样
+    assert_eq(sel.copy_text(g1, 0, 5, sel.mk(1, 6)), "b\ncd")
+    assert_eq(sel.copy_text(g1, 0, 5, sel.mk(6, 1)), "b\ncd")
+    // 一格；只有空白
+    assert_eq(sel.copy_text(g1, 0, 5, sel.mk(8, 8)), "e")
+    assert_eq(sel.copy_text(g1, 0, 5, sel.mk(2, 4)), "")
+    // 两整行
+    assert_eq(sel.copy_text(g1, 0, 5, sel.mk(0, 9)), "ab\ncd ef")
+    // 宽字符的右半去掉
+    assert_eq(sel.copy_text([[0x4E2D, 0, 0x41]], 0, 3, sel.mk(0, 2)), "中A")
+    // 双击选词
+    a, b = sel.word(codes("cd ef"), 5, 3)
+    assert_eq(a, 3)
+    assert_eq(b, 4)
+    c, d = sel.word(codes("cd ef"), 5, 0)
+    assert_eq(c, 0)
+    assert_eq(d, 1)
+    e, f = sel.word(codes("a(bc)d"), 6, 2)
+    assert_eq(e, 2)
+    assert_eq(f, 3)
+    g, h = sel.word(codes("cd ef"), 5, 2)
+    assert_eq(g, 2)
+    assert_eq(h, 2)
+    i, j = sel.word([0x4E2D, 0, 0x6587, 0], 4, 1)
+    assert_eq(i, 0)
+    assert_eq(j, 3)
+}
+
+test "选中：随机的格子，性质和 VtSel.lean 的定理一样（mk_symm、mk_in、copy_lines、trim_end、left_*、right_*）" {
+    r = rand.new(181)
+    wrong = 0
+    alpha = [0x61, 0x62, 0x20, 0x20, 0x28, 0x2C, 0x4E2D, 0]
+    for _t in 0..300 {
+        c = r.range(1, 7)
+        nr = r.range(1, 5)
+        g: [[int]] = []
+        for _y in 0..nr {
+            row: [int] = []
+            for _x in 0..c { row.push(alpha[r.range(0, len(alpha))]) }
+            g.push(row)
+        }
+        p = r.range(0, nr * c)
+        q = r.range(0, nr * c)
+        s = sel.mk(p, q)
+        // 两头怎么给都一样；里面的格子正好是两个位置之间的
+        s2 = sel.mk(q, p)
+        if s.lo != s2.lo || s.hi != s2.hi { wrong += 1 }
+        for i in 0..nr * c {
+            want = (p <= i && i <= q) || (q <= i && i <= p)
+            if sel.in_sel(s, i) != want { wrong += 1 }
+        }
+        // 复制出来按换行切开：行数对，每一行是那一行选中的部分、不以空白结尾
+        txt = sel.copy_text(g, 0, c, s)
+        parts = str.split(txt, "\n")
+        if len(parts) != s.hi / c - s.lo / c + 1 { wrong += 1 }
+        for k in 0..len(parts) {
+            y = s.lo / c + k
+            want = ""
+            for ch in sel.line_of(g[y], c, s, y) { want += utf8.from_code_point(ch) }
+            if parts[k] != want { wrong += 1 }
+            if len(parts[k]) > 0 && byte_at(parts[k], len(parts[k]) - 1) == 0x20 { wrong += 1 }
+        }
+        // 双击选词：包含点的那一格，里面都是词里的字符，两头再往外一格就不是了
+        y = r.range(0, nr)
+        x = r.range(0, c)
+        a, b = sel.word(g[y], c, x)
+        if a > x || b < x || b >= c { wrong += 1 }
+        if sel.is_word(sel.cell_at(g[y], x)) {
+            for k in a..b + 1 {
+                if !sel.is_word(sel.cell_at(g[y], k)) { wrong += 1 }
+            }
+            if a > 0 && sel.is_word(sel.cell_at(g[y], a - 1)) { wrong += 1 }
+            if b < c - 1 && sel.is_word(sel.cell_at(g[y], b + 1)) { wrong += 1 }
+        } else if a != x || b != x {
+            wrong += 1
+        }
+    }
+    assert_eq(wrong, 0)
+}
+
+test "选中：绝对行号（pushed）、反显、窗口标题（OSC 0 / 2）" {
+    // 3 行的屏幕写 5 行：推上去 2 行
+    t = feed_all(3, 4, "1\r\n2\r\n3\r\n4\r\n5")
+    assert_eq(t.m.pushed, 2)
+    assert_eq(mode.sb_len(t.m), 2)
+    // 滚动缓冲满了以后 pushed 还一直加（第一次换行只是走到第二行，后面 9 次各推上去一行）
+    t2 = term.new(2, 2)
+    t2.m.cap = 3
+    for _i in 0..10 { term.feed(&t2, "x\r\n") }
+    assert_eq(t2.m.pushed, 9)
+    assert_eq(mode.sb_len(t2.m), 3)
+    // 反显：第 0 行的第 1、2 格
+    f = draw.frame(t.m.scr)
+    m = sel.mark(f, sel.mk(2 * 4 + 1, 2 * 4 + 2), 2)
+    v0 = style.unpack(m.sty[0][0])
+    v1 = style.unpack(m.sty[0][1])
+    v2 = style.unpack(m.sty[0][2])
+    w1 = style.unpack(m.sty[1][1])
+    assert_eq(v0.inverse, false)
+    assert_eq(v1.inverse, true)
+    assert_eq(v2.inverse, true)
+    assert_eq(w1.inverse, false)
+    // 标题
+    t3 = feed_all(1, 4, "\x1b]0;hello\x07\x1b]2;世界\x1b\\ab")
+    assert_eq(t3.title, "世界")
+    assert_eq(term.text(t3, 0), "ab  ")
+    t4 = feed_all(1, 4, "\x1b]1;icon\x07")
+    assert_eq(t4.title, "")
+}
+
+// ---------- 阶段 13：把鼠标交给程序（formal/Lark/VtMouse.lean） ----------
+
+fn mev(k: int, b: int, h: bool, m: int, x: int, y: int) -> mouse.Ev { mouse.Ev(kind: k, btn: b, held: h, mods: m, x: x, y: y) }
+
+fn mset(ns: [int], on: bool) -> mouse.M {
+    m = mouse.start()
+    for n in ns { mouse.set_mode(&m, n, on) }
+    m
+}
+
+test "鼠标：和 VtMouse.lean 的 #guard 一样" {
+    // 左键在左上角按下、在 (9, 4) 松开
+    assert_eq(mouse.sgr(mev(mouse.K_PRESS, 0, false, 0, 0, 0)), "\x1b[<0;1;1M")
+    assert_eq(mouse.sgr(mev(mouse.K_RELEASE, 0, false, 0, 9, 4)), "\x1b[<0;10;5m")
+    // 右键拖、不按键移动、滚轮下、Ctrl + 左键
+    assert_eq(mouse.code(mev(mouse.K_MOTION, 2, true, 0, 0, 0)), 34)
+    assert_eq(mouse.code(mev(mouse.K_MOTION, 0, false, 0, 0, 0)), 35)
+    assert_eq(mouse.code(mev(mouse.K_WHEEL, 1, false, 0, 0, 0)), 65)
+    assert_eq(mouse.code(mev(mouse.K_PRESS, 0, false, 4, 0, 0)), 16)
+    // 老格式：松开是 3；放不下时不报
+    assert_eq(mouse.x10(mev(mouse.K_RELEASE, 0, false, 0, 0, 0)), "\x1b[M" + from_byte(35) + from_byte(33) + from_byte(33))
+    assert_eq(mouse.x10(mev(mouse.K_PRESS, 0, false, 0, 300, 0)), "")
+    // 模式：1000 不报移动、1002 报按着键拖、1003 都报；关掉以后都不报
+    held = mev(mouse.K_MOTION, 0, true, 0, 1, 1)
+    free = mev(mouse.K_MOTION, 0, false, 0, 1, 1)
+    assert_eq(mouse.report(mset([1000, 1006], true), held), "")
+    assert_eq(mouse.report(mset([1002, 1006], true), held), mouse.sgr(held))
+    assert_eq(mouse.report(mset([1002, 1006], true), free), "")
+    assert_eq(mouse.report(mset([1003], true), free) != "", true)
+    m = mset([1003], true)
+    mouse.set_mode(&m, 1003, false)
+    assert_eq(mouse.report(m, mev(mouse.K_PRESS, 0, false, 0, 1, 1)), "")
+    // 终端记下模式；ESC c 复位
+    t = feed_all(2, 4, "\x1b[?1002h\x1b[?1006h")
+    assert_eq(t.mouse.track, mouse.DRAG)
+    assert_eq(t.mouse.sgr, true)
+    term.feed(&t, "\x1b[?1002l")
+    assert_eq(t.mouse.track, mouse.OFF)
+    term.feed(&t, "\x1b[?1000;1006h\x1bc")
+    assert_eq(t.mouse.track, mouse.OFF)
+    assert_eq(t.mouse.sgr, false)
+}
+
+test "鼠标：随机的事件，报告解析回来是同一个事件（sgr_parse、code_*、wants、x10_len）" {
+    r = rand.new(191)
+    wrong = 0
+    for _t in 0..400 {
+        k = r.range(0, 4)
+        b = if k == mouse.K_WHEEL { r.range(0, 2) } else { r.range(0, 3) }
+        e = mev(k, b, r.range(0, 2) == 1, r.range(0, 8), r.range(0, 400), r.range(0, 300))
+        c = mouse.code(e)
+        // 从码分得出是什么事件
+        if k == mouse.K_PRESS || k == mouse.K_RELEASE {
+            if c >= 32 || c % 4 != b || c / 4 != e.mods { wrong += 1 }
+        } else if k == mouse.K_MOTION {
+            if c < 32 || c >= 64 { wrong += 1 }
+        } else if c < 64 { wrong += 1 }
+        // SGR：正好一个 CSI < [码, 列 + 1, 行 + 1] M / m
+        p = parse.new()
+        got = parse.run(&p, mouse.sgr(e))
+        if len(got) != 1 { wrong += 1 }
+        for a in got {
+            match a {
+                Csi(ps, inter, f) => {
+                    if len(ps) != 3 || ps[0] != c || ps[1] != e.x + 1 || ps[2] != e.y + 1 { wrong += 1 }
+                    if len(inter) != 1 || inter[0] != 0x3C { wrong += 1 }
+                    if f != (if k == mouse.K_RELEASE { 0x6D } else { 0x4D }) { wrong += 1 }
+                }
+                _ => { wrong += 1 }
+            }
+        }
+        // 老格式：要么不报，要么 6 个字节
+        xs = mouse.x10(e)
+        if xs != "" && len(xs) != 6 { wrong += 1 }
+        // 没打开时不报；打开了按下、松开、滚轮都报
+        t = r.range(0, 4)
+        w = mouse.wants(t, e)
+        if t == mouse.OFF && w { wrong += 1 }
+        if t != mouse.OFF && k != mouse.K_MOTION && !w { wrong += 1 }
+        if k == mouse.K_MOTION && !e.held && w != (t == mouse.ANY) { wrong += 1 }
+        if k == mouse.K_MOTION && e.held && w != (t == mouse.DRAG || t == mouse.ANY) { wrong += 1 }
+    }
+    assert_eq(wrong, 0)
+}

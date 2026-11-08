@@ -1,0 +1,11 @@
+// 期望错误：defer 里不能写 return（defer 是在离开块的路上执行的）
+fn f() {
+    defer {
+        return
+    }
+    print("f")
+}
+
+fn main() {
+    f()
+}

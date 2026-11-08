@@ -1,0 +1,8 @@
+// 给 tests/err1/priv_type.lark 用的模块
+pub type Outer {
+    n: int
+}
+
+type Inner {
+    n: int
+}

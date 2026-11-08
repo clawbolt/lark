@@ -1,0 +1,9 @@
+// 期望错误：extern "c" 只有 [u8] 参数可以 inout
+extern "c" {
+    fn bump(inout n: int)
+}
+
+fn main() {
+    x = 1
+    bump(&x)
+}

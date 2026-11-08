@@ -1,0 +1,6 @@
+// 期望错误：常量不能赋值
+const limit = 10
+
+fn main() {
+    limit = 20
+}

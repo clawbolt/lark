@@ -1,0 +1,143 @@
+// 翻看滚动缓冲（lterm run 里按 Ctrl-] 再按 [）。
+// 先证明再写：对应 formal/Lark/VtView.lean，函数和定义一一对应：
+//   clamp ↔ clamp、window ↔ view（每一行是格子和样式）、up ↔ up、down ↔ down。
+// 证明了：窗口总是正好 R 行（view_len）；不翻时就是现在的屏幕（view_zero）；窗口是 滚动缓冲 ++ 屏幕 里连续的一段（view_sub）；
+// 翻到最上面从缓冲的第一行开始（view_top）；上翻不超过顶（up_le），上翻再下翻回到原处（up_down），下翻够了回到屏幕（down_zero）。
+// 和模型不一样的一处：改过列数以后缓冲里的行和屏幕不一样宽，画的时候补齐或截断（row_fix），样式补 0。
+// 翻看时右上角写 [翻了几行/缓冲几行]（反显）；这一层（mark）和按键（keys）没有证明，tests.lark 里测。
+// 按键：k / ↑ 上一行、j / ↓ 下一行、b / PgUp 上一页、f / 空格 / PgDn 下一页、g 最上面、G 最下面、q / Esc 回去。
+// 平常时 Ctrl-] 是前缀：后面跟 [ 进入翻看，再按一次 Ctrl-] 把 Ctrl-] 本身交给 shell，跟别的键时两个都交给 shell。
+import "vt/screen"
+import "vt/style"
+import "vt/mode"
+import "vt/draw"
+
+pub const PREFIX = 0x1D
+
+// 限制在 [0, 缓冲的行数] 里（clamp）
+pub fn clamp(nsb: int, o: int) -> int {
+    if o < 0 { return 0 }
+    if o < nsb { o } else { nsb }
+}
+
+pub fn up(nsb: int, n: int, o: int) -> int { clamp(nsb, o + n) }
+
+pub fn down(n: int, o: int) -> int { if o > n { o - n } else { 0 } }
+
+fn zfit(n: int, l: [int]) -> [int] {
+    out: [int] = []
+    for i in 0..n { out.push(if i < len(l) { l[i] } else { 0 }) }
+    out
+}
+
+// 往上翻了 off 行时看到的窗口（view）：滚动缓冲 ++ 屏幕，从 len(sb) - clamp(off) 开始取 R 行
+pub fn window(t: mode.M, off: int) -> draw.F {
+    nsb = mode.sb_len(t)
+    start = nsb - clamp(nsb, off)
+    cs: [[int]] = []
+    ss: [[int]] = []
+    for i in 0..t.scr.rows {
+        k = start + i
+        if k < nsb {
+            cs.push(screen.row_fix(t.scr.cols, mode.sb_row(t, k)))
+            ss.push(zfit(t.scr.cols, mode.sb_sty(t, k)))
+        } else {
+            cs.push(screen.row(t.scr, k - nsb))
+            ss.push(screen.srow(t.scr, k - nsb))
+        }
+    }
+    draw.F(cells: cs, sty: ss, rows: t.scr.rows, cols: t.scr.cols)
+}
+
+// 右上角写上 [off/nsb]（反显）；放不下就不写
+pub fn mark(f: draw.F, off: int, nsb: int) -> draw.F {
+    out = f.copy()
+    if out.rows == 0 { return out }
+    tag = "[#{off}/#{nsb}]"
+    n = len(tag)
+    if n > out.cols { return out }
+    inv = style.dflt()
+    inv.inverse = true
+    v = style.pack(inv)
+    row = out.cells[0].copy()
+    sty = out.sty[0].copy()
+    for i in 0..n {
+        row[out.cols - n + i] = byte_at(tag, i)
+        sty[out.cols - n + i] = v
+    }
+    out.cells[0] = screen.row_fix(out.cols, row)
+    out.sty[0] = sty
+    out
+}
+
+// ---------- 按键 ----------
+
+pub type V {
+    pub view: bool      // 在翻看
+    pub off: int        // 往上翻了几行
+    pub prefix: bool    // 刚按了 Ctrl-]
+}
+
+pub fn new() -> V { V(view: false, off: 0, prefix: false) }
+
+fn starts(s: str, i: int, p: str) -> bool {
+    if i + len(p) > len(s) { return false }
+    slice(s, i, i + len(p)) == p
+}
+
+// 处理一段键盘输入：改 v，返回要交给 shell 的字节。nsb 是缓冲的行数，page 是一页几行
+pub fn keys(inout v: V, d: str, nsb: int, page: int) -> str {
+    out = ""
+    i = 0
+    for i < len(d) {
+        c = byte_at(d, i)
+        if v.view {
+            n = 1
+            if c == 0x6B || starts(d, i, "\x1b[A") || starts(d, i, "\x1bOA") {
+                v.off = up(nsb, 1, v.off)
+                n = if c == 0x6B { 1 } else { 3 }
+            } else if c == 0x6A || starts(d, i, "\x1b[B") || starts(d, i, "\x1bOB") {
+                v.off = down(1, v.off)
+                n = if c == 0x6A { 1 } else { 3 }
+            } else if c == 0x62 || starts(d, i, "\x1b[5~") {
+                v.off = up(nsb, page, v.off)
+                n = if c == 0x62 { 1 } else { 4 }
+            } else if c == 0x66 || c == 0x20 || starts(d, i, "\x1b[6~") {
+                v.off = down(page, v.off)
+                n = if c == 0x1B { 4 } else { 1 }
+            } else if c == 0x67 {
+                v.off = nsb
+            } else if c == 0x47 {
+                v.off = 0
+            } else if c == 0x71 || (c == 0x1B && i + 1 == len(d)) {
+                v.view = false
+                v.off = 0
+            } else if c == 0x1B {
+                // 不认识的转义序列：整个跳过（到结尾字节）
+                j = i + 1
+                if j < len(d) && (byte_at(d, j) == 0x5B || byte_at(d, j) == 0x4F) { j += 1 }
+                for j < len(d) && byte_at(d, j) < 0x40 { j += 1 }
+                n = j + 1 - i
+            }
+            i += n
+            continue
+        }
+        if v.prefix {
+            v.prefix = false
+            if c == 0x5B {
+                v.view = true
+                v.off = 0
+            } else if c == PREFIX {
+                out += from_byte(PREFIX)
+            } else {
+                out += from_byte(PREFIX) + from_byte(c)
+            }
+        } else if c == PREFIX {
+            v.prefix = true
+        } else {
+            out += from_byte(c)
+        }
+        i += 1
+    }
+    out
+}

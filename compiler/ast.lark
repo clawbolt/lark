@@ -1,0 +1,183 @@
+// Lark 编译器 stage1 · 语法树
+// 语法树在解析后不再修改；类型、变量编号、调用解析等结果都按节点 id 存在检查器的旁表里。
+// 可能没有的部分（else 分支、块的值、return 的值、for 的条件）用 T? 表示。
+
+type Expr {
+    id: int
+    line: int
+    col: int
+    kind: ExprKind
+}
+
+enum ExprKind {
+    EInt(n: int)
+    EFloat(text: str)   // 浮点字面量的原文（去掉了 _），代码生成时原样写进 C
+    EBool(b: bool)
+    EStr(s: str)
+    EInterp(parts: [Expr])
+    EVar(name: str)
+    EField(base: Expr, name: str)
+    EIndex(base: Expr, idx: Expr)
+    ECall(name: str, args: [Arg], method: bool)   // 方法调用时 args[0] 是接收者
+    EList(items: [Expr])
+    ETuple(items: [Expr])     // (a, b)：元组，至少两个元素；也用作解构赋值的目标 a, b = …
+    EUnary(op: str, a: Expr)
+    EBinary(op: str, a: Expr, b: Expr)
+    EIf(cond: Expr, thn: Block, els: Block?)
+    EMatch(owning: bool, scrut: Expr, arms: [Arm])   // owning：match take
+    EBlock(b: Block)
+    EScope(b: Block)    // scope { … }：块结束前等待其中 spawn 的所有任务
+    ELock(m: Expr, name: str, id: int, b: Block)   // lock m as c { … }：锁上 Mutex[T]，块里 c 是里面的值（inout），块尾解锁
+    ESelect(arms: [SelArm])   // select { v <- ch => …  after ms => …  done => … }
+    EReturn(val: Expr?)
+    EBreak(label: str)      // break outer：label 是外层循环的标签，没写时为 ""
+    EContinue(label: str)
+    EClosure(params: [Param], body: Expr)   // |x, y| body；参数类型来自期望的函数类型
+}
+
+type Arg {
+    label: str      // 没有标签时为 ""
+    amp: bool
+    value: Expr
+}
+
+type Arm {
+    pat: Pat
+    line: int
+    col: int
+    body: Expr
+}
+
+enum Pat {
+    PWild
+    PBind(name: str, id: int)
+    PInt(n: int)
+    PBool(b: bool)
+    PStr(s: str)
+    PVariant(name: str, fields: [Pat])   // 字段可以是任意子模式（嵌套）
+    PTuple(items: [Pat])                 // (p, q, …)
+    POr(alts: [Pat])                     // A | B | …：任一个匹配就算匹配；不能绑定名字
+    PType(name: str, id: int, ty: str)   // r: Rect：dyn 值里装的是 Rect 时匹配，r 借用里面的值（名字可以是 _）
+}
+
+type Block {
+    stmts: [Stmt]
+    tail: Expr?
+}
+
+type Stmt {
+    id: int
+    line: int
+    col: int
+    kind: StmtKind
+}
+
+enum StmtKind {
+    SAssign(target: Expr, annot: str, rhs: Expr)   // annot：类型标注原文，没有时为 ""
+    SExpr(e: Expr)
+    SForCond(cond: Expr?, body: Block)
+    SForRange(name: str, id: int, lo: Expr, hi: Expr, body: Block)
+    SForEach(name: str, id: int, it: Expr, body: Block, iname: str, iid: int)   // for i, x in xs：iname 是下标的名字，没有时为 ""
+    SDefer(body: Block)    // defer { … }：离开所在的块时执行（见 cg_stmt 的 SDefer）
+    SLabel(name: str, body: Block)   // outer: for …：body 里只有那个循环（循环取走 name，见 check 的 pend_label）
+}
+
+type FieldDecl {
+    name: str
+    ty: str
+    is_pub: bool    // 结构体字段前写了 pub：在模块外能读；字段全是 pub 时在模块外也能改。变体的字段总是 true
+}
+
+type VariantDecl {
+    name: str
+    fields: [FieldDecl]
+}
+
+type StructDecl {
+    name: str
+    tparams: [str]
+    fields: [FieldDecl]
+    line: int
+    col: int
+}
+
+type EnumDecl {
+    name: str
+    tparams: [str]
+    variants: [VariantDecl]
+    line: int
+    col: int
+}
+
+type Param {
+    name: str
+    mode: str       // "read" / "inout" / "take"
+    ty: str
+    id: int
+    line: int
+    col: int
+}
+
+type FnDecl {
+    name: str
+    tparams: [str]  // 类型参数；非泛型函数为空
+    tbounds: [str]  // 每个类型参数的约束，如 "Show+Eq"；没有约束时为 ""
+    tok: int        // "fn" 所在的 token 下标，实例化时从这里重新解析
+    params: [Param]
+    ret: str        // 没有返回值时为 "()"
+    body: Block
+    line: int
+    col: int
+    ext: bool       // extern "c" 里的声明：只有签名，调用 C 的同名函数（参数类型原文可以是 c_int 这类 C 类型）
+}
+
+// interface Show { fn show(x: Self) -> str }：方法签名里用 Self 指代实现接口的类型
+type IfaceMethod {
+    name: str
+    params: [Param]
+    ret: str
+}
+
+type IfaceDecl {
+    name: str
+    methods: [IfaceMethod]
+    line: int
+    col: int
+}
+
+type Program {
+    structs: [StructDecl]
+    enums: [EnumDecl]
+    fns: [FnDecl]
+    ifaces: [IfaceDecl]
+    nodes: int      // 已分配的节点 id 数量
+    toks: [Tok]     // 全部 token，留给泛型函数实例化时重新解析
+    nmain: int      // 命令行给出的文件数，之后的文件是 import 载入的模块
+    pubs: [int]     // 带 pub 的声明所在的行
+    fmods: [str]    // 每个文件所在的模块："" 是命令行给出的文件（根模块），import 载入的文件是它的文件名（不带 .lark）
+    mods: [str]     // 每个文件导入的模块，“模块名@文件序号”
+    consts: [ConstDecl]
+    tests: [str]        // test "名字" { … } 的名字；测试体是 fns 里名为 test_fns[k] 的无参函数（只收根模块的）
+    test_fns: [str]
+    paths: [str]        // 每个文件的路径（按文件序号），由 main.lark 填上；assert 的出错位置要用
+    testing: bool       // lark1 --test：生成运行全部测试的 main，程序自己的 main 不再必需
+}
+
+// select 的分支。kind："recv"（name <- src）、"after"（src 是毫秒数）、"done"（所有通道都结束了，没有 src）
+type SelArm {
+    kind: str
+    name: str
+    id: int
+    src: Expr?
+    body: Expr
+    line: int
+    col: int
+}
+
+// const NAME = 值：值在编译时算出（见 check.lark 的 cval）
+type ConstDecl {
+    name: str
+    value: Expr
+    line: int
+    col: int
+}

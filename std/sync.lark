@@ -1,0 +1,68 @@
+// Lark 标准库 · 任务之间的协作（用 Lark 自己写，底下是内置的 Mutex 和 Chan）
+// 用法：import "std/sync"
+//
+//   c = sync.new_cancel()
+//   scope {
+//       spawn(worker, Job(stop: c.copy(), …))       // copy 只是计数加一，拿到的是同一个
+//       …
+//       c.cancel()                                  // 告诉所有拿着它的任务：不用做了
+//   }
+//
+//   fn worker(take j: Job) {
+//       stop = j.stop.watch()                       // 在循环外面 watch 一次
+//       for going {
+//           select {
+//               _v <- stop => { going = false }     // cancel 以后这个分支收到值
+//               v <- j.jobs => work(v)
+//           }
+//       }
+//   }
+//
+// 不在 select 里时用 c.is_cancelled() 查，或者 c.wait() 一直等到 cancel。
+// Mutex、Chan 是语言内置的；读写锁、原子整数、Once 等有程序要用时再加（docs/std-roadmap.md）。
+
+// 取消：一个任务说“不用做了”，同一个 scope 里拿着它的任务都能知道。只能从没取消变成取消，不能撤回
+pub type Cancel {
+    st: Mutex[CancelState]
+}
+
+type CancelState {
+    done: bool
+    subs: [Chan[bool]]      // watch 给出去、还没收到通知的通道
+}
+
+pub fn new_cancel() -> Cancel { Cancel(st: mutex(CancelState(done: false, subs: []))) }
+
+// 取消；重复调用没关系
+pub fn cancel(c: Cancel) {
+    lock c.st as s {
+        if !s.done {
+            s.done = true
+            for ch in s.subs { ch.send(true) }
+            s.subs = []
+        }
+    }
+}
+
+pub fn is_cancelled(c: Cancel) -> bool {
+    lock c.st as s { s.done }
+}
+
+// 给 select 用的通道：取消时（已经取消了就马上）收到一个 true。每调用一次登记一个新的通道，
+// 所以在循环外面调用一次，别在每一轮 select 里调用
+pub fn watch(c: Cancel) -> Chan[bool] {
+    ch: Chan[bool] = chan()
+    lock c.st as s {
+        if s.done { ch.send(true) } else { s.subs.push(ch.copy()) }
+    }
+    ch
+}
+
+// 一直等到取消
+pub fn wait(c: Cancel) {
+    w = watch(c)
+    _v = w.recv()
+}
+
+// "#{c}"：Cancel(没取消)、Cancel(已取消)
+pub fn show(c: Cancel) -> str { if is_cancelled(c) { "Cancel(已取消)" } else { "Cancel(没取消)" } }

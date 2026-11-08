@@ -1,0 +1,97 @@
+// lhttp：用 Lark 写的静态文件 HTTP/1.1 服务器。浏览器、curl、wrk 都能连上来。
+// 构建：在 apps/lhttp 里 lark build，得到 build/lhttp
+//
+//   lhttp [--port 端口] [--bind 地址] [--root 目录]   默认 127.0.0.1:8080，目录是当前目录；端口给 0 时由系统挑
+//
+// 支持：GET、HEAD 读文件；目录有 index.html 就用它，没有就列出目录；POST /echo 原样返回请求体（测试用）。
+// keep-alive 和流水线、连接 30 秒没有动静就关掉，这些由 std/http 的 serve 做（每个连接一个任务）。
+// 文件带 Last-Modified，If-Modified-Since 和它一字不差时回 304。
+// 不支持：chunked 的请求体、Range、其余的条件请求（If-None-Match 等）、HTTPS。
+//
+// 这里只有处理请求的部分（http/files.lark）；连接之间只共享文件缓存（Mutex），所以不用通道。
+// 另有一个任务等 SIGINT / SIGTERM（on_signal），收到就写日志退出。
+import "std/net"
+import "std/io"
+import "std/os"
+import "std/str"
+import "std/time"
+import "std/log"
+import "std/signal"
+import "std/http"
+import "http/files"
+
+type Site {
+    l: net.Listener
+    root: str
+    cache: Mutex[files.Cache]
+}
+
+// 每个请求交给 files.handle；accept 出错时（比如文件描述符用完了）记一行日志，不再接受新连接
+fn serve_site(take s: Site) {
+    cache = s.cache.copy()
+    root = s.root.copy()
+    h: Fn(http.Request) -> http.Response = |req| files.handle(cache, root, req, time.unix_ms())
+    match http.serve(s.l, h) {
+        Ok => {}
+        Err(e) => log.new("lhttp").log(log.ERROR, "accept 出错，不再接受新连接", ["err", e.copy()])
+    }
+}
+
+fn run_server(host: str, port: int, root: str) -> ()! {
+    if !os.is_dir(root) { return Err("不是目录：#{root}") }
+    // 先登记信号再告诉别人准备好了：之后的 Ctrl-C、kill 都由 on_signal 处理
+    sigs = signal.notify([signal.INT, signal.TERM])?
+    l = net.listen(host, port)?
+    p = l.local_port()?
+    // 先写出来再开始等：测试脚本靠这一行知道端口
+    w = io.stdout()
+    w.write_line("lhttp 在 http://#{host}:#{p}/ 上提供 #{root}")?
+    w.flush()?
+    // 根目录不带结尾的 /，请求的路径总是 / 开头
+    r = if len(root) > 1 && str.ends_with(root, "/") { slice(root, 0, len(root) - 1) } else { root.copy() }
+    scope {
+        spawn(on_signal, sigs)
+        spawn(serve_site, Site(l: l, root: r, cache: files.new_cache()))
+    }
+}
+
+// 收到 SIGINT（Ctrl-C）或 SIGTERM（kill）：写一行日志就退出，不等进行中的连接
+fn on_signal(take s: signal.Signals) {
+    n = s.wait() ?? signal.TERM
+    log.new("lhttp").info("收到 #{signal.name(n)}，退出")
+    exit(0)
+}
+
+fn usage() {
+    eprint("用法：lhttp [--port 端口] [--bind 地址] [--root 目录]")
+    exit(2)
+}
+
+fn main() {
+    av = args()
+    host = "127.0.0.1"
+    port = 8080
+    root = "."
+    k = 1
+    for k < len(av) {
+        if k + 1 >= len(av) { usage() }
+        if av[k] == "--port" {
+            port = try_parse_int(av[k + 1]) ?? -1
+            if port < 0 { usage() }
+        } else if av[k] == "--bind" {
+            host = av[k + 1].copy()
+        } else if av[k] == "--root" {
+            root = av[k + 1].copy()
+        } else {
+            usage()
+        }
+        k += 2
+    }
+    match run_server(host, port, root) {
+        Ok => {}
+        Err(e) => {
+            eprint("lhttp：#{e}")
+            exit(1)
+        }
+    }
+}

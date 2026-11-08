@@ -1,0 +1,12 @@
+// 多文件示例的一半：类型和函数定义在这里，main.lark 直接使用
+enum Shape {
+    Circle(r: int)
+    Rect(w: int, h: int)
+}
+
+fn area(s: Shape) -> int {
+    match s {
+        Circle(r) => 3 * r * r
+        Rect(w, h) => w * h
+    }
+}

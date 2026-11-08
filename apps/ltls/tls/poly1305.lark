@@ -1,0 +1,124 @@
+// Poly1305（RFC 8439 第 2.5 节）：一次性的 32 字节密钥（r 和 s 各 16 字节），算出 16 字节的标签。
+// 照 poly1305-donna 的 32 位写法：模 2^130 - 5 的数拆成 5 个 26 位，乘积最大约 2^58，int 装得下。
+// 先证明再写：规格是 formal/Lark/Tls.lean 的 poly（直接模 2^130 - 5 算，对上了第 2.5.2 节的向量）；
+// 最后减不减 p 用掩码选，不按数据分支（sel_keep / sel_swap）。26 位分段的乘法和进位和规格一致没有证明，靠测试向量。
+// 实验性：没有经过审计
+import "tls/chacha20"
+
+const M26 = 0x3ffffff
+const M32 = 0xFFFF_FFFF
+
+pub fn mac(key: [u8], msg: [u8]) -> [u8] {
+    if len(key) != 32 { panic("poly1305.mac：密钥要 32 字节") }
+    // r 按第 2.5 节截掉一些位（clamp），拆成 26 位一段
+    r0 = chacha20.le32(key, 0) & 0x3ffffff
+    r1 = (chacha20.le32(key, 3) >>> 2) & 0x3ffff03
+    r2 = (chacha20.le32(key, 6) >>> 4) & 0x3ffc0ff
+    r3 = (chacha20.le32(key, 9) >>> 6) & 0x3f03fff
+    r4 = (chacha20.le32(key, 12) >>> 8) & 0x00fffff
+    s1 = r1 * 5
+    s2 = r2 * 5
+    s3 = r3 * 5
+    s4 = r4 * 5
+    h0 = 0
+    h1 = 0
+    h2 = 0
+    h3 = 0
+    h4 = 0
+    i = 0
+    for i < len(msg) {
+        // 每块 16 字节，后面补一个 1；最后不满 16 字节的块补 1 再补 0，这时不另外加 2^128
+        n = if len(msg) - i < 16 { len(msg) - i } else { 16 }
+        blk: [u8] = []
+        for j in 0..n { blk.push(msg[i + j]) }
+        hibit = 1 << 24
+        if n < 16 {
+            blk.push(1)
+            for _j in n + 1..16 { blk.push(0) }
+            hibit = 0
+        }
+        h0 += chacha20.le32(blk, 0) & M26
+        h1 += (chacha20.le32(blk, 3) >>> 2) & M26
+        h2 += (chacha20.le32(blk, 6) >>> 4) & M26
+        h3 += (chacha20.le32(blk, 9) >>> 6) & M26
+        h4 += (chacha20.le32(blk, 12) >>> 8) | hibit
+        // h = h * r mod 2^130 - 5（2^130 ≡ 5，所以越过最高段的部分乘 5 折回来）
+        d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1
+        d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2
+        d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3
+        d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4
+        d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0
+        c = d0 >>> 26
+        h0 = d0 & M26
+        d1 += c
+        c = d1 >>> 26
+        h1 = d1 & M26
+        d2 += c
+        c = d2 >>> 26
+        h2 = d2 & M26
+        d3 += c
+        c = d3 >>> 26
+        h3 = d3 & M26
+        d4 += c
+        c = d4 >>> 26
+        h4 = d4 & M26
+        h0 += c * 5
+        c = h0 >>> 26
+        h0 = h0 & M26
+        h1 += c
+        i += 16
+    }
+    // 进位做完，再算 g = h + 5 - 2^130；g 不是负数时 h ≥ p，结果取 g
+    c = h1 >>> 26
+    h1 = h1 & M26
+    h2 += c
+    c = h2 >>> 26
+    h2 = h2 & M26
+    h3 += c
+    c = h3 >>> 26
+    h3 = h3 & M26
+    h4 += c
+    c = h4 >>> 26
+    h4 = h4 & M26
+    h0 += c * 5
+    c = h0 >>> 26
+    h0 = h0 & M26
+    h1 += c
+    g0 = h0 + 5
+    c = g0 >>> 26
+    g0 = g0 & M26
+    g1 = h1 + c
+    c = g1 >>> 26
+    g1 = g1 & M26
+    g2 = h2 + c
+    c = g2 >>> 26
+    g2 = g2 & M26
+    g3 = h3 + c
+    c = g3 >>> 26
+    g3 = g3 & M26
+    g4 = h4 + c - (1 << 26)
+    keep = g4 >> 63            // g4 是负数时全是 1（留着 h），否则是 0（换成 g）
+    h0 = (h0 & keep) | (g0 & !keep)
+    h1 = (h1 & keep) | (g1 & !keep)
+    h2 = (h2 & keep) | (g2 & !keep)
+    h3 = (h3 & keep) | (g3 & !keep)
+    h4 = (h4 & keep) | (g4 & !keep)
+    // 拼回 128 位，加上 s（模 2^128）
+    f0 = (h0 | (h1 << 26)) & M32
+    f1 = ((h1 >>> 6) | (h2 << 20)) & M32
+    f2 = ((h2 >>> 12) | (h3 << 14)) & M32
+    f3 = ((h3 >>> 18) | (h4 << 8)) & M32
+    f = f0 + chacha20.le32(key, 16)
+    t0 = f & M32
+    f = f1 + chacha20.le32(key, 20) + (f >>> 32)
+    t1 = f & M32
+    f = f2 + chacha20.le32(key, 24) + (f >>> 32)
+    t2 = f & M32
+    f = f3 + chacha20.le32(key, 28) + (f >>> 32)
+    t3 = f & M32
+    out: [u8] = []
+    for t in [t0, t1, t2, t3] {
+        for k in 0..4 { out.push(((t >>> (8 * k)) & 255).wrap_u8()) }
+    }
+    out
+}

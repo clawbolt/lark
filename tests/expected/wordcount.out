@@ -1,0 +1,14 @@
+不同的词：6
+the: 4
+cat: 1
+and: 2
+dog: 1
+bird: 1
+end: 1
+有 cat：true，有 cow：false
+99 的平方：9801，共 100 个
+找到点 (1, 2)
+split：4 段，第 3 段为空：true
+trim：[你好]
+starts_with：true，ends_with：true
+find：6，-1

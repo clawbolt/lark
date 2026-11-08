@@ -1,0 +1,82 @@
+// llua · 语法树。解析时已经把名字解析好了：局部变量是函数里的槽位，被内层函数捕获的局部变量放在单独的格子（cell）里，
+// 内层函数通过上值（upvalue）拿到格子的编号；其余的名字是全局变量。
+
+// 二元运算
+pub const OP_ADD = 1
+pub const OP_SUB = 2
+pub const OP_MUL = 3
+pub const OP_DIV = 4
+pub const OP_IDIV = 5
+pub const OP_MOD = 6
+pub const OP_POW = 7
+pub const OP_CONCAT = 8
+pub const OP_EQ = 9
+pub const OP_NE = 10
+pub const OP_LT = 11
+pub const OP_LE = 12
+pub const OP_GT = 13
+pub const OP_GE = 14
+pub const OP_BAND = 15
+pub const OP_BOR = 16
+pub const OP_BXOR = 17
+pub const OP_SHL = 18
+pub const OP_SHR = 19
+// 一元运算
+pub const OP_NEG = 20
+pub const OP_NOT = 21
+pub const OP_LEN = 22
+pub const OP_BNOT = 23
+
+pub enum Ex {
+    ENil
+    ETrue
+    EFalse
+    EVararg
+    EInt(n: int)
+    ENum(f: float)
+    EStr(s: str)
+    ELocal(slot: int, name: str)
+    EUp(idx: int, name: str)
+    EGlobal(name: str)
+    EIndex(obj: Ex, key: Ex, line: int)
+    ECall(f: Ex, args: [Ex], line: int)
+    EMethod(obj: Ex, name: str, args: [Ex], line: int)
+    EFunc(proto: int)
+    EBin(op: int, a: Ex, b: Ex, line: int)
+    EAnd(a: Ex, b: Ex)
+    EOr(a: Ex, b: Ex)
+    EUn(op: int, a: Ex, line: int)
+    // 表构造：items 是没写键的项（按顺序放在 1、2、3…），keys / vals 是写了键的项
+    ETable(items: [Ex], keys: [Ex], vals: [Ex], line: int)
+    EParen(e: Ex)     // 括号把多个返回值截成一个
+}
+
+pub enum St {
+    SLocal(slots: [int], vals: [Ex], line: int)
+    SLocalFn(slot: int, proto: int)
+    SAssign(targets: [Ex], vals: [Ex], line: int)
+    SCall(e: Ex, line: int)
+    SDo(body: [St])
+    SWhile(cond: Ex, body: [St])
+    SRepeat(body: [St], cond: Ex)
+    SIf(conds: [Ex], blocks: [[St]], els: [St])
+    SNumFor(slot: int, start: Ex, limit: Ex, step: Ex, body: [St], line: int)
+    SGenFor(slots: [int], exprs: [Ex], body: [St], line: int)
+    SReturn(vals: [Ex], line: int)
+    SBreak
+}
+
+// 一个函数（主程序也是一个）
+pub type Proto {
+    pub name: str          // 报错用：函数名或 "main chunk"
+    pub line: int
+    pub nparams: int       // 参数占槽位 0..nparams
+    pub vararg: bool
+    pub nslots: int
+    pub boxed: [bool]      // 每个槽位是否被内层函数捕获（是的话放在格子里）
+    pub names: [str]       // 每个槽位的变量名，报错用
+    pub up_local: [bool]   // 第 i 个上值：true 表示是外层函数的槽位 up_idx[i]，false 表示是外层函数的第 up_idx[i] 个上值
+    pub up_idx: [int]
+    pub up_names: [str]
+    pub body: [St]
+}

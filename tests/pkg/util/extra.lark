@@ -1,0 +1,2 @@
+// 依赖包里的第二个模块：import "util/extra"
+pub fn greet() -> str { "来自 util/extra" }

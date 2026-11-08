@@ -1,0 +1,88 @@
+// 把鼠标交给里面的程序（lterm app 用；vim、htop、codex、tmux 打开 CSI ? 1000 / 1002 / 1003 / 1006 h 以后）。
+// 先证明再写：对应 formal/Lark/VtMouse.lean，函数和定义一一对应：
+//   M ↔ M（track：OFF / PRESS / DRAG / ANY ↔ Track 的 off / press / drag / any）、start ↔ start、is_mouse ↔ isMouse、
+//   track_of ↔ trackOf、set_mode ↔ setMode、Ev ↔ Ev（kind：K_PRESS / K_RELEASE / K_MOTION / K_WHEEL ↔ Kind）、
+//   base ↔ base、code ↔ code、wants ↔ wants、fin ↔ fin、sgr ↔ sgr、xcode ↔ xcode、x10 ↔ x10、report ↔ report。
+// 证明了：SGR 格式的报告交给阶段 1 的解析器正好解析成 CSI < [码, 列 + 1, 行 + 1] M / m（sgr_parse）；从码分得出是什么事件（code_*）；
+// 什么时候报（off_quiet、press_on、motion_*）；关掉以后不报（set_off）；老格式正好 6 个字节、都小于 256（x10_len）。
+// 和模型不一样的一处：报告是字节串（模型里是字节的列表），不报时是空串（模型里是 none）。
+
+pub const OFF = 0
+pub const PRESS = 1
+pub const DRAG = 2
+pub const ANY = 3
+
+pub const K_PRESS = 0
+pub const K_RELEASE = 1
+pub const K_MOTION = 2
+pub const K_WHEEL = 3
+
+pub type M {
+    pub track: int
+    pub sgr: bool
+}
+
+pub fn start() -> M { M(track: OFF, sgr: false) }
+
+pub fn is_mouse(n: int) -> bool { n == 1000 || n == 1002 || n == 1003 }
+
+pub fn track_of(n: int) -> int { if n == 1000 { PRESS } else if n == 1002 { DRAG } else { ANY } }
+
+// CSI ? n h / l
+pub fn set_mode(inout m: M, n: int, on: bool) {
+    if n == 1006 {
+        m.sgr = on
+    } else if is_mouse(n) {
+        m.track = if on { track_of(n) } else { OFF }
+    }
+}
+
+// btn：按下、松开时是哪个键（0 左、1 中、2 右）；拖动时按着的键；滚轮 0 上、1 下。
+// held：移动时有没有按着键。mods：1 Shift、2 Meta、4 Ctrl 加起来。x、y 从 0 开始
+pub type Ev {
+    pub kind: int
+    pub btn: int
+    pub held: bool
+    pub mods: int
+    pub x: int
+    pub y: int
+}
+
+pub fn base(e: Ev) -> int {
+    if e.kind == K_MOTION { return (if e.held { e.btn } else { 3 }) + 32 }
+    if e.kind == K_WHEEL { return 64 + e.btn }
+    e.btn
+}
+
+pub fn code(e: Ev) -> int { base(e) + 4 * e.mods }
+
+// 这个事件报不报
+pub fn wants(t: int, e: Ev) -> bool {
+    if t == OFF { return false }
+    if e.kind != K_MOTION { return true }
+    if t == PRESS { return false }
+    if t == DRAG { return e.held }
+    true
+}
+
+pub fn fin(e: Ev) -> int { if e.kind == K_RELEASE { 0x6D } else { 0x4D } }
+
+// ESC [ < 码 ; 列 + 1 ; 行 + 1 M（松开时是 m）
+pub fn sgr(e: Ev) -> str { "\x1b[<#{code(e)};#{e.x + 1};#{e.y + 1}" + from_byte(fin(e)) }
+
+// 老格式的码：松开时不知道是哪个键，是 3
+pub fn xcode(e: Ev) -> int { if e.kind == K_RELEASE { 3 + 4 * e.mods } else { code(e) } }
+
+// ESC [ M 32 + 码、33 + 列、33 + 行；放不下时是空串
+pub fn x10(e: Ev) -> str {
+    if 32 + xcode(e) < 256 && 33 + e.x < 256 && 33 + e.y < 256 {
+        return "\x1b[M" + from_byte(32 + xcode(e)) + from_byte(33 + e.x) + from_byte(33 + e.y)
+    }
+    ""
+}
+
+// 报给程序的字节（不报时是空串）
+pub fn report(m: M, e: Ev) -> str {
+    if !wants(m.track, e) { return "" }
+    if m.sgr { sgr(e) } else { x10(e) }
+}

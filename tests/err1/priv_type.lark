@@ -1,0 +1,6 @@
+// 期望错误：shapes.Inner 没有 pub（类型标注里用到也不行）
+import "../mods/shapes"
+
+fn main() {
+    x: shapes.Inner = shapes.Inner(n: 1)
+}

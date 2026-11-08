@@ -1,0 +1,118 @@
+// Lark 标准库 · 优先队列 Heap[T]（二叉堆，用 Lark 自己写）
+// 用法：import "std/heap"
+//
+//   h: heap.Heap[int] = heap.new()   // 或 heap.of([5, 1, 4])
+//   h.insert(3)
+//   h.peek_min()                     // T?：最小的元素的副本，不取出
+//   h.pop_min()                      // T?：取出最小的元素
+//   len(h)、h.is_empty()
+//   heap.into_sorted(h)              // 拿走 h，从小到大返回所有元素
+//
+// 元素要满足 Ord（int / float / str / 定义了 fn cmp 的类型）。要最大的先出来，就给元素类型写一个反过来的 cmp。
+// insert 和 pop_min 是 O(log n)。元素存成 T?：移动元素时用 replace 换成 None 再放到新位置，不用复制。
+
+pub type Heap[T] {
+    items: [T?]
+}
+
+pub fn new[T]() -> Heap[T] {
+    Heap(items: [])
+}
+
+pub fn of[T: Ord](xs: [T]) -> Heap[T] {
+    h: Heap[T] = new()
+    for x in xs { insert(&h, x.copy()) }
+    h
+}
+
+// len(h)：元素个数（只有 iter_len、没有 iter_at：堆里的顺序不是从小到大，不能 for in）
+pub fn iter_len[T](h: Heap[T]) -> int { len(h.items) }
+
+pub fn is_empty[T](h: Heap[T]) -> bool { len(h.items) == 0 }
+
+pub fn insert[T: Ord](inout h: Heap[T], take x: T) {
+    // 末尾留一个空位，比 x 大的父节点依次往下挪，最后把 x 放进空位
+    hole: T? = None
+    h.items.push(hole)
+    i = len(h.items) - 1
+    for i > 0 && lt_opt(x, h.items[(i - 1) / 2]) {
+        p = (i - 1) / 2
+        e: T? = None
+        v = replace(&h.items[p], e)
+        h.items[i] = v
+        i = p
+    }
+    h.items[i] = Some(x)
+}
+
+pub fn peek_min[T](h: Heap[T]) -> T? {
+    if len(h.items) == 0 { return None }
+    h.items[0].copy()
+}
+
+pub fn pop_min[T: Ord](inout h: Heap[T]) -> T? {
+    n = len(h.items)
+    if n == 0 { return None }
+    last = h.items.pop()
+    if n == 1 { return last }
+    // 取出根，把原来的最后一个元素从根往下沉：比它小的子节点依次往上挪
+    e0: T? = None
+    top = replace(&h.items[0], e0)
+    x = match take last {
+        Some(v) => v
+        None => panic("heap.pop_min：内部错误，堆里有空位")
+    }
+    m = len(h.items)
+    i = 0
+    for 2 * i + 1 < m {
+        l = 2 * i + 1
+        r = l + 1
+        ch = if r < m && less_at(h.items, r, l) { r } else { l }
+        if !opt_lt(h.items[ch], x) { break }
+        e: T? = None
+        w = replace(&h.items[ch], e)
+        h.items[i] = w
+        i = ch
+    }
+    h.items[i] = Some(x)
+    top
+}
+
+pub fn into_sorted[T: Ord](take h: Heap[T]) -> [T] {
+    out: [T] = []
+    for {
+        v = pop_min(&h)
+        match take v {
+            Some(x) => out.push(x)
+            None => break
+        }
+    }
+    out
+}
+
+// x < y（y 是空位时为 false）
+fn lt_opt[T: Ord](x: T, y: T?) -> bool {
+    match y {
+        Some(v) => x < v
+        None => false
+    }
+}
+
+// y < x（y 是空位时为 false）
+fn opt_lt[T: Ord](y: T?, x: T) -> bool {
+    match y {
+        Some(v) => v < x
+        None => false
+    }
+}
+
+// xs[a] < xs[b]
+fn less_at[T: Ord](xs: [T?], a: int, b: int) -> bool {
+    match xs[a] {
+        Some(u) => lt_opt(u, xs[b])
+        None => false
+    }
+}
+
+// "#{h}"：[1, 1, 4, 5]，从小到大（堆里的存放顺序没有意义）。要复制并排序一遍，O(n log n)，只适合调试和测试
+pub fn show[T: Ord](h: Heap[T]) -> str { "#{into_sorted(h.copy())}" }

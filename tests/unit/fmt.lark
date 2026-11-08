@@ -1,0 +1,64 @@
+// std/fmt 的边界：0、负数、最小的 int、四舍五入、不合法的 UTF-8、长短不一的表格
+import "std/fmt"
+import "std/math"
+
+test "进制" {
+    assert_eq(fmt.radix(0, 2), "0")
+    assert_eq(fmt.radix(35, 36), "z")
+    assert_eq(fmt.hex(255), "ff")
+    assert_eq(fmt.hex(-1), "-1")
+    assert_eq(fmt.bin(0), "0")
+    assert_eq(fmt.hex(math.MAX), "7fffffffffffffff")
+    assert_eq(fmt.hex(math.MIN), "-8000000000000000")
+    assert_eq(len(fmt.bin(math.MIN)), 65)
+}
+
+test "千分位和定点小数" {
+    assert_eq(fmt.thousands(0), "0")
+    assert_eq(fmt.thousands(999), "999")
+    assert_eq(fmt.thousands(1000), "1,000")
+    assert_eq(fmt.thousands(-100), "-100")
+    assert_eq(fmt.thousands(-1000), "-1,000")
+    assert_eq(fmt.thousands(math.MIN), "-9,223,372,036,854,775,808")
+    assert_eq(fmt.fixed(0, 2), "0.00")
+    assert_eq(fmt.fixed(5, 2), "0.05")
+    assert_eq(fmt.fixed(-5, 2), "-0.05")
+    assert_eq(fmt.fixed(100, 2), "1.00")
+    assert_eq(fmt.fixed(123, 0), "123")
+    assert_eq(fmt.fixed(123, -1), "123")
+    // 0.125 和 2.5 在二进制里是精确的，四舍五入远离 0
+    assert_eq(fmt.fixed(0.125, 2), "0.13")
+    assert_eq(fmt.fixed(-0.125, 2), "-0.13")
+    assert_eq(fmt.fixed(2.5, 0), "3")
+    assert_eq(fmt.fixed(-2.5, 0), "-3")
+    assert_eq(fmt.fixed(math.INF, 2), float_str(math.INF))
+}
+
+test "显示宽度和对齐" {
+    assert_eq(fmt.width(""), 0)
+    assert_eq(fmt.width("ab"), 2)
+    assert_eq(fmt.width("中文"), 4)
+    assert_eq(fmt.width("😀"), 2)
+    // e 后面跟一个组合用的重音符（U+0301）
+    assert_eq(fmt.width("e" + from_byte(0xCC) + from_byte(0x81)), 1)
+    assert_eq(fmt.width("—…"), 2)
+    // 不合法的字节和截断的字符：每个字节一列
+    assert_eq(fmt.width(from_byte(0xff)), 1)
+    assert_eq(fmt.width(slice("中", 0, 2)), 2)
+    assert_eq(fmt.align_left("中", 4), "中  ")
+    assert_eq(fmt.align_right("中", 4), "  中")
+    assert_eq(fmt.align_center("ab", 5), " ab  ")
+    assert_eq(fmt.align_center("abc", 2), "abc")
+    assert_eq(fmt.align_left("abc", -1), "abc")
+}
+
+test "表格" {
+    t = fmt.table([["名字", "数量"], ["苹果", "3"], ["香蕉", "12"]])
+    assert_eq(t, "名字  数量\n----------\n苹果     3\n香蕉    12")
+    // 只有表头时不画分隔线
+    assert_eq(fmt.table([["a", "b"]]), "a  b")
+    none: [[str]] = []
+    assert_eq(fmt.table(none), "")
+    // 行长短不一：短的行只写到自己的最后一格，行尾没有空格；有一格不是数字的列靠左
+    assert_eq(fmt.table([["k"], ["a", "1"], ["bb", "x"]]), "k\n-----\na   1\nbb  x")
+}

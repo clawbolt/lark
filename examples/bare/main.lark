@@ -1,0 +1,60 @@
+// 没有操作系统时运行的 Lark 程序（见同目录的 plat.c、bare.h、run.sh）：只用计算层和格式模块，
+// 编译器自动只带运行时的核心；编译 C 时加上 LK_BARE，输出、退出、时间、随机数和内存都交给 plat.c。
+// 解析一段传感器读数（JSON），按设备汇总，排序后输出，再用 digest 算一个摘要，最后用 exit 结束
+import "std/json"
+import "std/map"
+import "std/sort"
+import "std/digest"
+
+const DATA = "[{\"dev\": \"temp\", \"v\": 21}, {\"dev\": \"hum\", \"v\": 40}, {\"dev\": \"temp\", \"v\": 23}, {\"dev\": \"door\", \"v\": 1}, {\"dev\": \"hum\", \"v\": 44}]"
+
+type Reading {
+    dev: str
+    v: int
+}
+
+fn readings(src: str) -> [Reading]! {
+    j = json.parse(src)?
+    out: [Reading] = []
+    for i in 0..json.count(j) {
+        r = json.at(j, i) ?? json.Null
+        dev = json.path_str(r, "dev") ?? "?"
+        v = json.path_int(r, "v") ?? 0
+        out.push(Reading(dev: dev, v: v))
+    }
+    Ok(out)
+}
+
+fn main() {
+    rs = match take readings(DATA) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    // 每个设备的读数之和和次数
+    sums: map.Map[str, int] = map.new()
+    counts: map.Map[str, int] = map.new()
+    for r in rs {
+        sums.update(r.dev, r.v, |s| s + r.v)
+        counts.update(r.dev, 1, |n| n + 1)
+    }
+    names: [str] = []
+    for k in sums.keys { names.push(k.copy()) }
+    sort.sort(&names)
+    lines: [str] = []
+    for n in names {
+        total = sums.get(n) ?? 0
+        times = counts.get(n) ?? 1
+        line = "#{n}：#{times} 次，平均 #{total / times}"
+        print(line)
+        lines.push(line)
+    }
+    // 定宽整数：读数打包成寄存器的值
+    reg: u16 = 0
+    for r in rs { reg = reg | (1 << (r.v % 16)).wrap_u16() }
+    print("寄存器：#{reg}")
+    report = join(lines, "\n")
+    abc = digest.to_hex(digest.sha256("abc".to_bytes()))
+    print("报告 #{len(report)} 字节，sha256(abc) 开头是 #{slice(abc, 0, 16)}")
+    // panic 和 exit 都走 lark_plat_exit
+    exit(3)
+}

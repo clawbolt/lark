@@ -1,0 +1,56 @@
+// llsp：Lark 的语言服务器（Language Server Protocol），先证明再写。
+// 构建：在 apps/llsp 里 lark build，得到 build/llsp；编辑器用 stdin / stdout 和它说话。
+// 接到 Neovim、Helix、VS Code 上：见 apps/llsp/editors/README.md。
+//   阶段 1：lsp/frame（基础协议的分帧）、lsp/pos（位置和字节偏移的换算，UTF-16 / UTF-8）、lsp/edit（didChange 的增量修改），
+//     证明在 formal/Lark/Lsp.lean；
+//   阶段 2：lsp/server（JSON-RPC 的请求和回复，initialize / shutdown / exit 的生命周期），证明在 formal/Lark/LspRpc.lean。
+//   阶段 3：lsp/docs（didOpen / didChange / didClose，记着打开的文档），证明在 formal/Lark/LspDoc.lean。
+//   阶段 4：lsp/diag（打开、改了文档以后用 lark1 检查，发 textDocument/publishDiagnostics），证明在 formal/Lark/LspDiag.lean。
+//   阶段 5：lsp/defn（textDocument/definition：扫描声明，跳到定义），证明在 formal/Lark/LspDef.lean。
+//   阶段 6：lsp/symbols（textDocument/documentSymbol：文档大纲），证明在 formal/Lark/LspSym.lean。
+//   阶段 7：lsp/format（textDocument/formatting：交给 build/lark-fmt，只换不一样的那段），证明在 formal/Lark/LspFmt.lean。
+//   阶段 8：lsp/complete（textDocument/completion：本文件的声明、关键字，模块. 后面是那个文件 pub 的声明），证明在 formal/Lark/LspComp.lean。
+//   阶段 9：lsp/semantic（textDocument/semanticTokens/full：语义高亮，给参数、局部变量、字段、函数、类型上色），证明在 formal/Lark/LspSem.lean。
+//   别的请求都回复 -32601（MethodNotFound）。测试见 tests.lark。
+import "std/io"
+import "lsp/server"
+import "lsp/diag"
+
+fn main() {
+    s = server.new()
+    // 用来检查文档的编译器；找不到时照样工作，只是没有诊断
+    home = diag.find_home()
+    if home == "" { eprint("llsp：找不到 Lark 的安装目录（设置 LARK_HOME，里面要有 build/lark1），不发诊断") }
+    buf = ""
+    w = io.stdout()
+    for true {
+        chunk = match take try_fd_read(0, 65536) {
+            Ok(c) => c
+            Err(e) => {
+                eprint("llsp：读 stdin 出错：#{e}")
+                exit(1)
+            }
+        }
+        // stdin 关了还没有 exit：和没有 shutdown 就 exit 一样，退出码 1
+        if chunk == "" { exit(1) }
+        buf += chunk
+        out, code = match take server.feed(&s, &buf, home) {
+            Ok(r) => r
+            Err(e) => {
+                eprint("llsp：#{e}")
+                exit(1)
+            }
+        }
+        if out != "" {
+            match w.write(out) {
+                Ok => {}
+                Err(_) => { exit(1) }
+            }
+            match w.flush() {
+                Ok => {}
+                Err(_) => { exit(1) }
+            }
+        }
+        if code >= 0 { exit(code) }
+    }
+}

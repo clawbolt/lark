@@ -1,0 +1,72 @@
+// lproxy · 转发：选上游、改头部、发请求、把回复带回来。不碰监听的套接字，单元测试直接调用
+import "std/http"
+import "std/net"
+import "std/str"
+import "std/timer"
+
+// 一条转发规则：路径以 prefix 开头的请求交给 base（http://主机:端口，后面不带路径）。路径原样带过去，不去掉前缀
+pub type Upstream {
+    pub prefix: str     // "/" 或者 "/api" 这样不带结尾 / 的
+    pub base: str
+}
+
+// "/api=http://127.0.0.1:9000" → Upstream
+pub fn parse_rule(s: str) -> Upstream! {
+    prefix, base = str.cut(s, "=") ?? ("", "")
+    if prefix == "" || base == "" { return Err("规则要写成 前缀=http://主机:端口：#{s}") }
+    if !str.starts_with(prefix, "/") { return Err("前缀要以 / 开头：#{s}") }
+    if prefix != "/" && str.ends_with(prefix, "/") { return Err("前缀不要以 / 结尾（/api 就包括了 /api/…）：#{s}") }
+    if str.contains(prefix, "{") || str.contains(prefix, "}") { return Err("前缀里不能有 { }：#{s}") }
+    _h, _p, path = http.parse_url(base)?
+    if path != "/" || str.ends_with(base, "/") { return Err("上游只写 http://主机:端口，不带路径：#{s}") }
+    Ok(Upstream(prefix: prefix, base: base))
+}
+
+// 每条规则在路由里的写法：/ 是 "/{rest...}"，/api 是 "/api" 和 "/api/{rest...}"（不写方法：什么方法都转）。
+// 路由取最具体的，所以 /api/x 走 /api 那条，/apix 和别的走 /
+pub fn patterns(u: Upstream) -> [str] {
+    if u.prefix == "/" { return ["/{rest...}"] }
+    [u.prefix.copy(), u.prefix + "/{rest...}"]
+}
+
+// 只管这一跳的头部，不转给对面（RFC 9110 第 7.6.1 节）；Host 由 Client 按上游写，长度按转过去的正文重新算
+fn hop_by_hop(name: str) -> bool {
+    name == "connection" || name == "keep-alive" || name == "proxy-connection" || name == "transfer-encoding" ||
+        name == "te" || name == "trailer" || name == "upgrade" || name == "proxy-authorization" || name == "proxy-authenticate"
+}
+
+// 转给上游的头部：去掉只管这一跳的、Host、Content-Length，加上 X-Forwarded-Host 和 Via
+pub fn request_headers(req: http.Request) -> [(str, str)] {
+    out: [(str, str)] = []
+    for (k, v) in req.headers {
+        if !hop_by_hop(k) && k != "host" && k != "content-length" { out.push((k.copy(), v.copy())) }
+    }
+    host = http.header(req, "host") ?? ""
+    if host != "" { out.push(("x-forwarded-host", host)) }
+    out.push(("via", "1.1 lproxy"))
+    out
+}
+
+// 带回给客户端的头部：去掉只管这一跳的和 Content-Length（正文已经解开 chunked，serve 会按它重新写长度）
+pub fn response_headers(r: http.Response) -> [(str, str)] {
+    out: [(str, str)] = []
+    for (k, v) in r.headers {
+        if !hop_by_hop(k) && k != "content-length" { out.push((k.copy(), v.copy())) }
+    }
+    out
+}
+
+// 把 req 转给 base，用 cl 发（cl 不跟随重定向，原样带回 3xx）。上游连不上、断了回 502，
+// 读写超过 timeout_ms 回 504；err 里写上原因，给调用的地方记日志
+pub fn forward(inout cl: http.Client, base: str, req: http.Request, timeout_ms: int, inout err: str) -> http.Response {
+    cl.set_timeout_ms(timeout_ms)
+    cl.set_max_redirects(0)
+    d = timer.deadline(timeout_ms)
+    match take cl.request(req.method, base + req.target, request_headers(req), req.body) {
+        Ok(r) => http.reply(r.status, response_headers(r), r.body)
+        Err(e) => {
+            err = e.copy()
+            if net.is_timeout(e) || d.is_expired() { http.reply_error(504) } else { http.reply_error(502) }
+        }
+    }
+}

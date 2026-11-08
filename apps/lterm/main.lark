@@ -1,0 +1,79 @@
+// lterm：从零写的终端仿真（类似 libghostty-vt），先证明再写。
+// 构建：在 apps/lterm 里 lark build，得到 build/lterm。
+//   阶段 1：vt/parse（转义序列的解析器：DEC / ANSI 的状态机），证明在 formal/Lark/VtParse.lean。
+//   阶段 2：vt/decode（UTF-8 的流式解码：字符切在两段之间也能拼上，坏字节是 U+FFFD）、vt/width（字符占几个格子），证明在 formal/Lark/VtUtf8.lean。
+//   阶段 3：vt/screen（屏幕：格子、光标、自动换行、擦除、插入删除、滚动区域），证明在 formal/Lark/VtScreen.lean；
+//     vt/term 把解析器、解码、屏幕串起来（没有证明）。
+//   阶段 4：vt/style（颜色和样式：CSI … m），证明在 formal/Lark/VtSgr.lean；屏幕的每一格带着样式。
+//   阶段 5：vt/mode（模式：自动换行、显示光标、括号粘贴；备用屏幕；保存光标），证明在 formal/Lark/VtMode.lean。
+//   阶段 6：滚动缓冲（滚出屏幕顶上的行）和改大小，证明在 formal/Lark/VtSb.lean。
+//   阶段 7：lterm run（live.lark）：在伪终端里跑 shell，屏幕画到外面的终端上，只画变了的地方（vt/draw），证明在 formal/Lark/VtDraw.lean。
+//   阶段 8：lterm run 里翻看滚动缓冲（Ctrl-] [，vt/view），证明在 formal/Lark/VtView.lean。
+//   阶段 9：回答终端查询（光标位置、终端是什么），方向键和小键盘的模式交给外面的终端，证明在 formal/Lark/VtReply.lean。
+//   阶段 10：画框线的字符集（ESC ( 0、SO / SI，vt/charset），证明在 formal/Lark/VtCharset.lean。
+//   阶段 11：滚动区域从顶上开始时（codex 这类下面留一块界面的程序）滚出去的行也进滚动缓冲，证明在 formal/Lark/VtRegion.lean。
+//   阶段 12：lterm app 里用鼠标选中（拖、双击选词、三击选行）、⌘C 复制，证明在 formal/Lark/VtSel.lean；还有窗口标题、⌘+ / ⌘- 改字号。
+//   阶段 13：程序打开 ?1000 / 1002 / 1003 / 1006 时把鼠标和滚轮交给它（vt/mouse），证明在 formal/Lark/VtMouse.lean。
+//   之后：lterm app（app.lark）：自己开一个窗口（macOS，vt/win、native/gui.c），不用在别的终端里启动；只画变了的行（VtDraw.lean）。
+//   build/lterm run [命令]          真的终端：在里面跑 $SHELL（或者给的命令），退出 shell 就回来
+//   build/lterm app [命令]          一样，但是自己开一个窗口（macOS）：关窗口或者退出 shell 就结束
+//   sh macos/make_app.sh [--install]  打包成 build/lterm.app（装到 ~/Applications）：双击就开窗口，在家目录跑登录 shell
+// 其余的用法从标准输入读字节：
+//   build/lterm                    一行一个写出解析出的动作，用来看一个程序到底发了哪些转义序列
+//   build/lterm --screen 行 列     喂给一个 行 × 列 的屏幕，最后把屏幕写出来（每行两边加 |）
+//   build/lterm --ansi 行 列       一样，但是带着颜色和样式写出来（CSI … m）
+//   build/lterm --all 行 列        先写滚动缓冲里的行（前面加 :），再写屏幕
+//   printf 'ab\033[1;31mc\033[0m' | build/lterm
+//   printf 'hello\033[1;3H\033[K' | build/lterm --screen 3 10
+//   printf '\033[1;31mred\033[0m ok' | build/lterm --ansi 1 10
+// 测试见 tests.lark。
+import "std/io"
+import "std/str"
+import "vt/parse"
+import "vt/term"
+
+// 从 Finder / Dock 启动的程序：当前目录是 /，PATH 只有系统的，常常没有 LANG。
+// 所以像"终端"一样：回到家目录，没有 LANG 时用 UTF-8，跑登录 shell（读 ~/.zprofile 这些，PATH 才对）
+const BUNDLE_SHELL = "cd ~ && : ${LANG:=en_US.UTF-8} && export LANG && exec \"${SHELL:-/bin/zsh}\" -l"
+
+fn main() {
+    av = args()
+    // 从 lterm.app 启动（双击、Dock、open）：没有参数（老的 macOS 会给一个 -psn_…），直接开窗口
+    if len(av) >= 1 && str.contains(av[0], ".app/Contents/MacOS/") && (len(av) == 1 || str.starts_with(av[1], "-psn")) {
+        exit(app(BUNDLE_SHELL))
+    }
+    if len(av) >= 2 && (av[1] == "run" || av[1] == "app") {
+        cmd = ""
+        for i in 2..len(av) { cmd += if i > 2 { " " + av[i] } else { av[i].copy() } }
+        exit(if av[1] == "app" { app(cmd) } else { live(cmd) })
+    }
+    r = io.stdin()
+    d = match take io.read_all(&r) {
+        Ok(x) => x
+        Err(e) => {
+            eprint("lterm：读 stdin 出错：#{e}")
+            exit(1)
+        }
+    }
+    if len(av) >= 2 && (av[1] == "--screen" || av[1] == "--ansi" || av[1] == "--all") {
+        color = av[1] == "--ansi"
+        rows = if len(av) >= 3 { try_parse_int(av[2]) ?? 24 } else { 24 }
+        cols = if len(av) >= 4 { try_parse_int(av[3]) ?? 80 } else { 80 }
+        if rows <= 0 || cols <= 0 {
+            eprint("lterm：屏幕的行数、列数要大于 0")
+            exit(2)
+        }
+        t = term.new(rows, cols)
+        term.feed(&t, d)
+        if av[1] == "--all" {
+            for h in term.history(t) { print(":" + h + ":") }
+        }
+        for i in 0..rows {
+            l = if color { term.ansi(t, i) } else { term.text(t, i) }
+            print("|" + l + "|")
+        }
+        return
+    }
+    p = parse.new()
+    for a in parse.run(&p, d) { print(parse.show(a)) }
+}

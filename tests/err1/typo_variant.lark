@@ -1,0 +1,14 @@
+// 期望错误：Cirle 不是 Shape 的变体，提示 Circle
+enum Shape {
+    Circle(r: int)
+    Square(a: int)
+}
+
+fn area(s: Shape) -> int {
+    match s {
+        Cirle(r) => r * r * 3
+        Square(a) => a * a
+    }
+}
+
+fn main() {}

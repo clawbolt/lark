@@ -1,0 +1,84 @@
+// lgrep · 在一段文字里逐行找，得到要打印的内容。不碰文件，单元测试直接调用
+import "std/re"
+import "std/term"
+
+pub type Opts {
+    pub number: bool        // -n：行号
+    pub count: bool         // -c：只打印匹配的行数
+    pub files_only: bool    // -l：只打印有匹配的文件名
+    pub invert: bool        // -v：不匹配的行
+    pub color: bool         // --color：把匹配的部分标成红色
+    pub with_name: bool     // 每行前面加文件名（不止一个文件时）
+}
+
+const BINARY_PROBE = 8000   // 前这么多个字节里有 0 字节就当二进制文件
+
+// 在 text（文件 name 的内容）里找；返回要打印的内容和匹配的行数。
+// 忽略大小写时整段只转一次小写；每行用 [start, e) 的位置去匹配，只有要打印的行才切出来
+pub fn scan(r: re.Re, text: str, name: str, o: Opts) -> (str, int) {
+    binary = is_binary(text)
+    subj = re.casefold(r, text)
+    m = re.matcher(r)
+    out = ""
+    hits = 0
+    start = 0
+    lineno = 0
+    for start < len(text) {
+        e = line_end(text, start)
+        lineno += 1
+        hit = re.is_match_in(&m, subj, start, e) != o.invert
+        if hit {
+            hits += 1
+            if o.files_only { return ("#{name}\n", hits) }
+            if !o.count && !binary {
+                if o.with_name { out += name + ":" }
+                if o.number { out += "#{lineno}:" }
+                out += if o.color && !o.invert { highlight(&m, text, subj, start, e) } else { slice(text, start, e) }
+                out += "\n"
+            }
+        }
+        start = e + 1
+    }
+    if o.count {
+        pre = if o.with_name { name + ":" } else { "" }
+        return ("#{pre}#{hits}\n", hits)
+    }
+    if binary && hits > 0 { return ("二进制文件 #{name} 有匹配\n", hits) }
+    (out, hits)
+}
+
+// 从 start 开始这一行的结尾（\n 的位置，没有 \n 时是文字的长度）
+fn line_end(text: str, start: int) -> int {
+    i = start
+    n = len(text)
+    for i < n && byte_at(text, i) != '\n' { i += 1 }
+    i
+}
+
+fn is_binary(text: str) -> bool {
+    n = if len(text) < BINARY_PROBE { len(text) } else { BINARY_PROBE }
+    for i in 0..n {
+        if byte_at(text, i) == 0 { return true }
+    }
+    false
+}
+
+// [lo, hi) 这一行里所有不重叠的匹配都标出来。在 subj（转成小写以后的 text，长度一样）上找、从 text 里取原文
+fn highlight(inout m: re.Matcher, text: str, subj: str, lo: int, hi: int) -> str {
+    out = ""
+    pos = lo
+    for pos <= hi {
+        a, b = re.find_in(&m, subj, lo, hi, pos) ?? (-1, -1)
+        if a < 0 { break }
+        if b == a {
+            // 空的匹配（比如 x*）：不标，往前走一个字节
+            if a >= hi { break }
+            out += slice(text, pos, a + 1)
+            pos = a + 1
+            continue
+        }
+        out += slice(text, pos, a) + term.style(slice(text, a, b), "1;31")
+        pos = b
+    }
+    out + slice(text, pos, hi)
+}

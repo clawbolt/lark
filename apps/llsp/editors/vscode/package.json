@@ -1,0 +1,47 @@
+{
+  "name": "lark-llsp",
+  "displayName": "Lark (llsp)",
+  "description": "Lark 语言：语法高亮、诊断、跳到定义、文档大纲、格式化、补全、语义高亮（语言服务器 llsp）",
+  "version": "0.1.0",
+  "publisher": "lark",
+  "license": "MIT",
+  "engines": { "vscode": "^1.82.0" },
+  "categories": ["Programming Languages"],
+  "main": "./extension.js",
+  "activationEvents": ["onLanguage:lark"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "lark",
+        "aliases": ["Lark", "lark"],
+        "extensions": [".lark"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "lark",
+        "scopeName": "source.lark",
+        "path": "./syntaxes/lark.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Lark (llsp)",
+      "properties": {
+        "llsp.path": {
+          "type": "string",
+          "default": "llsp",
+          "description": "llsp 的路径；不填时用仓库里的 apps/llsp/build/llsp（扩展从仓库里运行时）"
+        },
+        "llsp.larkHome": {
+          "type": "string",
+          "default": "",
+          "description": "Lark 的安装目录（里面有 build/lark1 和 std/），用来检查代码发诊断；不填时 llsp 从自己所在的目录往上找"
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

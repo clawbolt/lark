@@ -1,0 +1,36 @@
+// 信号：给自己发信号（sh 的 $PPID 就是测试进程），看 wait 收到什么
+import "std/signal"
+import "std/os"
+
+test "名字" {
+    assert_eq(signal.name(signal.INT), "SIGINT")
+    assert_eq(signal.name(signal.TERM), "SIGTERM")
+    assert_eq(signal.name(signal.HUP), "SIGHUP")
+    assert_eq(signal.name(signal.QUIT), "SIGQUIT")
+    assert_eq(signal.name(9), "信号 9")
+}
+
+test "收到自己发的信号" {
+    s = match take signal.notify([signal.TERM]) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    assert_eq("#{s}", "Signals(SIGTERM)")
+    // 登记以后 SIGTERM 不再结束进程
+    assert_eq(os.shell("kill -TERM $PPID"), 0)
+    assert_eq(s.wait() ?? 0, signal.TERM)
+}
+
+test "不在这一组里的信号丢掉" {
+    hup = match take signal.notify([signal.HUP, signal.TERM]) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    assert_eq("#{hup}", "Signals(SIGHUP, SIGTERM)")
+    term = match take signal.notify([signal.TERM]) {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    assert_eq(os.shell("kill -HUP $PPID; kill -TERM $PPID"), 0)
+    assert_eq(term.wait() ?? 0, signal.TERM)
+}

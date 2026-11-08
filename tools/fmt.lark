@@ -1,0 +1,285 @@
+// lark-fmt：Lark 源码的格式化工具（用 Lark 自己写，需要 lark1 及以后的版本）
+// 构建：make fmt-tool（得到 build/lark-fmt）
+//
+//   lark-fmt 文件…              就地改写（只在有变化时写回）
+//   lark-fmt --check 文件…      只检查：列出还没格式化的文件，有的话以 1 退出
+//   lark-fmt --stdout 文件…     把格式化的结果打印到标准输出
+//
+// 只调整空白，不改变代码的意思（也不会挪动换行，所以 } else 之类的写法照旧）：
+// - 缩进：每层 { ( [ 缩进 4 格，同一行里打开的几个括号只算一层；以 } ) ] 开头的行和打开它的那一行对齐。
+// - 续行：上一行以运算符（+ && = => -> ?? 等）结尾，或者这一行以 . 开头时，比语句的第一行多缩进 4 格；
+//   续行上打开的括号按语句的第一行算（多行的 if 条件后面的块照常缩进 4 格）。
+// - 行内：连续的空格合成一个；( [ 后面和 ) ] , 前面不留空格；, 后面留一个空格；
+//   { 前后、} 前各留一个空格（{} 除外）。行尾注释前面的空格原样保留，方便对齐。
+// - 去掉行尾空白和 \r；连续的空行合成一行；文件开头、{ 之后、} 之前的空行去掉；文件以一个换行结尾。
+// - 字符串（包括跨行的字符串和 #{ } 插值）、字符字面量和注释的内容原样保留。
+
+// 还没闭合的括号
+type Open {
+    ch: int
+    indent: int     // 打开它的那一行的缩进
+}
+
+// 跨行保持的扫描状态
+type St {
+    stack: [Open]
+    in_str: bool    // 正在字符串里（字符串可以跨行）
+    interp: int     // 字符串插值 #{ … } 里的花括号层数；0 表示不在插值里（同编译器的词法分析，只数花括号）
+    cont: bool      // 上一个代码行以运算符结尾：下一行是续行
+    stmt: int       // 当前语句第一行的缩进
+}
+
+// 一行的结果：text 是整行（含缩进），code 是去掉注释和行尾空白后的代码部分（判断续行用）
+type Line {
+    text: str
+    code: str
+}
+
+fn spaces(n: int) -> str {
+    out = ""
+    for _k in 0..n { out = out + " " }
+    out
+}
+
+fn is_blank(b: int) -> bool { b == ' ' || b == '\t' || b == '\r' }
+
+fn trim_left(s: str) -> str {
+    i = 0
+    for i < len(s) && is_blank(byte_at(s, i)) { i += 1 }
+    slice(s, i, len(s))
+}
+
+fn trim_right(s: str) -> str {
+    j = len(s)
+    for j > 0 && is_blank(byte_at(s, j - 1)) { j -= 1 }
+    slice(s, 0, j)
+}
+
+// 行首空白的宽度（tab 算 4 格）
+fn lead(s: str) -> int {
+    w = 0
+    for k in 0..len(s) {
+        b = byte_at(s, k)
+        if b == ' ' {
+            w += 1
+        } else if b == '\t' {
+            w += 4
+        } else {
+            return w
+        }
+    }
+    w
+}
+
+fn last_byte(s: str) -> int { if len(s) == 0 { 0 } else { byte_at(s, len(s) - 1) } }
+
+fn is_closer(b: int) -> bool { b == ')' || b == ']' || b == '}' }
+
+// 行尾的这些运算符表示语句还没写完（同编译器词法分析的续行规则，括号和逗号除外）
+fn ends_with_op(s: str) -> bool {
+    n = len(s)
+    if n == 0 { return false }
+    if n >= 2 {
+        t = slice(s, n - 2, n)
+        if t == "==" || t == "!=" || t == "<=" || t == ">=" || t == "&&" || t == "||" || t == "+=" ||
+            t == "-=" || t == "*=" || t == ".." || t == "->" || t == "=>" || t == "??" {
+            return true
+        }
+    }
+    b = byte_at(s, n - 1)
+    b == '+' || b == '-' || b == '*' || b == '/' || b == '%' || b == '<' || b == '>' || b == '!' ||
+        b == '=' || b == '&' || b == ':' || b == '.' || b == '|' || b == '^'
+}
+
+// 格式化一行里的代码（行首空白已去掉），同时更新括号和字符串的状态；这一行打开的括号记为缩进 open_ind
+fn fmt_code(inout st: St, s: str, open_ind: int) -> Line {
+    out = ""
+    code = ""
+    has_comment = false
+    n = len(s)
+    i = 0
+    for i < n {
+        b = byte_at(s, i)
+        if st.in_str {
+            if st.interp > 0 {
+                if b == '{' { st.interp += 1 }
+                if b == '}' { st.interp -= 1 }
+                out = out + from_byte(b)
+                i += 1
+            } else if b == '\\' && i + 1 < n {
+                out = out + slice(s, i, i + 2)
+                i += 2
+            } else if b == '#' && i + 1 < n && byte_at(s, i + 1) == '{' {
+                st.interp = 1
+                out = out + "\#{"
+                i += 2
+            } else {
+                if b == '"' { st.in_str = false }
+                out = out + from_byte(b)
+                i += 1
+            }
+        } else if b == '/' && i + 1 < n && byte_at(s, i + 1) == '/' {
+            // 注释：内容原样，前面至少一个空格
+            code = trim_right(out)
+            has_comment = true
+            if out != "" && !is_blank(last_byte(out)) { out = out + " " }
+            out = out + trim_right(slice(s, i, n))
+            i = n
+        } else if is_blank(b) {
+            j = i
+            for j < n && is_blank(byte_at(s, j)) { j += 1 }
+            nb = if j < n { byte_at(s, j) } else { 0 }
+            lb = last_byte(out)
+            if j >= n || lb == '(' || lb == '[' || nb == ')' || nb == ']' || nb == ',' {
+                // 行尾、( [ 之后、) ] , 之前不留空格
+            } else if nb == '/' && j + 1 < n && byte_at(s, j + 1) == '/' {
+                out = out + slice(s, i, j)
+            } else {
+                out = out + " "
+            }
+            i = j
+        } else if b == '"' {
+            st.in_str = true
+            out = out + "\""
+            i += 1
+        } else if b == '\'' {
+            // 字符字面量 'a'、'\n'：原样
+            j = i + 1
+            if j < n && byte_at(s, j) == '\\' { j += 1 }
+            j += 1
+            if j < n && byte_at(s, j) == '\'' { j += 1 }
+            if j > n { j = n }
+            out = out + slice(s, i, j)
+            i = j
+        } else {
+            pb = last_byte(out)
+            if b == '{' && out != "" && !is_blank(pb) && pb != '(' && pb != '[' { out = out + " " }
+            if b == '}' && out != "" && !is_blank(pb) && pb != '{' { out = out + " " }
+            out = out + from_byte(b)
+            if b == '(' || b == '[' || b == '{' {
+                st.stack.push(Open(ch: b, indent: open_ind))
+            } else if is_closer(b) && len(st.stack) > 0 {
+                st.stack.pop()
+            }
+            nx = if i + 1 < n { byte_at(s, i + 1) } else { 0 }
+            if b == ',' && nx != 0 && !is_blank(nx) && nx != ')' && nx != ']' { out = out + " " }
+            if b == '{' && nx != 0 && !is_blank(nx) && nx != '}' { out = out + " " }
+            i += 1
+        }
+    }
+    if !has_comment { code = trim_right(out) }
+    Line(text: out, code: code)
+}
+
+fn fmt_line(inout st: St, raw: str) -> Line {
+    if st.in_str {
+        // 从跨行字符串中间开始的行原样保留，只更新状态
+        _r = fmt_code(&st, raw, lead(raw))
+        st.cont = false
+        return Line(text: raw.copy(), code: "")
+    }
+    body = trim_left(raw)
+    if body == "" { return Line(text: "", code: "") }
+    first = byte_at(body, 0)
+    comment = len(body) > 1 && first == '/' && byte_at(body, 1) == '/'
+    dot = first == '.' && !(len(body) > 1 && byte_at(body, 1) == '.')
+    top = len(st.stack) - 1
+    ind = 0
+    is_cont = (st.cont || dot) && !is_closer(first)
+    if is_closer(first) && top >= 0 {
+        ind = st.stack[top].indent
+    } else {
+        ind = if top >= 0 { st.stack[top].indent + 4 } else { 0 }
+        if is_cont && st.stmt + 4 > ind { ind = st.stmt + 4 }
+    }
+    if !comment && !is_cont { st.stmt = ind }
+    // 续行上打开的括号属于整条语句：多行的 if 条件后面的 { 里，内容比语句的第一行多缩进 4 格
+    open_ind = if is_cont { st.stmt } else { ind }
+    ln = fmt_code(&st, body, open_ind)
+    // 注释行不影响续行的判断
+    if !comment { st.cont = !st.in_str && ends_with_op(ln.code) }
+    Line(text: spaces(ind) + ln.text, code: ln.code)
+}
+
+fn split_lines(s: str) -> [str] {
+    out: [str] = []
+    start = 0
+    for k in 0..len(s) {
+        if byte_at(s, k) == '\n' {
+            out.push(slice(s, start, k))
+            start = k + 1
+        }
+    }
+    if start < len(s) { out.push(slice(s, start, len(s))) }
+    out
+}
+
+fn format(src: str) -> str {
+    st = St(stack: [], in_str: false, interp: 0, cont: false, stmt: 0)
+    out: [str] = []
+    prev_code = ""      // 上一个输出行的代码部分
+    blank = false       // 中间有没有被跳过的空行
+    lines = split_lines(src)
+    for raw in lines {
+        verbatim = st.in_str
+        ln = fmt_line(&st, raw)
+        if !verbatim && ln.text == "" {
+            blank = true
+        } else {
+            body = trim_left(ln.text)
+            closer = !verbatim && len(body) > 0 && byte_at(body, 0) == '}'
+            if blank && len(out) > 0 && last_byte(prev_code) != '{' && !closer { out.push("") }
+            blank = false
+            out.push(ln.text.copy())
+            prev_code = if verbatim { "" } else { ln.code.copy() }
+        }
+    }
+    if len(out) == 0 { return "" }
+    join(out, "\n") + "\n"
+}
+
+fn usage() {
+    eprint("用法：lark-fmt [--check | --stdout] 文件…")
+    exit(2)
+}
+
+fn main() {
+    av = args()
+    mode = "write"
+    files: [str] = []
+    for i in 1..len(av) {
+        if av[i] == "--check" {
+            mode = "check"
+        } else if av[i] == "--stdout" {
+            mode = "stdout"
+        } else if len(av[i]) > 0 && byte_at(av[i], 0) == '-' {
+            usage()
+        } else {
+            files.push(av[i])
+        }
+    }
+    if len(files) == 0 { usage() }
+    bad = 0
+    for f in files {
+        src = match try_read_file(f) {
+            Ok(s) => s.copy()
+            Err(e) => {
+                eprint(e)
+                exit(2)
+            }
+        }
+        out = format(src)
+        if mode == "stdout" {
+            if len(out) > 0 { print(slice(out, 0, len(out) - 1)) }
+        } else if out != src {
+            if mode == "check" {
+                print("没有格式化：#{f}")
+                bad += 1
+            } else {
+                write_file(f, out)
+                print("已格式化：#{f}")
+            }
+        }
+    }
+    if bad > 0 { exit(1) }
+}

@@ -1,0 +1,80 @@
+// 接口约束与按第一个参数类型重载（需要 lark1 及以后的版本）
+// 接口按结构匹配：存在签名相符的函数就算实现了，不需要写 impl。
+
+interface Show {
+    fn show(x: Self) -> str
+}
+
+interface Area {
+    fn area(s: Self) -> int
+}
+
+type Point {
+    x: int
+    y: int
+}
+
+type Rect {
+    w: int
+    h: int
+}
+
+type Square {
+    side: int
+}
+
+// 同名函数按第一个参数的类型区分，x.show() 和 show(x) 都会选对
+fn show(p: Point) -> str { "(#{p.x}, #{p.y})" }
+fn show(n: int) -> str { "#{n}" }
+fn show(b: bool) -> str { if b { "真" } else { "假" } }
+
+fn area(r: Rect) -> int { r.w * r.h }
+fn area(s: Square) -> int { s.side * s.side }
+
+fn show_all[T: Show](xs: [T]) -> str {
+    parts: [str] = []
+    for x in xs {
+        parts.push(x.show())
+    }
+    "[" + join(parts, ", ") + "]"
+}
+
+fn total_area[T: Area](xs: [T]) -> int {
+    sum = 0
+    for x in xs {
+        sum += x.area()
+    }
+    sum
+}
+
+// 内置约束：Eq 可以 ==，Ord 可以 <
+fn index_of[T: Eq](xs: [T], x: T) -> int {
+    for i in 0..len(xs) {
+        if xs[i] == x { return i }
+    }
+    -1
+}
+
+fn max_of[T: Ord](xs: [T]) -> T? {
+    if len(xs) == 0 { return None }
+    m = xs[0].copy()
+    for x in xs {
+        if x > m { m = x.copy() }
+    }
+    m
+}
+
+fn main() {
+    print(show_all([Point(x: 1, y: 2), Point(x: 3, y: 4)]))
+    print(show_all([1, 2, 3]))
+    print(show_all([true, false]))
+    print("面积和：#{total_area([Rect(w: 2, h: 3), Rect(w: 1, h: 1)])}")
+    print("正方形面积和：#{total_area([Square(side: 2), Square(side: 3)])}")
+    print("乙的位置：#{index_of(["甲", "乙"], "乙")}")
+    print("最大值：#{max_of([3, 9, 4]) ?? -1}")
+    words = ["梨", "苹果", "桃"]
+    match max_of(words) {
+        Some(w) => print("字典序最大：#{w}")
+        None => print("空")
+    }
+}

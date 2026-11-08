@@ -1,0 +1,46 @@
+// TLS 1.3 的密钥计算（RFC 8446 第 7.1、7.3、4.4.4 节），SHA-256。
+// 先证明再写：对应 formal/Lark/Tls13.lean 的 earlySecret / hsSecret / masterSecret / deriveH / finishedMac，
+// 每一步都用 #guard 对了 RFC 8448 第 3 节的值（tests.lark 里同一批）。没有 PSK，所以 early secret 是固定的。
+// 实验性：没有经过审计
+import "std/digest"
+import "tls/hkdf"
+
+fn zeros32() -> [u8] {
+    out: [u8] = []
+    for _i in 0..32 { out.push(0) }
+    out
+}
+
+// 空消息的 SHA-256："derived" 用的就是它
+fn empty_hash() -> [u8] { digest.sha256([]) }
+
+// Early Secret = HKDF-Extract(0, 0)
+pub fn early() -> [u8] { hkdf.extract(zeros32(), zeros32()) }
+
+// Handshake Secret = HKDF-Extract(Derive-Secret(early, "derived", ""), 共享的秘密)
+pub fn handshake(shared: [u8]) -> [u8] {
+    hkdf.extract(hkdf.derive_secret(early(), "derived", empty_hash()), shared)
+}
+
+// Master Secret = HKDF-Extract(Derive-Secret(handshake, "derived", ""), 0)
+pub fn master(hs: [u8]) -> [u8] {
+    hkdf.extract(hkdf.derive_secret(hs, "derived", empty_hash()), zeros32())
+}
+
+// "c hs traffic"、"s hs traffic"、"c ap traffic"、"s ap traffic"、"exp master"：th 是到那时为止的消息的 SHA-256
+pub fn secret(base: [u8], label: str, th: [u8]) -> [u8] { hkdf.derive_secret(base, label, th) }
+
+pub type Keys {
+    pub key: [u8]
+    pub iv: [u8]
+}
+
+// 第 7.3 节：流量秘密 → 密钥和 IV。ChaCha20-Poly1305 的密钥是 32 字节（AES-128-GCM 是 16 字节）
+pub fn traffic(s: [u8], key_len: int) -> Keys {
+    Keys(key: hkdf.expand_label(s, "key", [], key_len), iv: hkdf.expand_label(s, "iv", [], 12))
+}
+
+// 第 4.4.4 节：Finished = HMAC(expand_label(流量秘密, "finished", "", 32), 消息的摘要)
+pub fn finished(s: [u8], th: [u8]) -> [u8] {
+    digest.hmac_sha256(hkdf.expand_label(s, "finished", [], 32), th)
+}

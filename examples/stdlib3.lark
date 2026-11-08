@@ -1,0 +1,165 @@
+// std/utf8、std/heap、std/deque、std/flag、std/rand（需要 lark1 及以后的版本）
+// 编译：lark1 examples/stdlib3.lark -o out.c
+import "std/utf8"
+import "std/heap"
+import "std/deque"
+import "std/flag"
+import "std/rand"
+
+// 优先级高的先出来：cmp 反过来写
+type Task {
+    pri: int
+    name: str
+}
+
+fn cmp(a: Task, b: Task) -> int { b.pri - a.pri }
+
+fn try_args(p: flag.Parser, xs: [str]) {
+    match p.parse_from(xs) {
+        Ok(a) => print("#{xs} → loud=#{a.get_bool("loud")} name=#{a.get_str("name")} times=#{a.get_int("times")} rest=#{a.rest}")
+        Err(e) => print("#{xs} → 错误：#{e}")
+    }
+}
+
+// 按字符倒过来：chars 得到每个字符，倒着拼起来
+fn reverse(s: str) -> str {
+    cs = utf8.chars(s)
+    out = ""
+    k = len(cs) - 1
+    for k >= 0 {
+        out += cs[k]
+        k -= 1
+    }
+    out
+}
+
+fn main() {
+    // ---------- utf8 ----------
+    s = "云雀a🎵"
+    print("len = #{len(s)}，字符数 = #{utf8.count(s)}")
+    print("chars：#{utf8.chars(s)}")
+    parts: [str] = []
+    for ch in utf8.each(s) { parts.push("<" + ch + ">") }
+    print("each：#{join(parts, "")}")
+    zh = "中é!"
+    print("code_points：#{utf8.code_points(zh)}，from_code_point：#{utf8.from_code_point(20013)}#{utf8.from_code_point(233)}#{utf8.from_code_point(127925)}")
+    print("slice_chars(1, 3) = #{utf8.slice_chars(s, 1, 3)}，slice_chars(2, 100) = #{utf8.slice_chars(s, 2, 100)}，slice_chars(-5, 1) = #{utf8.slice_chars(s, -5, 1)}")
+    print("reverse：#{reverse(s)}")
+    bad = from_byte(255) + "a"
+    print("is_valid：#{utf8.is_valid(s)} #{utf8.is_valid(slice(s, 0, 2))} #{utf8.is_valid(slice(s, 1, 3))} #{utf8.is_valid(bad)}，坏字节也算字符：#{utf8.count(bad)}")
+
+    // ---------- heap ----------
+    h = heap.of([5, 1, 8, 3, 9, 2])
+    h.insert(7)
+    h.insert(0)
+    print("堆：#{len(h)} 个，最小 #{h.peek_min()}")
+    a = h.pop_min()
+    b = h.pop_min()
+    print("取出 #{a} #{b}，剩下从小到大：#{heap.into_sorted(h)}")
+    print("字符串：#{heap.into_sorted(heap.of(["pear", "apple", "fig"]))}")
+    tq: heap.Heap[Task] = heap.new()
+    tq.insert(Task(pri: 1, name: "扫地"))
+    tq.insert(Task(pri: 5, name: "救火"))
+    tq.insert(Task(pri: 3, name: "回邮件"))
+    names: [str] = []
+    for t in heap.into_sorted(tq) { names.push(t.name) }
+    print("按优先级：#{join(names, " → ")}")
+    empty: heap.Heap[int] = heap.new()
+    print("空堆：#{empty.pop_min()} #{empty.is_empty()}")
+
+    // ---------- deque ----------
+    d = deque.of([1, 2, 3])
+    d.push_front(0)
+    d.push_back(4)
+    print("deque：#{d.to_list()}")
+    print("pop_front #{d.pop_front()}，pop_back #{d.pop_back()}")
+    for i in 0..10 { d.push_front(100 + i) }
+    total = 0
+    for x in d { total += x }
+    print("#{len(d)} 个，front #{d.front()}，back #{d.back()}，get(10) #{d.get(10)}，get(13) #{d.get(13)}，和 #{total}")
+    for _ in 0..5 {
+        v = d.pop_front() ?? 0
+        d.push_back(v)
+    }
+    print("转 5 次：#{d.to_list()}")
+    d.clear()
+    print("clear 之后：#{d.is_empty()} #{d.pop_back()}")
+    ws: deque.Deque[str] = deque.new()
+    ws.push_back("乙")
+    ws.push_front("甲")
+    ws.push_back("丙")
+    print("字符串：#{join(ws.to_list(), "、")}")
+
+    // ---------- flag ----------
+    p = flag.new("greet", "向某人问好")
+    p.add_bool("loud", "l", "全部大写")
+    p.add_str("name", "n", "世界", "要问候的人")
+    p.add_int("times", "t", 1, "重复几次")
+    try_args(p, [])
+    try_args(p, ["-l", "--name=云雀", "-t", "3", "x", "y"])
+    try_args(p, ["a", "--", "-l", "--x"])
+    try_args(p, ["--times", "x"])
+    try_args(p, ["--loud=yes"])
+    try_args(p, ["--color"])
+    try_args(p, ["-n"])
+    try_args(p, ["-ll", "z"])
+    try_args(p, ["-lq"])
+    try_args(p, ["-lt", "3"])
+    try_args(p, ["-h"])
+    print(p.usage())
+
+    // ---------- rand ----------
+    r = rand.new(42)
+    xs: [int] = []
+    for _ in 0..8 { xs.push(r.range(0, 100)) }
+    print("种子 42：#{xs}")
+    r1 = rand.new(2026)
+    r2 = rand.new(2026)
+    same = true
+    for _ in 0..1000 {
+        if r1.range(0, 1000000) != r2.range(0, 1000000) { same = false }
+    }
+    print("同一个种子得到同一串数：#{same}")
+    seen: [bool] = []
+    for _ in 0..10 { seen.push(false) }
+    in_range = true
+    for _ in 0..1000 {
+        k = r1.range(10, 20)
+        if k < 10 || k >= 20 {
+            in_range = false
+        } else {
+            seen[k - 10] = true
+        }
+    }
+    all_seen = true
+    for f in seen {
+        if !f { all_seen = false }
+    }
+    print("range(10, 20)：都在区间里 #{in_range}，10 个值都出现了 #{all_seen}")
+    sum = 0.0
+    ok = true
+    for _ in 0..10000 {
+        u = r1.next_float()
+        if u < 0.0 || u >= 1.0 { ok = false }
+        sum += u
+    }
+    mean = sum / 10000.0
+    print("next_float：都在 [0, 1) 里 #{ok}，均值接近 0.5 #{mean > 0.48 && mean < 0.52}")
+    hits = 0
+    for _ in 0..10000 {
+        if r1.next_bool(0.3) { hits += 1 }
+    }
+    print("next_bool(0.3)：10000 次里 2800 到 3200 次 #{hits > 2800 && hits < 3200}")
+    big = r1.range(0, 4000000000000000000)
+    print("大范围：#{big >= 0 && big < 4000000000000000000}")
+    r3 = rand.new(7)
+    ys = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    r3.shuffle(&ys)
+    print("打乱：#{ys}")
+    words = ["甲", "乙", "丙", "丁", "戊"]
+    print("sample 3：#{r3.sample(words, 3)}，sample 9：#{len(r3.sample(words, 9))} 个")
+    none: [int] = []
+    print("空列表的 choice：#{r3.choice(none)}")
+    r4 = rand.new(-1)
+    print("负数种子：#{r4.range(0, 6)} #{r4.range(0, 6)} #{r4.range(0, 6)}")
+}

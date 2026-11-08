@@ -1,0 +1,17 @@
+ok   rules
+ok   root
+ok   prefix
+ok   not_prefix
+ok   nested
+ok   redirect
+ok   post
+ok   head
+ok   length
+ok   bad_gateway
+ok   keepalive
+ok   warn_logged
+== SIGTERM
+代理退出码 0
+收到 SIGTERM，不再接受新连接，等进行中的请求做完
+ok   exit_logged
+ok   refused

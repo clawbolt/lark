@@ -1,0 +1,9 @@
+// 期望错误：xs 以 inout 传入的同时被闭包捕获（违反排他性）
+fn run(inout xs: [int], f: fn(int) -> int) {
+    xs.push(f(1))
+}
+
+fn main() {
+    xs = [1]
+    run(&xs, |x| x + len(xs))
+}

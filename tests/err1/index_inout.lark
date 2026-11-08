@@ -1,0 +1,8 @@
+// 期望错误：m[k] 是 index 返回的新值，不能直接在它上面 push（要取出、修改后再放回）
+import "std/map"
+
+fn main() {
+    m: map.Map[str, [int]] = map.new()
+    m["a"] = [1]
+    m["a"].push(2)
+}

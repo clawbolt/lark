@@ -1,0 +1,78 @@
+// 更强的模式（需要 lark1 及以后的版本）：嵌套的变体模式、元组模式、字符串模式。
+// 分支从上到下尝试，第一个匹配的执行；Some(Leaf(v)) 这种带条件的分支不算覆盖了整个 Some。
+
+enum Tree {
+    Leaf(v: int)
+    Node(l: Tree, r: Tree)
+}
+
+fn describe(t: Tree?) -> str {
+    match t {
+        None => "空"
+        Some(Leaf(0)) => "值为 0 的叶子"
+        Some(Leaf(v)) => "叶子 #{v}"
+        Some(Node(Leaf(a), Leaf(b))) => "两片叶子 #{a} 和 #{b}"
+        Some(Node(_, _)) => "更深的树"
+    }
+}
+
+fn sum(t: Tree) -> int {
+    match t {
+        Leaf(v) => v
+        Node(l, r) => sum(l) + sum(r)
+    }
+}
+
+// 元组模式：同时看几个值
+fn fizz(n: int) -> str {
+    match (n % 3, n % 5) {
+        (0, 0) => "FizzBuzz"
+        (0, _) => "Fizz"
+        (_, 0) => "Buzz"
+        _ => "#{n}"
+    }
+}
+
+// 字符串模式
+fn command(s: str) -> int {
+    match s {
+        "start" => 1
+        "stop" => 2
+        _ => 0
+    }
+}
+
+enum Shape {
+    Circle(r: int)
+    Rect(w: int, h: int)
+}
+
+// 结果里的嵌套模式，再加上元组
+fn area(r: (str, Shape)!) -> str {
+    match r {
+        Ok((name, Circle(0))) => "#{name}：退化的圆"
+        Ok((name, Circle(x))) => "#{name}：#{3 * x * x}"
+        Ok((name, Rect(w, h))) => "#{name}：#{w * h}"
+        Err(e) => "错误：#{e}"
+    }
+}
+
+fn main() {
+    print(describe(None))
+    print(describe(Some(Leaf(0))))
+    print(describe(Some(Leaf(7))))
+    print(describe(Some(Node(Leaf(1), Leaf(2)))))
+    deep = Node(Node(Leaf(1), Leaf(2)), Leaf(3))
+    print("#{describe(Some(deep.copy()))}，和是 #{sum(deep)}")
+
+    out: [str] = []
+    for i in 1..16 { out.push(fizz(i)) }
+    print(join(out, " "))
+
+    print("start=#{command("start")} stop=#{command("stop")} 其它=#{command("jump")}")
+
+    print(area(Ok(("轮子", Circle(2)))))
+    print(area(Ok(("点", Circle(0)))))
+    print(area(Ok(("门", Rect(2, 5)))))
+    print(area(Err("读不到")))
+}

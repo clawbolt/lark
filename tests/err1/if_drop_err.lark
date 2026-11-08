@@ -1,0 +1,12 @@
+// 期望错误：()! 函数末尾是没有 else 的 if，分支里的 Err(…) 会被丢掉（要写 return Err(…)）
+fn check(n: int) -> ()! {
+    print("#{n}")
+    if n < 0 { Err("负数") }
+}
+
+fn main() {
+    match check(1) {
+        Ok => {}
+        Err(e) => print(e)
+    }
+}

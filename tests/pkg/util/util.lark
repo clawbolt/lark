@@ -1,0 +1,13 @@
+// lark build 的测试：依赖包的主模块，用到了包里的另一个模块、std 和 C 函数
+import "std/str"
+import "util/extra"
+
+extern "c" {
+    fn lark_pkg_twice(n: c_int) -> c_int
+}
+
+pub fn shout(s: str) -> str { str.to_upper(s) + "!" }
+
+pub fn twice(n: int) -> int { lark_pkg_twice(n) }
+
+pub fn hi() -> str { extra.greet() }

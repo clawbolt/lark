@@ -1,0 +1,3 @@
+tests/err1/generic_body.lark:2:32: 错误：运算 + 不支持类型 [int]
+ 2 | fn add[T](a: T, b: T) -> T { a + b }
+   |                                ^

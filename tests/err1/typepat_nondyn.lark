@@ -1,0 +1,8 @@
+// 期望错误：类型模式只能用于 dyn 值
+fn main() {
+    n = 3
+    match n {
+        k: int => print("#{k}")
+        _ => print("别的")
+    }
+}

@@ -1,0 +1,3 @@
+tests/err/loop_move.lark:8:5: 错误：t 在循环里被移走，必须在本轮结束前重新赋值
+ 8 |     for i in 0..2 {
+   |     ^

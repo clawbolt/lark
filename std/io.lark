@@ -1,0 +1,204 @@
+// Lark 标准库 · 带缓冲的读写（用 Lark 自己写，底下是内置的 try_open、try_fd_read、try_fd_write、try_fd_close）
+// 用法：import "std/io"
+//
+//   r = io.open("data.txt")?             // Reader；io.stdin() 是标准输入
+//   for true {
+//       line = match r.read_line() {     // str?：一行（不含 \n 和行尾的 \r），读完时 None
+//           Some(s) => s
+//           None => break
+//       }
+//       …
+//   }
+//   if r.last_error() != "" { … }             // read_line 遇到错误时也返回 None，错误信息在这里
+//   all = r.read_all()?                  // 剩下的全部内容
+//
+//   w = io.create("out.txt")?            // Writer；io.open_append(path) 追加，io.stdout()、io.stderr()
+//   w.write("abc")?                      // 先放进缓冲区，满 64KB 时写出去
+//   w.write_line("一行")?
+//   w.flush()?                           // 立刻写出去
+//   w.close()?                           // 写出剩下的内容并关闭；不调用的话离开作用域时也会做（但看不到错误）
+//
+// stdout() 的内容在 flush 时才写出去；写之前会先把 print 的内容写出去，所以两者的先后按 flush 的时刻算。
+
+const CHUNK = 65536
+
+pub type Reader {
+    fd: int
+    buf: str        // 读进来还没交出去的内容从 buf[pos] 开始
+    pos: int
+    eof: bool
+    err: str
+    owns: bool      // 是 open 打开的（离开作用域时要关闭），而不是 stdin
+}
+
+pub type Writer {
+    fd: int
+    buf: str
+    owns: bool
+}
+
+// 从已经打开的文件描述符读，不负责关闭它（std/net 的连接自己管关闭）；io.open 打开的文件由 Reader 关闭
+pub fn from_fd(fd: int) -> Reader { reader(fd, false) }
+
+fn reader(fd: int, owns: bool) -> Reader { Reader(fd: fd, buf: "", pos: 0, eof: false, err: "", owns: owns) }
+
+pub fn stdin() -> Reader { reader(0, false) }
+
+pub fn open(path: str) -> Reader! {
+    fd = try_open(path, "r")?
+    Ok(reader(fd, true))
+}
+
+pub fn stdout() -> Writer { Writer(fd: 1, buf: "", owns: false) }
+
+pub fn stderr() -> Writer { Writer(fd: 2, buf: "", owns: false) }
+
+pub fn create(path: str) -> Writer! {
+    fd = try_open(path, "w")?
+    Ok(Writer(fd: fd, buf: "", owns: true))
+}
+
+pub fn open_append(path: str) -> Writer! {
+    fd = try_open(path, "a")?
+    Ok(Writer(fd: fd, buf: "", owns: true))
+}
+
+// ---------- 读 ----------
+
+// 再读一块接到缓冲区后面；读到结尾或出错时返回 false
+fn fill(inout r: Reader) -> bool {
+    if r.eof || r.fd < 0 { return false }
+    got = try_fd_read(r.fd, CHUNK)
+    match got {
+        Ok(chunk) => {
+            if len(chunk) == 0 {
+                r.eof = true
+                return false
+            }
+            // 先丢掉已经交出去的部分，再在后面追加（+= 原地加长，摊下来每个字节只复制常数次；
+            // 写成 a + b 每次都要整段复制，read_all 读大文件会变成平方）
+            if r.pos >= len(r.buf) {
+                r.buf = chunk
+            } else {
+                if r.pos > 0 { r.buf = slice(r.buf, r.pos, len(r.buf)) }
+                r.buf += chunk
+            }
+            r.pos = 0
+            true
+        }
+        Err(e) => {
+            r.err = e
+            r.eof = true
+            false
+        }
+    }
+}
+
+pub fn read_line(inout r: Reader) -> str? {
+    scan = r.pos
+    for true {
+        n = len(r.buf)
+        for scan < n {
+            if byte_at(r.buf, scan) == '\n' {
+                line = cut_cr(slice(r.buf, r.pos, scan))
+                r.pos = scan + 1
+                return Some(line)
+            }
+            scan += 1
+        }
+        // 这一块里没有换行：再读一块，接着从没看过的地方找
+        done = r.pos
+        if !fill(&r) {
+            if done < len(r.buf) {
+                rest = cut_cr(slice(r.buf, done, len(r.buf)))
+                r.buf = ""
+                r.pos = 0
+                return Some(rest)
+            }
+            return None
+        }
+        scan = scan - done
+    }
+    None
+}
+
+fn cut_cr(s: str) -> str {
+    n = len(s)
+    if n > 0 && byte_at(s, n - 1) == '\r' { slice(s, 0, n - 1) } else { s }
+}
+
+pub fn read_all(inout r: Reader) -> str! {
+    for fill(&r) {}
+    if r.err != "" { return Err(r.err.copy()) }
+    out = slice(r.buf, r.pos, len(r.buf))
+    r.buf = ""
+    r.pos = 0
+    Ok(out)
+}
+
+// 已经读进缓冲区、还没交出去的内容，最多 max 个字节（不再从系统读）。max 是负数时 panic
+pub fn read_buffered(inout r: Reader, max: int) -> str {
+    if max < 0 { panic("io.read_buffered：max 不能是负数，得到 #{max}") }
+    n = len(r.buf) - r.pos
+    if n <= 0 { return "" }
+    k = if n < max { n } else { max }
+    out = slice(r.buf, r.pos, r.pos + k)
+    r.pos += k
+    out
+}
+
+pub fn last_error(r: Reader) -> str { r.err.copy() }
+
+pub fn close(inout r: Reader) -> ()! {
+    if r.owns && r.fd >= 0 {
+        fd = r.fd
+        r.fd = -1
+        _r = try_fd_close(fd)?
+    }
+    r.fd = -1
+}
+
+fn drop(inout r: Reader) {
+    if r.owns && r.fd >= 0 { _r = try_fd_close(r.fd) }
+}
+
+// ---------- 写 ----------
+
+pub fn write(inout w: Writer, s: str) -> ()! {
+    if w.fd < 0 { return Err("io：写入已经关闭的 Writer") }
+    w.buf += s
+    if len(w.buf) >= CHUNK { flush(&w)? }
+}
+
+pub fn write_line(inout w: Writer, s: str) -> ()! {
+    write(&w, s)?
+    write(&w, "\n")?
+}
+
+pub fn flush(inout w: Writer) -> ()! {
+    if len(w.buf) == 0 || w.fd < 0 { return Ok() }
+    data = replace(&w.buf, "")
+    _r = try_fd_write(w.fd, data)?
+}
+
+pub fn close(inout w: Writer) -> ()! {
+    flushed = flush(&w)
+    if w.owns && w.fd >= 0 {
+        fd = w.fd
+        w.fd = -1
+        _r = try_fd_close(fd)?
+    }
+    w.fd = -1
+    flushed
+}
+
+fn drop(inout w: Writer) {
+    if w.fd >= 0 && len(w.buf) > 0 { _r = try_fd_write(w.fd, w.buf) }
+    if w.owns && w.fd >= 0 { _c = try_fd_close(w.fd) }
+}
+
+// "#{r}"：Reader(fd 0)
+pub fn show(r: Reader) -> str { "Reader(fd #{r.fd})" }
+
+// "#{w}"：Writer(fd 1)
+pub fn show(w: Writer) -> str { "Writer(fd #{w.fd})" }

@@ -1,0 +1,140 @@
+// 标准库第三批补上的函数：str.cut / split_n、fmt.byte_size、json 的路径和构造、time.parse_dur / format_iso_at / local_offset
+import "std/str"
+import "std/fmt"
+import "std/json"
+import "std/time"
+
+fn dur(s: str) -> int {
+    match take time.parse_dur(s) {
+        Ok(n) => n
+        Err(e) => panic(e)
+    }
+}
+
+fn dur_err(s: str) -> str {
+    match take time.parse_dur(s) {
+        Ok(n) => "<成功：#{n}>"
+        Err(e) => e
+    }
+}
+
+fn iso(s: str) -> int {
+    match take time.parse_iso(s) {
+        Ok(n) => n
+        Err(e) => panic(e)
+    }
+}
+
+fn iso_err(s: str) -> str {
+    match take time.parse_iso(s) {
+        Ok(n) => "<成功：#{n}>"
+        Err(e) => e
+    }
+}
+
+fn has(j: json.Json, p: str) -> bool {
+    match take json.path(j, p) {
+        Some(_) => true
+        None => false
+    }
+}
+
+test "str：cut、split_n、repeat、pad" {
+    k, v = str.cut("name=云雀", "=") ?? ("", "")
+    assert_eq(k, "name")
+    assert_eq(v, "云雀")
+    a, b = str.cut("a==b==c", "==") ?? ("", "")
+    assert_eq(a, "a")
+    assert_eq(b, "b==c")
+    none, _rest = str.cut("abc", "=") ?? ("<无>", "")
+    assert_eq(none, "<无>")
+    assert(str.split_n("a:b:c", ":", 2) == ["a", "b:c"])
+    assert(str.split_n("a:b:c", ":", 0) == ["a", "b", "c"])
+    assert(str.split_n("a:b", ":", 1) == ["a:b"])
+    assert(str.split_n("abc", ":", 3) == ["abc"])
+    assert_eq(str.repeat("ab", 3), "ababab")
+    assert_eq(str.repeat("x", 0), "")
+    assert_eq(str.repeat("x", -2), "")
+    assert_eq(len(str.repeat("云", 10000)), 30000)
+    assert_eq(str.pad_start("7", 3, "0"), "007")
+    assert_eq(str.pad_start("x", 5, "ab"), "ababx")
+    assert_eq(str.pad_start("abc", 2, "0"), "abc")
+    assert_eq(str.pad_end("a", 3, "."), "a..")
+}
+
+test "fmt.byte_size" {
+    assert_eq(fmt.byte_size(0), "0 B")
+    assert_eq(fmt.byte_size(-9223372036854775807 - 1), "-8 EiB")
+    assert_eq(fmt.byte_size(1023), "1023 B")
+    assert_eq(fmt.byte_size(1024), "1 KiB")
+    assert_eq(fmt.byte_size(1126), "1.1 KiB")
+    assert_eq(fmt.byte_size(1536), "1.5 KiB")
+    assert_eq(fmt.byte_size(1048575), "1 MiB")
+    assert_eq(fmt.byte_size(1048576), "1 MiB")
+    assert_eq(fmt.byte_size(5683281920), "5.3 GiB")
+    assert_eq(fmt.byte_size(-2048), "-2 KiB")
+    assert_eq(fmt.byte_size(0x7FFF_FFFF_FFFF_FFFF), "8 EiB")
+}
+
+test "json：路径和构造" {
+    j = match take json.parse("{\"user\": {\"name\": \"云雀\", \"tags\": [\"a\", \"b\"], \"age\": 3, \"ok\": true, \"h\": 1.5}, \"list\": [{\"x\": 1}]}") {
+        Ok(x) => x
+        Err(e) => panic(e)
+    }
+    assert_eq(json.path_str(j, "user.name") ?? "-", "云雀")
+    assert_eq(json.path_str(j, "user.tags.1") ?? "-", "b")
+    assert_eq(json.path_int(j, "user.age") ?? -1, 3)
+    assert_eq(json.path_int(j, "list.0.x") ?? -1, 1)
+    assert_eq(json.path_int(j, "user.name") ?? -1, -1)
+    assert((json.path_float(j, "user.h") ?? -1.0) == 1.5)
+    assert((json.path_float(j, "user.age") ?? -1.0) == 3.0)
+    assert(json.path_bool(j, "user.ok") ?? false)
+    assert(!has(j, "list.5"))
+    assert(!has(j, "user.tags.x"))
+    assert(!has(j, "user."))
+    assert(!has(j, "nope.deeper"))
+    whole = json.path(j, "") ?? json.Null
+    assert_eq(json.format(whole), json.format(j))
+    o = json.object([("n", json.Num(1)), ("s", json.Str("x"))])
+    json.insert(&o, "n", json.Num(2))
+    json.insert(&o, "new", json.Arr([json.Null]))
+    assert_eq(json.format(o), "{\"n\":2,\"s\":\"x\",\"new\":[null]}")
+    v = json.Num(1)
+    json.insert(&v, "a", json.Bool(false))
+    assert_eq(json.format(v), "{\"a\":false}")
+}
+
+test "time：读时长" {
+    assert_eq(dur("300ms"), 300_000_000)
+    assert_eq(dur("1.5s"), 1_500_000_000)
+    assert_eq(dur("2m30s"), 150_000_000_000)
+    assert_eq(dur("1.5h"), 5_400_000_000_000)
+    assert_eq(dur("1h2m3s4ms5us6ns"), 3_723_004_005_006)
+    assert_eq(dur("250µs"), 250_000)
+    assert_eq(dur("-10s"), -10_000_000_000)
+    assert_eq(dur("+1m"), 60_000_000_000)
+    assert_eq(dur("0"), 0)
+    assert_eq(dur("0.000000001s"), 1)
+    assert_eq(dur_err(""), "时长的写法不对：（应该像 300ms、1.5s、2m30s）")
+    assert_eq(dur_err("10"), "时长少了单位：10（可以用 ns us ms s m h）")
+    assert_eq(dur_err("5d"), "不认识的时间单位 d：5d")
+    assert_eq(dur_err("s"), "时长的写法不对：s（应该像 300ms、1.5s、2m30s）")
+    assert_eq(dur_err(".s"), "时长的写法不对：.s（应该像 300ms、1.5s、2m30s）")
+    assert_eq(dur_err("99999999999999h"), "时长太大：99999999999999h")
+}
+
+test "time：时差" {
+    ms = 1_761_710_641_123
+    assert_eq(time.format_iso_at(ms, 0), "2025-10-29T04:04:01.123Z")
+    assert_eq(time.format_iso_at(ms, 8 * 60), "2025-10-29T12:04:01.123+08:00")
+    assert_eq(time.format_iso_at(ms, -330), "2025-10-28T22:34:01.123-05:30")
+    assert_eq(iso("2025-10-29T12:04:01.123+08:00"), ms)
+    assert_eq(iso("2025-10-28T22:34:01.123-0530"), ms)
+    assert_eq(iso("2025-10-29T04:04:01.123Z"), ms)
+    assert_eq(iso_err("2025-10-29T04:04:01+8"), "时差的格式不对：+8（应该像 +08:00）")
+    assert_eq(iso_err("2025-10-29T04:04:01+24:00"), "时差不对：+24:00")
+    // 系统时区：不知道测试机在哪里，只检查范围（世界上的时差在 -12 到 +14 小时之间）
+    off = time.local_offset(ms)
+    assert(off >= -12 * 60 && off <= 14 * 60)
+    assert(time.local_offset(0) >= -12 * 60)
+}

@@ -1,0 +1,42 @@
+// 基准：和 tokens.lark 做同样的事，但 token 是按值存放的结构体（kind 0 是数，1 是加，2 是乘），不分配堆内存
+type Tok {
+    kind: int
+    v: int
+}
+
+fn lex(n: int) -> [Tok] {
+    ts: [Tok] = []
+    for i in 0..n {
+        if i % 3 == 0 {
+            ts.push(Tok(kind: 0, v: i))
+        } else if i % 3 == 1 {
+            ts.push(Tok(kind: 1, v: 0))
+        } else {
+            ts.push(Tok(kind: 2, v: 0))
+        }
+    }
+    ts
+}
+
+fn score(ts: [Tok]) -> int {
+    s = 0
+    for t in ts {
+        if t.kind == 0 {
+            s += t.v % 7
+        } else if t.kind == 1 {
+            s += 1
+        } else {
+            s += 2
+        }
+    }
+    s
+}
+
+fn main() {
+    total = 0
+    for _ in 0..60 {
+        ts = lex(200000)
+        total += score(ts)
+    }
+    print("#{total}")
+}

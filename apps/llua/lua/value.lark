@@ -1,0 +1,257 @@
+// llua · 值和表。Lark 里没有共享的可变数据，所以表、闭包、格子都放在解释器的数组里（见 interp.lark 的 Vm），
+// 值里只存编号。还没有垃圾回收：表和闭包在程序结束前一直占着内存。
+import "std/map"
+import "lex"
+
+pub enum Value {
+    Nil
+    Bool(b: bool)
+    Int(n: int)
+    Num(f: float)
+    Str(s: str)
+    Tab(id: int)
+    Func(id: int)      // Lua 函数（闭包），Vm.clos 的下标
+    Native(id: int)    // 内置函数，编号见 interp.lark
+    Cel(id: int)       // 被捕获的局部变量的格子，只出现在槽位里，Lua 程序看不到
+}
+
+// 表：1..n 的整数键放在 arr，其余放在 hkeys / hvals（按插入顺序，next 也按这个顺序）。
+// 删除只把值改成 nil，键留着当墓碑，所以遍历时删除是安全的；墓碑太多时在插入新键时整理
+pub type Table {
+    pub arr: [Value]
+    pub hkeys: [Value]
+    pub hvals: [Value]
+    pub slot: map.Map[Value, int]
+    pub dead: int
+    pub meta: int        // 元表的编号，没有时 -1
+}
+
+pub fn new_table() -> Table {
+    Table(arr: [], hkeys: [], hvals: [], slot: map.new(), dead: 0, meta: -1)
+}
+
+fn mix(n: int) -> int {
+    h = n *% 0x9E37_79B9_7F4A_7C15
+    h ^ (h >>> 32)
+}
+
+pub fn hash(v: Value) -> int {
+    match v {
+        Nil => 0
+        Bool(b) => if b { 1 } else { 2 }
+        Int(n) => mix(n)
+        Num(f) => if f > -1.0e15 && f < 1.0e15 { mix(to_int(f * 1024.0)) +% 3 } else { 5 }
+        Str(s) => hash(s)
+        Tab(id) => mix(id) +% 7
+        Func(id) => mix(id) +% 11
+        Native(id) => mix(id) +% 13
+        Cel(id) => mix(id) +% 17
+    }
+}
+
+pub fn is_nil(v: Value) -> bool {
+    match v {
+        Nil => true
+        _ => false
+    }
+}
+
+pub fn truthy(v: Value) -> bool {
+    match v {
+        Nil => false
+        Bool(b) => b
+        _ => true
+    }
+}
+
+// 能精确表示成整数的浮点数，转成整数（表的键、tointeger 都用）
+pub fn float_to_int(f: float) -> int? {
+    if f >= -9.2233720368547758e18 && f < 9.2233720368547758e18 && floor(f) == f { return Some(to_int(f)) }
+    None
+}
+
+// 键的规范形式：整数值的浮点键当成整数
+pub fn norm_key(take k: Value) -> Value {
+    match take k {
+        Num(f) => match float_to_int(f) {
+            Some(n) => Int(n)
+            None => Num(f)
+        }
+        other => other
+    }
+}
+
+// 原始读取（不看元表）
+pub fn raw_get(t: Table, k: Value) -> Value {
+    match k {
+        Int(n) => if n >= 1 && n <= len(t.arr) { return t.arr[n - 1].copy() }
+        Num(f) => match float_to_int(f) {
+            Some(n) => return raw_get(t, Int(n))
+            None => {}
+        }
+        Str(_) => {}
+        Nil => return Nil
+        _ => {}
+    }
+    match t.slot.get(k) {
+        Some(i) => t.hvals[i].copy()
+        None => Nil
+    }
+}
+
+pub fn raw_get_str(t: Table, k: str) -> Value { raw_get(t, Str(k)) }
+
+// 原始写入；k 是 nil 或 NaN 时由调用者先报错
+pub fn raw_set(inout t: Table, take key: Value, take v: Value) {
+    k = norm_key(key)
+    n = match k {
+        Int(i) => i
+        _ => 0
+    }
+    if n >= 1 && n <= len(t.arr) {
+        t.arr[n - 1] = v
+        // 去掉末尾的 nil，让 #t 是一个边界
+        if n == len(t.arr) {
+            for len(t.arr) > 0 && is_nil(t.arr[len(t.arr) - 1]) { _ = t.arr.pop() }
+        }
+        return
+    }
+    if n == len(t.arr) + 1 && !is_nil(v) {
+        t.arr.push(v)
+        migrate(&t)
+        return
+    }
+    match t.slot.get(k) {
+        Some(i) => {
+            if is_nil(v) && !is_nil(t.hvals[i]) { t.dead += 1 }
+            if !is_nil(v) && is_nil(t.hvals[i]) { t.dead -= 1 }
+            t.hvals[i] = v
+        }
+        None => {
+            if is_nil(v) { return }
+            if t.dead > 8 && t.dead * 2 > len(t.hkeys) { compact(&t) }
+            t.slot.insert(k.copy(), len(t.hkeys))
+            t.hkeys.push(k)
+            t.hvals.push(v)
+        }
+    }
+}
+
+// arr 变长以后，哈希部分里紧接着的整数键挪进 arr
+fn migrate(inout t: Table) {
+    if len(t.hkeys) - t.dead == 0 { return }
+    for true {
+        k = Int(len(t.arr) + 1)
+        i = t.slot.get(k) ?? -1
+        if i < 0 || is_nil(t.hvals[i]) { return }
+        v = replace(&t.hvals[i], Nil)
+        t.dead += 1
+        t.arr.push(v)
+    }
+}
+
+// 去掉墓碑，重建哈希部分
+fn compact(inout t: Table) {
+    ks = replace(&t.hkeys, [])
+    vs = replace(&t.hvals, [])
+    t.slot = map.new()
+    t.dead = 0
+    for i in 0..len(ks) {
+        if !is_nil(vs[i]) {
+            t.slot.insert(ks[i].copy(), len(t.hkeys))
+            t.hkeys.push(ks[i].copy())
+            t.hvals.push(vs[i].copy())
+        }
+    }
+}
+
+pub fn length(t: Table) -> int { len(t.arr) }
+
+// next：k 之后的下一对键值；没有了得到 None；k 不在表里时 Err
+pub fn next_pair(t: Table, k: Value) -> (Value, Value)?! {
+    start = 0     // 从第几项开始找：0..len(arr) 是数组部分，之后是哈希部分
+    match k {
+        Nil => {}
+        _ => {
+            nk = norm_key(k.copy())
+            idx = match nk {
+                Int(n) => if n >= 1 && n <= len(t.arr) { n } else { -1 }
+                _ => -1
+            }
+            if idx > 0 {
+                start = idx
+            } else {
+                match t.slot.get(nk) {
+                    Some(i) => { start = len(t.arr) + i + 1 }
+                    None => return Err("invalid key to 'next'")
+                }
+            }
+        }
+    }
+    for j in start..len(t.arr) {
+        if !is_nil(t.arr[j]) { return Ok(Some((Int(j + 1), t.arr[j].copy()))) }
+    }
+    h0 = if start > len(t.arr) { start - len(t.arr) } else { 0 }
+    for i in h0..len(t.hkeys) {
+        if !is_nil(t.hvals[i]) { return Ok(Some((t.hkeys[i].copy(), t.hvals[i].copy()))) }
+    }
+    Ok(None)
+}
+
+// ---------- 数字和字符串 ----------
+
+extern "c" {
+    fn llua_num_str(x: float) -> str
+    pub fn llua_fmt_num(spec: str, x: float) -> str
+    pub fn llua_fmt_int(spec: str, n: c_long) -> str
+    pub fn llua_clock() -> float
+}
+
+pub fn num_str(f: float) -> str { llua_num_str(f) }
+
+pub fn type_name(v: Value) -> str {
+    match v {
+        Nil => "nil"
+        Bool(_) => "boolean"
+        Int(_) | Num(_) => "number"
+        Str(_) => "string"
+        Tab(_) => "table"
+        Func(_) | Native(_) => "function"
+        Cel(_) => "cell"
+    }
+}
+
+fn is_space(c: int) -> bool { c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == 12 }
+
+// 字符串转数字（tonumber 和算术里的自动转换）：去掉两边空白，按 Lua 的数字写法读，可以带正负号
+pub fn str_to_num(s: str) -> Value {
+    a = 0
+    b = len(s)
+    for a < b && is_space(byte_at(s, a)) { a += 1 }
+    for b > a && is_space(byte_at(s, b - 1)) { b -= 1 }
+    if a == b { return Nil }
+    neg = false
+    if byte_at(s, a) == '-' || byte_at(s, a) == '+' {
+        neg = byte_at(s, a) == '-'
+        a += 1
+    }
+    body = slice(s, a, b)
+    if len(body) == 0 || !(lex.is_digit(byte_at(body, 0)) || byte_at(body, 0) == '.') { return Nil }
+    ts = match take lex.lex(body, "") {
+        Ok(x) => x
+        Err(_) => return Nil
+    }
+    if len(ts) != 2 { return Nil }
+    if ts[0].kind == lex.K_INT { return Int(if neg { 0 -% ts[0].n } else { ts[0].n }) }
+    if ts[0].kind == lex.K_FLT { return Num(if neg { 0.0 - ts[0].f } else { ts[0].f }) }
+    Nil
+}
+
+// 数字转字符串（tostring 和 .. 用）
+pub fn num_to_str(v: Value) -> str? {
+    match v {
+        Int(n) => Some("#{n}")
+        Num(f) => Some(num_str(f))
+        _ => None
+    }
+}

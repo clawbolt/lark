@@ -1,0 +1,8 @@
+// 期望错误：未知类型 Pointt，提示 Point
+type Point {
+    x: int
+}
+
+fn norm(p: Pointt) -> int { 0 }
+
+fn main() {}

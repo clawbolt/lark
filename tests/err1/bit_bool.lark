@@ -1,0 +1,5 @@
+// 期望错误：位运算只用于 int，bool 请用 && 和 ||
+fn main() {
+    x = true & false
+    print("#{x}")
+}
